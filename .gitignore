@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment & credentials
+.env
+.env.*
+
+# Local persistent browser profile
+.outlook-browser-profile*/
+
+# Media & local scratch files
+*.png
+*.jpg
+*.jpeg
+/scratch/
+/tmp/
+
+# Local exploration & debugging scripts
+harvest.mjs
+enumerate.mjs
+probe_*.mjs
+inspect_*.mjs
+test_*.mjs
+verify_*.mjs
+fetch_recent_emails.mjs
