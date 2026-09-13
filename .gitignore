@@ -29,3 +29,7 @@ inspect_*.mjs
 test_*.mjs
 verify_*.mjs
 fetch_recent_emails.mjs
+create_reply_draft_*.mjs
+dump_*.mjs
+sf_ticket_*.txt
+sf_*.txt

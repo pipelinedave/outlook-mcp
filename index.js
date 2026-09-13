@@ -125,6 +125,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'outlook_reply_draft',
+        description: 'Erstellt einen nativen Antwort-Entwurf (Reply / Reply All) auf eine vorhandene E-Mail in Outlook Web. Behält den vollständigen E-Mail-Verlauf (Thread/Zitat) und die automatische Outlook-Signatur bei. Speichert den Entwurf im Ordner "Entwürfe" (Drafts).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            email_id: {
+              type: 'string',
+              description: 'Optionale ID oder Conversation-ID (data-convid) der Ziel-E-Mail.'
+            },
+            id: {
+              type: 'string',
+              description: 'Alias für email_id.'
+            },
+            query: {
+              type: 'string',
+              description: 'Optionaler Suchbegriff oder Betreff zum Finden der Ziel-E-Mail (falls email_id nicht angegeben).'
+            },
+            subject: {
+              type: 'string',
+              description: 'Alias für query (Betreff der zu beantwortenden E-Mail).'
+            },
+            body: {
+              type: 'string',
+              description: 'Inhalt / Text der Antwort (wird oben über dem bisherigen Verlauf und vor der Signatur eingefügt).'
+            },
+            reply_all: {
+              type: 'boolean',
+              description: 'True für "Allen antworten" (Reply All), False für einfaches "Antworten" (Reply). Standard: false.',
+              default: false
+            },
+            folder: {
+              type: 'string',
+              description: 'Optional: Ordner, in dem gesucht werden soll (Standard: inbox).'
+            }
+          },
+          required: ['body']
+        }
+      },
+      {
         name: 'outlook_close',
         description: 'Schließt die Hintergrund-Browserinstanz.',
         inputSchema: {
@@ -169,6 +208,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ['id']
         }
+      },
+      {
+        name: 'outlook_toggle_flag',
+        description: 'Toggelt bzw. entfernt das Flag (Kennzeichnung) einer E-Mail anhand ihrer conversation-ID (data-convid).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'conversation-ID (data-convid)' },
+            folder: { type: 'string', description: 'Optional: Ordner (Standard: flagged)' }
+          },
+          required: ['id']
+        }
+      },
+      {
+        name: 'outlook_archive_email',
+        description: 'Verschiebt eine E-Mail anhand ihrer conversation-ID (data-convid) ins Archiv.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'conversation-ID (data-convid)' },
+            folder: { type: 'string', description: 'Optional: Ordner (Standard: inbox)' }
+          },
+          required: ['id']
+        }
+      },
+      {
+        name: 'outlook_accept_meeting',
+        description: 'Nimmt eine Termineinladung (Meeting Request) in Outlook Web an (RSVP "Annehmen"/Accept). Sendet die Annahme-Rückmeldung an die Gegenseite, trägt den Termin in den Firmenkalender ein und übernimmt den Outlook-typischen Archiv-Flow. Lokalisierung per conversation-ID (data-convid) oder Suchbegriff.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'conversation-ID (data-convid) der Einladung' },
+            email_id: { type: 'string', description: 'Alias für id.' },
+            query: { type: 'string', description: 'Optionaler Suchbegriff oder Betreff zum Finden der Einladung (z.B. "CMIS Schnittstelle").' },
+            subject: { type: 'string', description: 'Alias für query (Betreff der Einladung).' },
+            folder: { type: 'string', description: 'Optional: Ordner, in dem gesucht werden soll (Standard: inbox).' },
+            send_response: { type: 'boolean', description: 'True (Standard): Antwortsendung an die Gegenseite. False: ohne Antwortübermittlung annehmen.', default: true }
+          }
+        }
       }
     ]
   };
@@ -206,6 +284,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           subject: args.subject,
           body: args.body,
           cc: args?.cc
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      }
+
+      case 'outlook_reply_draft': {
+        const result = await owaClient.replyDraft({
+          email_id: args?.email_id || args?.id,
+          query: args?.query || args?.subject,
+          body: args?.body,
+          reply_all: args?.reply_all ?? args?.replyAll ?? false,
+          folder: args?.folder
         });
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -258,6 +349,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'outlook_read_email': {
         const res = await owaClient.readEmailByConvId(args.id, args.folder);
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_toggle_flag': {
+        const res = await owaClient.toggleFlag(args.id, args.folder);
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_archive_email': {
+        const res = await owaClient.archiveEmail(args.id, args.folder);
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_reply_draft': {
+        const res = await owaClient.replyDraft({
+          emailId: args.email_id || args.id,
+          query: args.query || args.subject,
+          body: args.body,
+          replyAll: args.reply_all ?? false,
+          folder: args.folder
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_accept_meeting': {
+        const res = await owaClient.acceptMeeting({
+          email_id: args?.email_id || args?.id,
+          id: args?.id,
+          query: args?.query || args?.subject,
+          subject: args?.subject,
+          folder: args?.folder,
+          send_response: args?.send_response ?? true
+        });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 

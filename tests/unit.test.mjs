@@ -71,3 +71,28 @@ describe('config - Defaults & Umgebungsvariablen', () => {
     assert.ok(config.defaultRealm.length > 0);
   });
 });
+
+describe('owaClient - replyDraft Validierung', () => {
+  test('replyDraft Methode existiert auf owaClient', async () => {
+    const { owaClient } = await import('../src/owa.js');
+    assert.equal(typeof owaClient.replyDraft, 'function');
+  });
+
+  test('replyDraft wirft Fehler bei fehlendem oder leerem body', async () => {
+    const { owaClient } = await import('../src/owa.js');
+    await assert.rejects(
+      async () => {
+        await owaClient.replyDraft({});
+      },
+      /Parameter "body" ist erforderlich/
+    );
+
+    await assert.rejects(
+      async () => {
+        await owaClient.replyDraft({ body: '   ' });
+      },
+      /Parameter "body" ist erforderlich/
+    );
+  });
+});
+

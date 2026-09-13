@@ -19,18 +19,22 @@ neue E-Mail-Entwürfe sicher anlegen.
 
 ## Features
 
-- **11 leistungsfähige MCP-Tools**:
+- **14 leistungsfähige MCP-Tools**:
   - `outlook_status`: Prüft Verbindungs- und Anmeldestatus von Outlook Web.
   - `outlook_login`: Öffnet ein sichtbares Browserfenster für den einmaligen interaktiven Login (inkl. SSO / MFA).
   - `outlook_search`: Volltextsuche über das OWA-Suchfeld (nach Kunden, Tickets, Absendern, Stichwörtern).
   - `outlook_get_email`: Liest eine E-Mail vollständig im Lesebereich aus (konvertiert in Markdown, extrahiert Teams-Links und Metadaten).
   - `outlook_list_recent`: Schnelle Übersicht über die neuesten E-Mails im Posteingang.
-  - `outlook_create_draft`: Legt E-Mail-Entwürfe im Ordner „Entwürfe“ (Drafts) an (per OWA DeepLink & Ctrl+S).
+  - `outlook_create_draft`: Legt neue E-Mail-Entwürfe im Ordner „Entwürfe“ (Drafts) an (per OWA DeepLink & Ctrl+S).
+  - `outlook_reply_draft`: Erstellt einen nativen Antwort-Entwurf (Reply / Reply All) direkt auf eine bestehende E-Mail. Behält vollständigen E-Mail-Verlauf (Thread/Zitat) und die automatische Outlook-Signatur bei.
   - `outlook_list_folders`: Listet alle Navigationsordner (Posteingang, Gesendet, Archiv, Entwürfe etc.).
   - `outlook_navigate_folder`: Wechselt gezielt in einen bestimmten Ordner (z.B. Sent Items, Archiv).
   - `outlook_bulk_list`: Scroll-Enumeration zur Überwindung der OWA-Listen-Virtualisierung (erfasst alle Conversation-IDs).
   - `outlook_read_email`: Liest gezielt eine E-Mail anhand ihrer Conversation-ID aus.
-  - `outlook_close`: Beendet die Hintergrund-Browserinstanz.
+  - `outlook_toggle_flag`: Toggelt bzw. entfernt das Flag (Kennzeichnung) einer E-Mail anhand ihrer Conversation-ID.
+   - `outlook_archive_email`: Verschiebt eine E-Mail anhand ihrer Conversation-ID ins Archiv.
+   - `outlook_accept_meeting`: Nimmt eine Termineinladung (Meeting Request) in Outlook Web an (RSVP "Annehmen"/Accept). Sendet die Annahme-Rückmeldung an die Gegenseite, trägt den Termin in den Firmenkalender ein und übernimmt den Outlook-typischen Archiv-Flow. Lokalisierung per Conversation-ID oder Suchbegriff.
+   - `outlook_close`: Beendet die Hintergrund-Browserinstanz.
 - **Sicherheits-Konzept (Draft-First)**: Es gibt kein Blindversenden von Mails. Der Server legt Entwürfe an, sodass der Anwender die Nachricht vor dem Absenden in Outlook sichten und freigeben kann.
 - **Auto-Erkennung von Browsern**: Findet automatisch Chromium/Chrome/Edge unter Linux, WSL, macOS und Windows (oder via `OUTLOOK_MCP_CHROME_PATH`).
 - **Persistentes lokales Profil**: Anmeldedaten und MFA-Tokens verbleiben sicher im lokalen Profil (`~/.outlook-browser-profile`).
