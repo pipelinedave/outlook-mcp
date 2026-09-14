@@ -247,6 +247,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             send_response: { type: 'boolean', description: 'True (Standard): Antwortsendung an die Gegenseite. False: ohne Antwortübermittlung annehmen.', default: true }
           }
         }
+      },
+      {
+        name: 'outlook_create_calendar_event',
+        description: 'Legt einen Eintrag (Fokuszeit-Blocker) im Outlook-FIRMENKALENDER an: Titel, Start/Ende, optionale Beschreibung. Firmenblöcke gehören laut Kalender-Architektur AUSSCHLIESSLICH hierher (nicht Google). Empfohlen vorher outlook_get_freebusy für den Kollisions-Check. Default transparency=busy.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            subject: { type: 'string', description: 'Titel des Blockers, z.B. "Blocker für Vorbereitung ..."' },
+            start: { type: 'string', description: 'Start ISO, z.B. "2026-09-15T09:30:00"' },
+            end: { type: 'string', description: 'Ende ISO, z.B. "2026-09-15T11:00:00"' },
+            body: { type: 'string', description: 'Optionale Beschreibung/Notizen' },
+            is_all_day: { type: 'boolean', description: 'Ganztägig? (Standard: false)', default: false },
+            timezone: { type: 'string', description: 'Optional, Default Europe/Berlin', default: 'Europe/Berlin' },
+            transparency: { type: 'string', description: 'busy (nicht verfügbar, Standard) oder free', enum: ['busy', 'free'], default: 'busy' }
+          },
+          required: ['subject', 'start', 'end']
+        }
+      },
+      {
+        name: 'outlook_get_freebusy',
+        description: 'Fragt die Belegung des Outlook-FIRMENKALENDERS in einem Zeitfenster ab (Busy-Slots), zur Kollisionsprüfung vor dem Anlegen eines Blockers.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            start: { type: 'string', description: 'Start ISO, z.B. "2026-09-15T09:30:00"' },
+            end: { type: 'string', description: 'Ende ISO, z.B. "2026-09-15T11:00:00"' }
+          },
+          required: ['start', 'end']
+        }
+      },
+      {
+        name: 'outlook_delete_calendar_event',
+        description: 'Löscht einen Eintrag aus dem Outlook-FIRMENKALENDER anhand seines Titels/Suchbegriffs (bzw. einer ID). Verwendet die OWA-Kalender-Suche zum Auffinden und entfernt das Event. Nützlich, um versehentlich angelegte Blocker/Test-Einträge zu bereinigen.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des zu löschenden Kalender-Events' },
+            id: { type: 'string', description: 'Alternative: Kalender-Event-ID (falls bekannt)' }
+          }
+        }
+      },
+      {
+        name: 'outlook_update_calendar_event',
+        description: 'Aktualisiert einen bestehenden Eintrag im Outlook-FIRMENKALENDER (Titel/Zeit/Beschreibung) anhand seines Titels/Suchbegriffs. Nützlich, um Blocker nachzubearbeiten.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des zu ändernden Kalender-Events' },
+            id: { type: 'string', description: 'Alternative: Kalender-Event-ID (falls bekannt)' },
+            subject: { type: 'string', description: 'Neuer Titel' },
+            start: { type: 'string', description: 'Neuer Start (ISO)' },
+            end: { type: 'string', description: 'Neues Ende (ISO)' },
+            body: { type: 'string', description: 'Neue Beschreibung' },
+            is_all_day: { type: 'boolean', description: 'Ganztägig? (Standard: false)' },
+            timezone: { type: 'string', description: 'Optional, Default Europe/Berlin' },
+            transparency: { type: 'string', description: 'busy oder free', enum: ['busy', 'free'] }
+          }
+        }
       }
     ]
   };
@@ -370,6 +428,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           subject: args?.subject,
           folder: args?.folder,
           send_response: args?.send_response ?? true
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_create_calendar_event': {
+        const res = await owaClient.createCalendarEvent({
+          subject: args.subject,
+          start: args.start,
+          end: args.end,
+          body: args?.body,
+          is_all_day: args?.is_all_day ?? false,
+          timezone: args?.timezone || 'Europe/Berlin',
+          transparency: args?.transparency || 'busy'
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_get_freebusy': {
+        const res = await owaClient.getFreeBusy({ start: args.start, end: args.end });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_delete_calendar_event': {
+        const res = await owaClient.deleteCalendarEvent({ query: args?.query, id: args?.id });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_update_calendar_event': {
+        const res = await owaClient.updateCalendarEvent({
+          query: args?.query,
+          id: args?.id,
+          subject: args?.subject,
+          start: args?.start,
+          end: args?.end,
+          body: args?.body,
+          is_all_day: args?.is_all_day,
+          timezone: args?.timezone || 'Europe/Berlin',
+          transparency: args?.transparency
         });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }

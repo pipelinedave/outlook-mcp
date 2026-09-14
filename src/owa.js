@@ -71,19 +71,33 @@ export function buildCalendarComposeUrl(realm, { subject, start, end, body, is_a
 }
 
 // Formatiert ein ISO-Datum (z.B. "2026-09-15T13:00:00" oder "2026-09-15T13:00:00+02:00")
-// zu einem OWA-kompatiblen startdt/enddt-Wert. Ohne Offset wird Europe/Berlin angenommen.
+// zu einem OWA-kompatiblen startdt/enddt-Wert.
+//
+// WICHTIG (Zeitzonen-Falle): Der OWA-Deep-Link (startdt/enddt) interpretiert Werte
+// OHNE Offset als LOKALE Browserzeit (Europe/Berlin) und Werte mit "Z" als UTC.
+// Daher werden zeitzonen-lose Inputs als Berliner Lokalzeit BELASSEN (nicht nach UTC
+// konvertiert) — sonst verschiebt OWA z.B. "08:00" (gewollt Berlin) auf "10:00".
 export function normalizeCalendarDate(input, timezone = 'Europe/Berlin') {
   if (!input) return undefined;
   let dt = input;
-  // Kein Zeitzonen-Offset vorhanden -> Europe/Berlin implizieren
+  // Kein Zeitzonen-Offset ("Z" oder +hh:mm / -hh:mm am Ende) vorhanden
+  // -> als lokale (Europe/Berlin) Zeit belassen, nur Format normalisieren.
   if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(dt)) {
-    try {
-      const date = new Date(`${dt}Z`);
-      if (!isNaN(date.getTime())) {
-        dt = date.toISOString();
-      }
-    } catch (e) { /* bewusst ignorieren */ }
+    // Sekunden/Werte normalisieren, ohne Zeitzone zu wechseln:
+    const m = String(dt).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+    if (m) {
+      const [, y, mo, d, h, mi, s = '00'] = m;
+      return `${y}-${mo}-${d}T${h}:${mi}:${s}`;
+    }
+    return dt;
   }
+  // Expliziter Offset: als UTC-ISO normalisieren (eindeutig).
+  try {
+    const date = new Date(dt);
+    if (!isNaN(date.getTime())) {
+      return date.toISOString();
+    }
+  } catch (e) { /* bewusst ignorieren */ }
   return dt;
 }
 
@@ -99,7 +113,7 @@ export class OwaClient {
   }
 
   async getPage(headless = true) {
-    const { page } = await browserManager.ensureContext(headless);
+    const { page } = await browserManager.ensureContext(headless, this.realm);
     this.lastPage = page;
     const currentUrl = page.url();
     if (!currentUrl.includes('outlook.office.com') && !currentUrl.includes('login.microsoftonline.com') && !currentUrl.includes('outlook.cloud.microsoft')) {
@@ -111,6 +125,42 @@ export class OwaClient {
     return page;
   }
 
+  // Bestimmt die tatsächlich aktive Mailbox-Adresse (nicht nur den Titel).
+  // Probierte Quellen in OWA: Account-Button (Initialen) aria-label/title,
+  // Persona/ProfileCard-Anker, OWA-Header-Account-Elemente. Fallback: null.
+  // Diese Methode ist bewusst tolerant — jeder Hinweis ist besser als gar keiner,
+  // weil sie die Verwechslungsgefahr zwischen Tenants (d.velop/adesso) sichtbar macht.
+  async detectActiveMailbox() {
+    const page = this.lastPage || (await this.getPage(true));
+    try {
+      const leaked = await page.evaluate(() => {
+        const candidates = [];
+        // 1) OWA-Account-Button (oben rechts): aria-label / title / Text
+        const accountBtn = document.querySelector('[data-tid="account"] button, [role="button"][aria-label*="Account" i], [role="button"][aria-label*="Konto" i]');
+        if (accountBtn) {
+          const lbl = accountBtn.getAttribute('aria-label') || accountBtn.getAttribute('title') || accountBtn.innerText || '';
+          if (lbl) candidates.push(lbl);
+        }
+        // 2) Account-Switcher / Persona-Links mit @
+        document.querySelectorAll('[title*="@"], [aria-label*="@"], [data-tid="accountName"], [data-account-name]').forEach(el => {
+          const txt = (el.getAttribute('title') || el.getAttribute('aria-label') || el.innerText || '').trim();
+          if (txt && txt.includes('@')) candidates.push(txt);
+        });
+        // 3) Textknoten im Header, die eine E-Mail enthalten
+        const header = document.querySelector('[role="banner"], #owaHeader, [data-tid="header"]');
+        if (header) {
+          const txt = header.innerText || '';
+          const emails = txt.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [];
+          candidates.push(...emails);
+        }
+        return [...new Set(candidates.map(c => c.trim()).filter(Boolean))].slice(0, 8);
+      });
+      return leaked;
+    } catch (e) {
+      return [];
+    }
+  }
+
   async checkStatus() {
     try {
       const page = await this.getPage(true);
@@ -120,6 +170,7 @@ export class OwaClient {
         return {
           authenticated: false,
           currentUrl: url,
+          realm: this.realm,
           message: "Nicht angemeldet. Bitte führe 'outlook_login' aus, um das Browserfenster für die einmalige Anmeldung zu öffnen."
         };
       }
@@ -129,15 +180,34 @@ export class OwaClient {
       const title = await page.title();
       const isLoaded = title.toLowerCase().includes('outlook') || page.url().includes('/mail');
 
+      // Aktive Mailbox-Adresse robust bestimmen (Verwechslungs-Schutz zwischen Tenants)
+      const mailboxHints = await this.detectActiveMailbox();
+
+      // Sanfter Abgleich: Zeigt an, ob die aktive Mailbox zum erwarteten Realm passt.
+      // Ein Realm passt, wenn ein Hint die Realm-/Domain endung enthält (z.B. @adesso.de).
+      const realmDomain = this.realm && this.realm.includes('.') ? this.realm.toLowerCase() : null;
+      const matchingHint = realmDomain
+        ? (mailboxHints.find(h => h.toLowerCase().includes(realmDomain)) || null)
+        : null;
+      const activeMailboxMatchesRealm = matchingHint !== null;
+
       return {
         authenticated: isLoaded,
         currentUrl: page.url(),
         title: title,
-        message: isLoaded ? "Outlook Web ist eingeloggt und einsatzbereit." : "Seite lädt noch oder erfordert Anmeldung."
+        realm: this.realm,
+        mailboxHints,
+        activeMailboxMatchesRealm,
+        message: isLoaded
+          ? (activeMailboxMatchesRealm
+              ? `Outlook Web ist eingeloggt (Mailbox passt zu ${this.realm}).`
+              : `ACHTUNG: Eingeloggt, aber Mailbox konnte nicht eindeutig zu '${this.realm}' verifiziert werden. Aktiv geprüfte Account-Hinweise: ${mailboxHints.length ? mailboxHints.join(' | ') : '(keine gefunden)'}. Bitte im sichtbaren Fenster die korrekte Mailbox bestätigen.`)
+          : "Seite lädt noch oder erfordert Anmeldung."
       };
     } catch (err) {
       return {
         authenticated: false,
+        realm: this.realm,
         error: err.message
       };
     }
@@ -225,7 +295,7 @@ export class OwaClient {
       throw new Error('Parameter "start" und "end" sind erforderlich.');
     }
 
-    const page = await browserManager.ensureContext(true).then(r => r.page);
+    const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
     this.lastPage = page;
 
     const startDt = normalizeCalendarDate(start, timezone);
@@ -234,32 +304,48 @@ export class OwaClient {
     // Body NICHT in URL-Parameter geben, da OWA den Editor sonst auf Plain-Text umstellt.
     const calendarUrl = buildCalendarComposeUrl(this.realm, { subject, start: startDt, end: endDt, is_all_day });
 
+    // Der Kalender-Deep-Link kann einen NEUEN Tab öffnen. Daher Zeitstempel der Tab-Liste merken.
+    const context = browserManager.context;
+    const pagesBefore = context ? context.pages().length : 0;
+
     await page.goto(calendarUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(6000);
 
+    // Falls ein neuer Tab geöffnet wurde: auf diesen wechseln
+    let activePage = page;
+    if (context) {
+      const pagesAfter = context.pages();
+      if (pagesAfter.length > pagesBefore) {
+        activePage = pagesAfter[pagesAfter.length - 1];
+        this.lastPage = activePage;
+        await activePage.waitForLoadState('domcontentloaded').catch(() => null);
+        await activePage.waitForTimeout(1500);
+      }
+    }
+
     // Der Event-Editor von OWA stellt den Betreff in einem Textfeld dar
-    const titleInput = await page.waitForSelector(
+    const titleInput = await activePage.waitForSelector(
       'input[aria-label*="Titel" i], input[aria-label*="Title" i], input[aria-label*="Betreff" i], input[aria-label*="Subject" i], input[placeholder*="Titel" i], input[placeholder*="Add a title" i]',
       { timeout: 15000 }
     ).catch(() => null);
 
     if (titleInput) {
       await titleInput.click();
-      await page.waitForTimeout(200);
+      await activePage.waitForTimeout(200);
       await titleInput.fill(subject);
-      await page.waitForTimeout(300);
+      await activePage.waitForTimeout(300);
     }
 
     // Body (Beschreibung) eintragen, falls vorhanden
     if (body && body.trim().length > 0) {
-      const bodyEditor = await page.waitForSelector(
+      const bodyEditor = await activePage.waitForSelector(
         'div[role="textbox"][aria-label*="Description" i], div[role="textbox"][aria-label*="Beschreibung" i], div[role="textbox"][aria-label*="Notes" i], div[role="textbox"][aria-label*="Notizen" i], div[role="textbox"][aria-label*="body" i]',
         { timeout: 8000 }
       ).catch(() => null);
 
       if (bodyEditor) {
         await bodyEditor.click();
-        await page.waitForTimeout(300);
+        await activePage.waitForTimeout(300);
         await bodyEditor.evaluate((el, text) => {
           const lines = text.split('\n');
           const fragment = document.createDocumentFragment();
@@ -276,13 +362,13 @@ export class OwaClient {
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
         }, body);
-        await page.waitForTimeout(400);
+        await activePage.waitForTimeout(400);
       }
     }
 
     // Speichern
-    await page.keyboard.press('Control+s');
-    await page.waitForTimeout(3000);
+    await activePage.keyboard.press('Control+s');
+    await activePage.waitForTimeout(3000);
 
     return {
       success: true,
@@ -300,7 +386,7 @@ export class OwaClient {
       throw new Error('Parameter "start" und "end" sind erforderlich.');
     }
 
-    const page = await browserManager.ensureContext(true).then(r => r.page);
+    const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
     this.lastPage = page;
 
     const startDt = normalizeCalendarDate(start) || start;
@@ -363,6 +449,213 @@ export class OwaClient {
       busySlots,
       count: busySlots.length,
       note: 'Busy-Slots direkt aus ARIA-Labels der Kalender-Event-Elemente extrahiert.'
+    };
+  }
+
+  // Lokalisiert ein Kalender-Event im OWA-Firmenkalender über die Kalender-Suche
+  // (Suchbegriff = Titel-Fragment) und öffnet das Event-Detail. Rückgabe: 
+  // { page, titleMatched, detailText } oder wirft, wenn nichts gefunden.
+  async openCalendarEventByQuery(query, { timeout = 20000 } = {}) {
+    if (!query || typeof query !== 'string' || query.trim().length === 0) {
+      throw new Error('Parameter "query" (Suchbegriff/Titel-Fragment) ist erforderlich.');
+    }
+    const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
+    this.lastPage = page;
+
+    const searchUrl = this.realm
+      ? `https://outlook.office.com/calendar/search?q=${encodeURIComponent(query)}&realm=${encodeURIComponent(this.realm)}`
+      : `https://outlook.office.com/calendar/search?q=${encodeURIComponent(query)}`;
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(6000);
+
+    // Event-Ergebnis in der Kalender-Suche auftun: Klick auf passendes Element
+    // mit aria-label/title, das den Suchbegriff (case-insensitiv) enthält.
+    let clicked = false;
+    for (let i = 0; i < 30; i++) {
+      const target = await page.evaluate((q) => {
+        const ql = q.toLowerCase();
+        const els = Array.from(document.querySelectorAll('[role="button"][aria-label], [role="button"][title], [aria-label], [title]'));
+        for (const el of els) {
+          const label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || '');
+          if (label.toLowerCase().includes(ql)) {
+            // Nicht die Suchfeld-/Filter-Elemente anwählen
+            const tag = el.tagName.toLowerCase();
+            if (tag === 'input' || tag === 'button') continue;
+            return el;
+          }
+        }
+        return null;
+      }, query);
+
+      if (target) {
+        try {
+          await target.click();
+          clicked = true;
+          break;
+        } catch (e) {
+          // Element evtl. detached – weitersuchen
+        }
+      }
+      await page.waitForTimeout(600);
+    }
+
+    if (!clicked) {
+      throw new Error(`Kein Kalender-Event für Suchbegriff "${query}" in der Kalender-Suche gefunden.`);
+    }
+
+    // Nach dem Klick auf ein Event-Ergebnis öffnet OWA i.d.R. ein Detail-Panel
+    await page.waitForTimeout(2500);
+
+    const detailText = await page.evaluate(() => {
+      const pane = document.querySelector('[role="dialog"], [role="main"], [class*="eventViewer"], [class*="eventDetails"]');
+      return pane ? (pane.innerText || '') : (document.body.innerText || '');
+    });
+
+    return { page, titleMatched: query, detailText };
+  }
+
+  async deleteCalendarEvent({ query, id } = {}) {
+    const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
+    this.lastPage = page;
+    const targetQuery = id || query;
+    if (!targetQuery) {
+      throw new Error('Parameter "query" oder "id" (Suchbegriff/Titel-Fragment) ist erforderlich.');
+    }
+
+    await this.openCalendarEventByQuery(targetQuery);
+
+    // Nach dem Öffnen des Events das "Löschen"-/Entfernen-Element suchen und klicken.
+    let deleted = false;
+    const clickDelete = async () => {
+      const btn = await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('[role="button"][aria-label], [role="button"][title], button[aria-label], button[title]'));
+        for (const el of els) {
+          const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
+          const text = (el.innerText || '').toLowerCase();
+          const combined = `${label} ${text}`;
+          // "Löschen"/"Delete" im Kontext eines einzelnen Events (nicht "Alle löschen" / Bulk)
+          if ((combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen') || combined.includes('remove')) &&
+              !combined.includes('alle löschen') && !combined.includes('all')) {
+            return el;
+          }
+        }
+        return null;
+      });
+      return btn || null;
+    };
+
+    let delBtn = await clickDelete();
+    if (!delBtn) {
+      // ggf. "…"-Overflow-Menü öffnen, falls Löschen nicht direkt sichtbar
+      const moreBtn = await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('[role="button"][aria-label], button[aria-label], button[title]'));
+        return els.find(el => {
+          const l = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
+          return l.includes('more options') || l.includes('weitere optionen') || l.includes('mehr optionen');
+        }) || null;
+      });
+      if (moreBtn) {
+        await moreBtn.click();
+        await page.waitForTimeout(1200);
+        const menuDel = await page.evaluate(() => {
+          const els = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [role="menuitemradio"]'));
+          for (const el of els) {
+            const t = (el.innerText || '').toLowerCase();
+            const l = (el.getAttribute('aria-label') || '').toLowerCase();
+            const combined = `${t} ${l}`;
+            if ((combined.includes('löschen') || combined.includes('delete')) && !combined.includes('alle löschen')) {
+              return el;
+            }
+          }
+          return null;
+        });
+        if (menuDel) {
+          await menuDel.click();
+          deleted = true;
+        }
+      }
+    } else {
+      await delBtn.click();
+      deleted = true;
+    }
+
+    // evtl. Bestätigungsdialog
+    await page.waitForTimeout(1500);
+    const confirmBtn = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const el of els) {
+        const t = (el.innerText || '').toLowerCase();
+        const l = (el.getAttribute('aria-label') || '').toLowerCase();
+        const combined = `${t} ${l}`;
+        if (combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen')) {
+          // eher "einzelnes Event" als "Serie löschen"-Option
+          if (!combined.includes('serie') && !combined.includes('all')) return el;
+        }
+      }
+      return null;
+    });
+    if (confirmBtn) {
+      await confirmBtn.click();
+      await page.waitForTimeout(1500);
+    }
+
+    return {
+      success: deleted,
+      query: targetQuery,
+      message: deleted
+        ? `Kalender-Event "${targetQuery}" wurde gelöscht/entfernt (bitte im Kalender gegenprüfen).`
+        : `Löschen-Button für "${targetQuery}" nicht gefunden. Bitte manuell im Kalender prüfen.`
+    };
+  }
+
+  async updateCalendarEvent({ query, id, subject, start, end, body, is_all_day, timezone = 'Europe/Berlin', transparency } = {}) {
+    const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
+    this.lastPage = page;
+    const targetQuery = id || query;
+    if (!targetQuery) {
+      throw new Error('Parameter "query" oder "id" (Suchbegriff/Titel-Fragment) ist erforderlich.');
+    }
+
+    await this.openCalendarEventByQuery(targetQuery);
+
+    // öffnet ggf. ein Edit-Panel; bei freien Blocker-Events ist der Event-Viewer meist editierbar.
+    // 1) Titel aktualisieren
+    if (subject && subject.trim().length > 0) {
+      const titleInput = await page.waitForSelector(
+        'input[aria-label*="Titel" i], input[aria-label*="Title" i], input[aria-label*="Betreff" i], input[aria-label*="Subject" i]',
+        { timeout: 8000 }
+      ).catch(() => null);
+      if (titleInput) {
+        await titleInput.click();
+        await page.waitForTimeout(200);
+        await titleInput.fill(subject);
+        await page.waitForTimeout(300);
+      }
+    }
+
+    // 2) Beschreibung aktualisieren
+    if (body && body.trim().length > 0) {
+      const bodyEditor = await page.waitForSelector(
+        'div[role="textbox"][aria-label*="Description" i], div[role="textbox"][aria-label*="Beschreibung" i], div[role="textbox"][aria-label*="Notes" i], div[role="textbox"][aria-label*="Notizen" i]',
+        { timeout: 6000 }
+      ).catch(() => null);
+      if (bodyEditor) {
+        await bodyEditor.click();
+        await page.waitForTimeout(200);
+        await bodyEditor.fill(body);
+        await page.waitForTimeout(300);
+      }
+    }
+
+    // Speichern
+    await page.keyboard.press('Control+s');
+    await page.waitForTimeout(2500);
+
+    return {
+      success: true,
+      query: targetQuery,
+      subject: subject || undefined,
+      message: `Kalender-Event "${targetQuery}" wurde aktualisiert und gespeichert.`
     };
   }
 

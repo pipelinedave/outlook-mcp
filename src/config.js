@@ -55,6 +55,18 @@ function getProfileDir() {
   return process.env.OUTLOOK_MCP_PROFILE_DIR || path.join(HOME, '.outlook-browser-profile');
 }
 
+// Pro-Realm-Profil: Jeder Tenant bekommt ein eigenes persistentes Browser-Profil,
+// damit die angemeldeten Mailbox-Sessions NICHT vermischt werden.
+// Achtung Migration: Der Default-Realm (d-velop.de) behält bewusst das bestehende
+// Basisprofil (kein Suffix), damit die bereits eingeloggte Session erhalten bleibt.
+// Alle abweichenden Realms (z.B. adesso.de) erhalten ein separates "-<realm>"-Profil.
+function getProfileDirForRealm(realm, defaultRealm = getDefaultRealm()) {
+  const base = getProfileDir();
+  if (!realm || realm === defaultRealm) return base;
+  const safe = String(realm).replace(/[^a-zA-Z0-9._-]/g, '_');
+  return `${base}-${safe}`;
+}
+
 function getDefaultRealm() {
   return process.env.OUTLOOK_MCP_REALM || 'd-velop.de';
 }
@@ -75,6 +87,7 @@ export const config = {
     return process.env.OUTLOOK_MCP_CHROME_PATH || detectedChromePath || undefined;
   },
   profileDir: getProfileDir(),
+  getProfileDirForRealm,
   defaultRealm: getDefaultRealm(),
   defaultHeadless: getDefaultHeadless()
 };
