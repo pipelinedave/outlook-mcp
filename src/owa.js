@@ -452,62 +452,58 @@ export class OwaClient {
     };
   }
 
-  // Lokalisiert ein Kalender-Event im OWA-Firmenkalender über die Kalender-Suche
-  // (Suchbegriff = Titel-Fragment) und öffnet das Event-Detail. Rückgabe: 
-  // { page, titleMatched, detailText } oder wirft, wenn nichts gefunden.
-  async openCalendarEventByQuery(query, { timeout = 20000 } = {}) {
+  // Lokalisiert ein Kalender-Event im OWA-Firmenkalender und öffnet dessen Detail-Panel.
+  // Suchbegriff = Titel-Fragment. Geht über die Wochenansicht (für den Zieltext), da die
+  // Kalender-Suche in OWA keine zuverlässigen klickbaren Ergebnisse liefert. Der Klick
+  // wird als ECHTER Playwright-Klick ausgeführt (React braucht native Events).
+  // Rückgabe: { page, titleMatched, detailText } oder wirft, wenn nichts gefunden.
+  async openCalendarEventByQuery(query, { timeout = 30000 } = {}) {
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
       throw new Error('Parameter "query" (Suchbegriff/Titel-Fragment) ist erforderlich.');
     }
     const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
     this.lastPage = page;
+    const ql = query.trim().toLowerCase();
 
-    const searchUrl = this.realm
-      ? `https://outlook.office.com/calendar/search?q=${encodeURIComponent(query)}&realm=${encodeURIComponent(this.realm)}`
-      : `https://outlook.office.com/calendar/search?q=${encodeURIComponent(query)}`;
-    await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+    const calUrl = this.realm
+      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+      : 'https://outlook.office.com/calendar/view/week';
+    await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(6000);
 
-    // Event-Ergebnis in der Kalender-Suche auftun: Klick auf passendes Element
-    // mit aria-label/title, das den Suchbegriff (case-insensitiv) enthält.
-    let clicked = false;
-    for (let i = 0; i < 30; i++) {
-      const target = await page.evaluate((q) => {
-        const ql = q.toLowerCase();
-        const els = Array.from(document.querySelectorAll('[role="button"][aria-label], [role="button"][title], [aria-label], [title]'));
-        for (const el of els) {
-          const label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || '');
-          if (label.toLowerCase().includes(ql)) {
-            // Nicht die Suchfeld-/Filter-Elemente anwählen
-            const tag = el.tagName.toLowerCase();
-            if (tag === 'input' || tag === 'button') continue;
-            return el;
-          }
-        }
-        return null;
-      }, query);
+    // Event-Elemente über ihr ARIA-Label (Format "<Titel>, HH:MM to HH:MM, ...") finden.
+    // Playwright locator mit Regex (case-insensitiv, Titel-Fragment am Anfang).
+    const titleEscaped = ql.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const locator = page.locator(`[role="button"][aria-label*="${titleEscaped}" i]`).first();
 
-      if (target) {
-        try {
-          await target.click();
-          clicked = true;
-          break;
-        } catch (e) {
-          // Element evtl. detached – weitersuchen
-        }
+    let clicked = false;
+    try {
+      await locator.waitFor({ state: 'visible', timeout: 15000 });
+      await locator.click({ timeout: 10000 });
+      clicked = true;
+    } catch (e) {
+      // Fallback: über exakteren Regex auf den kompletten Titel
+      try {
+        const exactLocator = page
+          .locator(`[role="button"][aria-label^="${titleEscaped}" i]`)
+          .first();
+        await exactLocator.waitFor({ state: 'visible', timeout: 10000 });
+        await exactLocator.click({ timeout: 10000 });
+        clicked = true;
+      } catch (e2) {
+        clicked = false;
       }
-      await page.waitForTimeout(600);
     }
 
     if (!clicked) {
-      throw new Error(`Kein Kalender-Event für Suchbegriff "${query}" in der Kalender-Suche gefunden.`);
+      throw new Error(`Kein Kalender-Event für Suchbegriff "${query}" gefunden (Wochenansicht).`);
     }
 
-    // Nach dem Klick auf ein Event-Ergebnis öffnet OWA i.d.R. ein Detail-Panel
-    await page.waitForTimeout(2500);
+    // OWA öffnet nach echtem Klick ein Detail-/Reading-Panel oder ein Popup
+    await page.waitForTimeout(3500);
 
     const detailText = await page.evaluate(() => {
-      const pane = document.querySelector('[role="dialog"], [role="main"], [class*="eventViewer"], [class*="eventDetails"]');
+      const pane = document.querySelector('[role="dialog"], [role="main"], [class*="eventViewer"], [class*="eventDetails"], [class*="reading"]');
       return pane ? (pane.innerText || '') : (document.body.innerText || '');
     });
 
@@ -524,78 +520,76 @@ export class OwaClient {
 
     await this.openCalendarEventByQuery(targetQuery);
 
-    // Nach dem Öffnen des Events das "Löschen"-/Entfernen-Element suchen und klicken.
+    // Nach dem Öffnen des Events das "Löschen"-/Entfernen-Element finden und klicken.
+    // Alle DOM-Vorgänge laufen in page.evaluate (im Browser), da DOM-Elemente nicht
+    // aus evaluate heraus zurückgegeben werden können (kein echtes ElementHandle).
     let deleted = false;
-    const clickDelete = async () => {
-      const btn = await page.evaluate(() => {
-        const els = Array.from(document.querySelectorAll('[role="button"][aria-label], [role="button"][title], button[aria-label], button[title]'));
-        for (const el of els) {
-          const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
-          const text = (el.innerText || '').toLowerCase();
-          const combined = `${label} ${text}`;
-          // "Löschen"/"Delete" im Kontext eines einzelnen Events (nicht "Alle löschen" / Bulk)
-          if ((combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen') || combined.includes('remove')) &&
-              !combined.includes('alle löschen') && !combined.includes('all')) {
-            return el;
-          }
-        }
-        return null;
-      });
-      return btn || null;
-    };
 
-    let delBtn = await clickDelete();
-    if (!delBtn) {
-      // ggf. "…"-Overflow-Menü öffnen, falls Löschen nicht direkt sichtbar
-      const moreBtn = await page.evaluate(() => {
+    // Versuche direkten Löschen-Button im Event-Detail/Dialog zu finden und zu klicken.
+    const directClick = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('[role="button"][aria-label], [role="button"][title], button[aria-label], button[title]'));
+      for (const el of els) {
+        const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
+        const text = (el.innerText || '').toLowerCase();
+        const combined = `${label} ${text}`;
+        if ((combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen') || combined.includes('remove')) &&
+            !combined.includes('alle löschen') && !combined.includes('serie löschen') && !combined.includes('all')) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (directClick) {
+      deleted = true;
+    } else {
+      // Fallback: "…"-Overflow-"Weitere Optionen"-Menü öffnen und dort Löschen anwählen.
+      const moreClicked = await page.evaluate(() => {
         const els = Array.from(document.querySelectorAll('[role="button"][aria-label], button[aria-label], button[title]'));
-        return els.find(el => {
+        const more = els.find(el => {
           const l = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
           return l.includes('more options') || l.includes('weitere optionen') || l.includes('mehr optionen');
-        }) || null;
+        });
+        if (more) { more.click(); return true; }
+        return false;
       });
-      if (moreBtn) {
-        await moreBtn.click();
-        await page.waitForTimeout(1200);
-        const menuDel = await page.evaluate(() => {
-          const els = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [role="menuitemradio"]'));
+      if (moreClicked) {
+        await page.waitForTimeout(1500);
+        const menuDeleted = await page.evaluate(() => {
+          const els = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [role="menuitemradio"], li'));
           for (const el of els) {
             const t = (el.innerText || '').toLowerCase();
             const l = (el.getAttribute('aria-label') || '').toLowerCase();
             const combined = `${t} ${l}`;
-            if ((combined.includes('löschen') || combined.includes('delete')) && !combined.includes('alle löschen')) {
-              return el;
+            if ((combined.includes('löschen') || combined.includes('delete')) && !combined.includes('alle löschen') && !combined.includes('serie löschen')) {
+              el.click();
+              return true;
             }
           }
-          return null;
+          return false;
         });
-        if (menuDel) {
-          await menuDel.click();
-          deleted = true;
-        }
+        if (menuDeleted) deleted = true;
       }
-    } else {
-      await delBtn.click();
-      deleted = true;
     }
 
-    // evtl. Bestätigungsdialog
+    // evtl. Bestätigungsdialog ("Löschen"-Bestätigung)
     await page.waitForTimeout(1500);
-    const confirmBtn = await page.evaluate(() => {
+    const confirmed = await page.evaluate(() => {
       const els = Array.from(document.querySelectorAll('button, [role="button"]'));
       for (const el of els) {
         const t = (el.innerText || '').toLowerCase();
         const l = (el.getAttribute('aria-label') || '').toLowerCase();
         const combined = `${t} ${l}`;
-        if (combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen')) {
-          // eher "einzelnes Event" als "Serie löschen"-Option
-          if (!combined.includes('serie') && !combined.includes('all')) return el;
+        if ((combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen')) &&
+            !combined.includes('serie löschen') && !combined.includes('alle löschen') && !combined.includes('all')) {
+          el.click();
+          return true;
         }
       }
-      return null;
+      return false;
     });
-    if (confirmBtn) {
-      await confirmBtn.click();
+    if (confirmed) {
+      deleted = true;
       await page.waitForTimeout(1500);
     }
 
