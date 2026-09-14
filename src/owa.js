@@ -139,24 +139,29 @@ export class OwaClient {
         await page.waitForTimeout(300);
       }
 
-      // Move to top of message body
-      await editor.click();
-      await page.waitForTimeout(200);
-      await page.keyboard.press('Control+Home');
-      await page.waitForTimeout(200);
-
-      // Type body lines
-      const lines = bodyStr.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (line) {
-          await page.keyboard.type(line, { delay: 6 });
+      // Prepend body lines before signature via safe DOM insertion
+      await editor.evaluate((el, text) => {
+        const lines = text.split('\n');
+        const fragment = document.createDocumentFragment();
+        for (const line of lines) {
+          const p = document.createElement('p');
+          if (line.trim().length === 0) {
+            p.appendChild(document.createElement('br'));
+          } else {
+            p.textContent = line;
+          }
+          fragment.appendChild(p);
         }
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(20);
-      }
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(400);
+        const spacer = document.createElement('p');
+        spacer.appendChild(document.createElement('br'));
+        fragment.appendChild(spacer);
+
+        el.insertBefore(fragment, el.firstChild);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, bodyStr);
+
+      await page.waitForTimeout(500);
 
       // Save draft
       await page.keyboard.press('Control+s');
