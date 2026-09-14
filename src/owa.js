@@ -49,6 +49,44 @@ export function buildComposeUrl(realm, { to, subject, body, cc } = {}) {
   return url;
 }
 
+export function buildCalendarComposeUrl(realm, { subject, start, end, body, is_all_day = false } = {}) {
+  const subjectStr = subject || '';
+  const bodyStr = body || '';
+  const realmParam = realm ? `realm=${encodeURIComponent(realm)}&` : '';
+
+  let url = `https://outlook.office.com/calendar/deeplink/compose?${realmParam}subject=${encodeURIComponent(subjectStr)}`;
+  if (start) {
+    url += `&startdt=${encodeURIComponent(start)}`;
+  }
+  if (end) {
+    url += `&enddt=${encodeURIComponent(end)}`;
+  }
+  if (bodyStr) {
+    url += `&body=${encodeURIComponent(bodyStr)}`;
+  }
+  if (is_all_day) {
+    url += `&allday=true`;
+  }
+  return url;
+}
+
+// Formatiert ein ISO-Datum (z.B. "2026-09-15T13:00:00" oder "2026-09-15T13:00:00+02:00")
+// zu einem OWA-kompatiblen startdt/enddt-Wert. Ohne Offset wird Europe/Berlin angenommen.
+export function normalizeCalendarDate(input, timezone = 'Europe/Berlin') {
+  if (!input) return undefined;
+  let dt = input;
+  // Kein Zeitzonen-Offset vorhanden -> Europe/Berlin implizieren
+  if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(dt)) {
+    try {
+      const date = new Date(`${dt}Z`);
+      if (!isNaN(date.getTime())) {
+        dt = date.toISOString();
+      }
+    } catch (e) { /* bewusst ignorieren */ }
+  }
+  return dt;
+}
+
 export class OwaClient {
   constructor(realm = config.defaultRealm) {
     this.realm = realm;
@@ -176,6 +214,155 @@ export class OwaClient {
       preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
       folder: "Entwürfe (Drafts)",
       message: "Entwurf wurde erfolgreich in Outlook unter 'Entwürfe' gespeichert (inklusive Signatur)."
+    };
+  }
+
+  async createCalendarEvent({ subject, start, end, body, is_all_day = false, timezone = 'Europe/Berlin', transparency = 'busy' } = {}) {
+    if (!subject || typeof subject !== 'string' || subject.trim().length === 0) {
+      throw new Error('Parameter "subject" ist erforderlich und darf nicht leer sein.');
+    }
+    if (!start || !end) {
+      throw new Error('Parameter "start" und "end" sind erforderlich.');
+    }
+
+    const page = await browserManager.ensureContext(true).then(r => r.page);
+    this.lastPage = page;
+
+    const startDt = normalizeCalendarDate(start, timezone);
+    const endDt = normalizeCalendarDate(end, timezone);
+
+    // Body NICHT in URL-Parameter geben, da OWA den Editor sonst auf Plain-Text umstellt.
+    const calendarUrl = buildCalendarComposeUrl(this.realm, { subject, start: startDt, end: endDt, is_all_day });
+
+    await page.goto(calendarUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(6000);
+
+    // Der Event-Editor von OWA stellt den Betreff in einem Textfeld dar
+    const titleInput = await page.waitForSelector(
+      'input[aria-label*="Titel" i], input[aria-label*="Title" i], input[aria-label*="Betreff" i], input[aria-label*="Subject" i], input[placeholder*="Titel" i], input[placeholder*="Add a title" i]',
+      { timeout: 15000 }
+    ).catch(() => null);
+
+    if (titleInput) {
+      await titleInput.click();
+      await page.waitForTimeout(200);
+      await titleInput.fill(subject);
+      await page.waitForTimeout(300);
+    }
+
+    // Body (Beschreibung) eintragen, falls vorhanden
+    if (body && body.trim().length > 0) {
+      const bodyEditor = await page.waitForSelector(
+        'div[role="textbox"][aria-label*="Description" i], div[role="textbox"][aria-label*="Beschreibung" i], div[role="textbox"][aria-label*="Notes" i], div[role="textbox"][aria-label*="Notizen" i], div[role="textbox"][aria-label*="body" i]',
+        { timeout: 8000 }
+      ).catch(() => null);
+
+      if (bodyEditor) {
+        await bodyEditor.click();
+        await page.waitForTimeout(300);
+        await bodyEditor.evaluate((el, text) => {
+          const lines = text.split('\n');
+          const fragment = document.createDocumentFragment();
+          for (const line of lines) {
+            const p = document.createElement('p');
+            if (line.trim().length === 0) {
+              p.appendChild(document.createElement('br'));
+            } else {
+              p.textContent = line;
+            }
+            fragment.appendChild(p);
+          }
+          el.insertBefore(fragment, el.firstChild);
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }, body);
+        await page.waitForTimeout(400);
+      }
+    }
+
+    // Speichern
+    await page.keyboard.press('Control+s');
+    await page.waitForTimeout(3000);
+
+    return {
+      success: true,
+      subject,
+      start: startDt || start,
+      end: endDt || end,
+      is_all_day,
+      transparency,
+      message: `Firmenkalender-Eintrag "${subject}" wurde in Outlook gespeichert (${transparency}). Bitte im Kalender kurz gegenprüfen.`
+    };
+  }
+
+  async getFreeBusy({ start, end } = {}) {
+    if (!start || !end) {
+      throw new Error('Parameter "start" und "end" sind erforderlich.');
+    }
+
+    const page = await browserManager.ensureContext(true).then(r => r.page);
+    this.lastPage = page;
+
+    const startDt = normalizeCalendarDate(start) || start;
+    const endDt = normalizeCalendarDate(end) || end;
+
+    // Woche/Tag-Ansicht öffnen
+    const calUrl = this.realm
+      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+      : 'https://outlook.office.com/calendar/view/week';
+
+    await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(6000);
+
+    // Belegte Slots robust aus den ARIA-Labels der Kalenderbuttons auslesen
+    const busySlots = await page.evaluate(({ startDt, endDt }) => {
+      const buttons = Array.from(document.querySelectorAll('[role="button"][aria-label]'));
+      const targetDate = startDt.slice(0, 10); // z.B. 2026-09-17
+      
+      const parsedDate = new Date(startDt);
+      const dayNum = parsedDate.getDate(); // z.B. 17
+      const weekdayNamesEn = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+      const weekdayNamesDe = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
+      const monthNamesEn = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      const monthNamesDe = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+      
+      const weekdayEn = weekdayNamesEn[parsedDate.getDay()];
+      const weekdayDe = weekdayNamesDe[parsedDate.getDay()];
+      const monthEn = monthNamesEn[parsedDate.getMonth()];
+      const monthDe = monthNamesDe[parsedDate.getMonth()];
+
+      const slots = [];
+      const seen = new Set();
+
+      for (const btn of buttons) {
+        const label = btn.getAttribute('aria-label') || '';
+        if (!label) continue;
+        
+        // Filter auf Busy/Besetzt/Termine
+        const isEvent = label.includes('Busy') || label.includes('Tentative') || label.includes('Besetzt') || label.includes('to ') || label.includes('bis ');
+        if (!isEvent) continue;
+
+        // Prüfen ob Event zum Ziel-Tag gehört (z.B. "Thursday", "Donnerstag", "17", "September")
+        const matchesDay = label.includes(weekdayEn) || label.includes(weekdayDe) || (label.includes(String(dayNum)) && (label.includes(monthEn) || label.includes(monthDe)));
+        
+        if (matchesDay) {
+          if (!seen.has(label)) {
+            seen.add(label);
+            slots.push(label);
+          }
+        }
+      }
+
+      return slots;
+    }, { startDt, endDt });
+
+    return {
+      start: startDt,
+      end: endDt,
+      calendar: 'Firmenkalender (Outlook Web)',
+      busySlots,
+      count: busySlots.length,
+      note: 'Busy-Slots direkt aus ARIA-Labels der Kalender-Event-Elemente extrahiert.'
     };
   }
 
