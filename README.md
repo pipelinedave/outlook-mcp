@@ -35,6 +35,11 @@ neue E-Mail-Entwürfe sicher anlegen.
    - `outlook_archive_email`: Verschiebt eine E-Mail anhand ihrer Conversation-ID ins Archiv.
    - `outlook_accept_meeting`: Nimmt eine Termineinladung (Meeting Request) in Outlook Web an (RSVP "Annehmen"/Accept). Sendet die Annahme-Rückmeldung an die Gegenseite, trägt den Termin in den Firmenkalender ein und übernimmt den Outlook-typischen Archiv-Flow. Lokalisierung per Conversation-ID oder Suchbegriff.
    - `outlook_close`: Beendet die Hintergrund-Browserinstanz.
+- **Firmenkalender-Tools** (für Blocker & Fokuszeiten im Outlook-Firmenkalender):
+  - `outlook_create_calendar_event`: Legt einen Kalender-Eintrag (Standard `transparency: busy`) per OWA DeepLink an. Termin-Zeiten werden korrekt als Berlin-Lokalzeit interpretiert (keine UTC-Verschiebung).
+  - `outlook_get_freebusy`: Fragt die Belegung des Firmenkalenders in einem Zeitfenster ab (Busy-Slots aus ARIA-Labels), zur Kollisionsprüfung vor dem Anlegen eines Blockers.
+  - `outlook_delete_calendar_event`: Löscht ein Kalender-Event anhand seines Titels/Suchbegriffs (über die Wochenansicht + echten Playwright-Klick). Entfernt einzelne Events, verhindert versehentliches Löschen ganzer Serien.
+  - `outlook_update_calendar_event`: Bearbeitet einen bestehenden Kalender-Eintrag (Titel/Zeit/Beschreibung) anhand seines Suchbegriffs.
 - **Sicherheits-Konzept (Draft-First)**: Es gibt kein Blindversenden von Mails. Der Server legt Entwürfe an, sodass der Anwender die Nachricht vor dem Absenden in Outlook sichten und freigeben kann.
 - **Auto-Erkennung von Browsern**: Findet automatisch Chromium/Chrome/Edge unter Linux, WSL, macOS und Windows (oder via `OUTLOOK_MCP_CHROME_PATH`).
 - **Persistentes lokales Profil**: Anmeldedaten und MFA-Tokens verbleiben sicher im lokalen Profil (`~/.outlook-browser-profile`).
@@ -119,6 +124,37 @@ exec node /pfad/zu/outlook-mcp/index.js "$@"
 3. Sobald dein Posteingang geladen ist, kannst du das Fenster schließen oder geöffnet lassen.
 4. Prüfe mit `outlook_status` den Verbindungsstatus.
 5. Das Profil wird dauerhaft lokal gespeichert – zukünftige MCP-Aufrufe laufen vollautomatisch im Hintergrund (Headless).
+
+---
+
+## Firmenkalender-Blocker (Fokuszeiten)
+
+Die Kalender-Tools bedienen ausschließlich den **Outlook-Firmenkalender** (OWA).
+Nützlich, um Fokusblöcke/Abwesenheiten anzulegen, Kollisionen zu prüfen und Blocker zu pflegen bzw. zu entfernen.
+
+```json
+// 1) Vorab Kollisionsprüfung (Busy-Slots im Fenster auslesen)
+{
+  "name": "outlook_get_freebusy",
+  "arguments": { "start": "2026-09-15T09:30:00", "end": "2026-09-15T11:00:00" }
+}
+
+// 2) Blocker anlegen (08:00–09:00 Berlin, busy)
+{
+  "name": "outlook_create_calendar_event",
+  "arguments": { "subject": "Fokus: tiefe Arbeit", "start": "2026-09-15T08:00:00", "end": "2026-09-15T09:00:00" }
+}
+
+// 3) Blocker löschen (per Titel-Fragment)
+{
+  "name": "outlook_delete_calendar_event",
+  "arguments": { "query": "Fokus: tiefe Arbeit" }
+}
+```
+
+> **Zeitzonen-Hinweis**: Zeiten ohne Offset (z.B. `2026-09-15T08:00:00`) werden als
+> **Europe/Berlin-Lokalzeit** interpretiert (OWA interpretiert `startdt` ohne Offset als
+> lokale Browserzeit). Ein expliziter Offset (`+02:00`) bzw. `Z` wird nach UTC-ISO normalisiert.
 
 ---
 
