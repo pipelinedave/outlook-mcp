@@ -362,17 +362,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 
-      case 'outlook_reply_draft': {
-        const res = await owaClient.replyDraft({
-          emailId: args.email_id || args.id,
-          query: args.query || args.subject,
-          body: args.body,
-          replyAll: args.reply_all ?? false,
-          folder: args.folder
-        });
-        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
-      }
-
       case 'outlook_accept_meeting': {
         const res = await owaClient.acceptMeeting({
           email_id: args?.email_id || args?.id,

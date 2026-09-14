@@ -937,9 +937,42 @@ export class OwaClient {
       throw new Error('Compose-Editor für den Antwort-Entwurf konnte nicht gefunden werden.');
     }
 
-    // 6. Focus editor, jump to top, type body
-    await editor.click();
+    // 6. Focus editor, verify activeElement, jump to top, type body
+    await editor.focus();
+    await editor.click({ position: { x: 10, y: 10 } });
     await activePage.waitForTimeout(300);
+
+    // Verify editor has focus; if not, force focus via evaluate
+    const isEditorActive = await activePage.evaluate(el => document.activeElement === el || el.contains(document.activeElement), editor);
+    if (!isEditorActive) {
+      await editor.evaluate(el => el.focus());
+      await activePage.waitForTimeout(200);
+    }
+
+    // Safety check: ensure activeElement is NOT an input/recipient/subject field
+    const activeDetails = await activePage.evaluate(() => {
+      const a = document.activeElement;
+      return {
+        tag: a.tagName,
+        ariaLabel: (a.getAttribute('aria-label') || '').toLowerCase(),
+        role: (a.getAttribute('role') || '').toLowerCase()
+      };
+    });
+
+    if (activeDetails.tag === 'INPUT' || activeDetails.ariaLabel.includes('to') || activeDetails.ariaLabel.includes('an') || activeDetails.ariaLabel.includes('cc') || activeDetails.ariaLabel.includes('subject') || activeDetails.ariaLabel.includes('betreff')) {
+      // Re-target editor explicitly
+      await editor.evaluate(el => {
+        el.focus();
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.setStart(el, 0);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      });
+      await activePage.waitForTimeout(200);
+    }
+
     await activePage.keyboard.press('Control+Home');
     await activePage.waitForTimeout(200);
 
