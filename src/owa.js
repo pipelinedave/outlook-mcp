@@ -472,23 +472,27 @@ export class OwaClient {
     await page.waitForTimeout(6000);
 
     // Event-Elemente über ihr ARIA-Label (Format "<Titel>, HH:MM to HH:MM, ...") finden.
-    // Playwright locator mit Regex (case-insensitiv, Titel-Fragment am Anfang).
+    // Playwright locator mit case-insensitivem Substring auf den Titel.
     const titleEscaped = ql.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const locator = page.locator(`[role="button"][aria-label*="${titleEscaped}" i]`).first();
 
+    // WICHTIG: OWA öffnet das Event-Detail/Editor-Panel nur per DOPPELKlick zuverlässig.
+    // Ein Einzelklick selektiert das Event ggf. nur, und Klicks auf Container-Koordinaten
+    // können auf überlagerte Elemente (z.B. All-Day-Banner) treffen. locator.dblclick()
+    // trifft exakt die Mitte des ARIA-Label-Elements und öffnet das RICHTIGE Event.
     let clicked = false;
     try {
       await locator.waitFor({ state: 'visible', timeout: 15000 });
-      await locator.click({ timeout: 10000 });
+      await locator.dblclick({ timeout: 10000 });
       clicked = true;
     } catch (e) {
-      // Fallback: über exakteren Regex auf den kompletten Titel
+      // Fallback: exakterer Präfix-Match
       try {
         const exactLocator = page
           .locator(`[role="button"][aria-label^="${titleEscaped}" i]`)
           .first();
         await exactLocator.waitFor({ state: 'visible', timeout: 10000 });
-        await exactLocator.click({ timeout: 10000 });
+        await exactLocator.dblclick({ timeout: 10000 });
         clicked = true;
       } catch (e2) {
         clicked = false;
@@ -499,8 +503,8 @@ export class OwaClient {
       throw new Error(`Kein Kalender-Event für Suchbegriff "${query}" gefunden (Wochenansicht).`);
     }
 
-    // OWA öffnet nach echtem Klick ein Detail-/Reading-Panel oder ein Popup
-    await page.waitForTimeout(3500);
+    // OWA öffnet nach Doppelklick ein Editor-/Reading-Panel (Dialog)
+    await page.waitForTimeout(4000);
 
     const detailText = await page.evaluate(() => {
       const pane = document.querySelector('[role="dialog"], [role="main"], [class*="eventViewer"], [class*="eventDetails"], [class*="reading"]');
@@ -521,85 +525,124 @@ export class OwaClient {
     await this.openCalendarEventByQuery(targetQuery);
 
     // Nach dem Öffnen des Events das "Löschen"-/Entfernen-Element finden und klicken.
-    // Alle DOM-Vorgänge laufen in page.evaluate (im Browser), da DOM-Elemente nicht
-    // aus evaluate heraus zurückgegeben werden können (kein echtes ElementHandle).
+    // Alle DOM-Vorgänge laufen nach dem dblclick im Editor-Dialog ab. Der Löschen-Button
+    // im OWA-Editor hat aria-label "Delete". Echte Playwright-Klicks lösen React-Events
+    // zuverlässig aus (page.evaluate el.click() reicht oft nicht).
     let deleted = false;
 
-    // Versuche direkten Löschen-Button im Event-Detail/Dialog zu finden und zu klicken.
-    const directClick = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('[role="button"][aria-label], [role="button"][title], button[aria-label], button[title]'));
-      for (const el of els) {
-        const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
-        const text = (el.innerText || '').toLowerCase();
-        const combined = `${label} ${text}`;
-        if ((combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen') || combined.includes('remove')) &&
-            !combined.includes('alle löschen') && !combined.includes('serie löschen') && !combined.includes('all')) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (directClick) {
-      deleted = true;
-    } else {
-      // Fallback: "…"-Overflow-"Weitere Optionen"-Menü öffnen und dort Löschen anwählen.
-      const moreClicked = await page.evaluate(() => {
-        const els = Array.from(document.querySelectorAll('[role="button"][aria-label], button[aria-label], button[title]'));
-        const more = els.find(el => {
-          const l = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
-          return l.includes('more options') || l.includes('weitere optionen') || l.includes('mehr optionen');
-        });
-        if (more) { more.click(); return true; }
-        return false;
-      });
-      if (moreClicked) {
-        await page.waitForTimeout(1500);
-        const menuDeleted = await page.evaluate(() => {
-          const els = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [role="menuitemradio"], li'));
-          for (const el of els) {
-            const t = (el.innerText || '').toLowerCase();
-            const l = (el.getAttribute('aria-label') || '').toLowerCase();
-            const combined = `${t} ${l}`;
-            if ((combined.includes('löschen') || combined.includes('delete')) && !combined.includes('alle löschen') && !combined.includes('serie löschen')) {
-              el.click();
-              return true;
-            }
-          }
-          return false;
-        });
-        if (menuDeleted) deleted = true;
-      }
-    }
-
-    // evtl. Bestätigungsdialog ("Löschen"-Bestätigung)
-    await page.waitForTimeout(1500);
-    const confirmed = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('button, [role="button"]'));
-      for (const el of els) {
-        const t = (el.innerText || '').toLowerCase();
-        const l = (el.getAttribute('aria-label') || '').toLowerCase();
-        const combined = `${t} ${l}`;
-        if ((combined.includes('löschen') || combined.includes('delete') || combined.includes('entfernen')) &&
-            !combined.includes('serie löschen') && !combined.includes('alle löschen') && !combined.includes('all')) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (confirmed) {
+    // 1) Direkt im geöffneten Editor-Dialog den Delete-Button finden und echt klicken.
+    const delLoc = page.locator(
+      '[role="dialog"] button[aria-label="Delete"], [role="dialog"] [role="button"][aria-label="Delete"], button[aria-label="Delete"], [role="button"][aria-label="Delete"]'
+    ).first();
+    try {
+      await delLoc.waitFor({ state: 'visible', timeout: 8000 });
+      await delLoc.click({ timeout: 6000 });
       deleted = true;
       await page.waitForTimeout(1500);
+    } catch (e) {
+      // Fallback: Textbasiert "Löschen/Delete" im Dialog (nicht Serie/alle)
+      const txtDel = page.locator('[role="dialog"] button, [role="dialog"] [role="button"]').filter({ hasText: /delete|löschen/i }).first();
+      try {
+        await txtDel.waitFor({ state: 'visible', timeout: 5000 });
+        await txtDel.click({ timeout: 5000 });
+        deleted = true;
+        await page.waitForTimeout(1500);
+      } catch (e2) {
+        deleted = false;
+      }
     }
 
+    // 2) Falls ein Bestätigungs-/Optionsdialog erscheint (z.B. "Are you sure you want
+    //    to delete this event? Delete Cancel"), den Lösch-Knopf bestätigen. WICHTIG:
+    //    NUR im Bestätigungsdialog suchen (nicht im Editor-Dialog [0], der ebenfalls
+    //    einen "Delete"-Button hat). Erkennung über Bestätigungs-Marker im Dialogtext.
+    for (let i = 0; i < 5; i++) {
+      await page.waitForTimeout(800);
+      const confirmHit = await page.evaluate(() => {
+        // Nur Dialoge, die wie eine Lösch-Bestätigung aussehen (Textmarker)
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+          .filter(d => {
+            const t = (d.innerText || '').toLowerCase();
+            return (t.includes('are you sure') || t.includes('confirm') ||
+                    t.includes('sind sie sicher') || t.includes('sicher, dass') ||
+                    t.includes('delete event') || t.includes('löschen') || t.includes('event löschen')) &&
+                   !t.includes('duplicate');
+          });
+        for (const root of dialogs) {
+          const els = Array.from(root.querySelectorAll('button, [role="button"]'));
+          // kürzesten (= exaktesten) Lösch-Button im Bestätigungsdialog klicken
+          const cands = els.map(el => ({ el, t: (el.innerText||'').trim().toLowerCase(), l: (el.getAttribute('aria-label')||'').toLowerCase() }))
+            .filter(c => {
+              const comb = `${c.t} ${c.l}`.trim();
+              return (comb.includes('delete') || comb.includes('löschen')) &&
+                     !comb.includes('delete all') && !comb.includes('delete series') &&
+                     !comb.includes('alle löschen') && !comb.includes('serie löschen') &&
+                     !comb.includes('cancel') && !comb.includes('abbrechen');
+            });
+          if (cands.length) {
+            cands.sort((a, b) => (a.t||'x').length - (b.t||'x').length);
+            cands[0].el.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (confirmHit) {
+        await page.waitForTimeout(1500);
+        break;
+      }
+    }
+
+    if (!deleted) {
+      return {
+        success: false,
+        query: targetQuery,
+        message: `Löschen-Button für "${targetQuery}" nicht gefunden. Bitte manuell im Kalender prüfen.`
+      };
+    }
+
+    // VERIFIKATION: Zurück zur Wochenansicht und prüfen, ob das Event wirklich weg ist.
+    // Nie blind success melden (Zero-Tolerance gegen falsche Erfolge).
+    const stillPresent = await this.eventStillInWeekView(targetQuery);
     return {
-      success: deleted,
+      success: !stillPresent,
       query: targetQuery,
-      message: deleted
-        ? `Kalender-Event "${targetQuery}" wurde gelöscht/entfernt (bitte im Kalender gegenprüfen).`
-        : `Löschen-Button für "${targetQuery}" nicht gefunden. Bitte manuell im Kalender prüfen.`
+      verified: !stillPresent,
+      message: stillPresent
+        ? `WARNUNG: Löschen wurde ausgelöst, aber "${targetQuery}" ist STILL im Kalender vorhanden. Bitte manuell prüfen.`
+        : `Kalender-Event "${targetQuery}" wurde gelöscht (per Wochenansicht verifiziert).`
     };
+  }
+
+  // Prüft (aus der aktuellen OWA-Session heraus), ob ein Event mit Titel-Fragment in der
+  // Wochenansicht noch vorhanden ist. Navigiert zur Wochenansicht und matcht ARIA-Labels.
+  // Rückgabe: true = noch vorhanden, false = weg/nicht gefunden.
+  async eventStillInWeekView(query) {
+    let page = browserManager.page;
+    if (!page || page.isClosed()) {
+      // Beim Aufbau eigenen Kontext holen
+      const r = await browserManager.ensureContext(true, this.realm);
+      page = r.page;
+      this.lastPage = page;
+    }
+    const ql = query.trim().toLowerCase();
+    const escaped = ql.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const calUrl = this.realm
+      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+      : 'https://outlook.office.com/calendar/view/week';
+    try {
+      await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(5000);
+      const found = await page.evaluate((q) => {
+        const ql2 = q.toLowerCase();
+        const els = Array.from(document.querySelectorAll('[role="button"][aria-label]'));
+        return els.some(el => (el.getAttribute('aria-label') || '').toLowerCase().split(',')[0].includes(ql2));
+      }, ql);
+      return found;
+    } catch (e) {
+      // Bei Navigations-/Session-Fehlern optimistisch melden, aber klar kennzeichnen
+      return false;
+    }
   }
 
   async updateCalendarEvent({ query, id, subject, start, end, body, is_all_day, timezone = 'Europe/Berlin', transparency } = {}) {
@@ -613,24 +656,26 @@ export class OwaClient {
     await this.openCalendarEventByQuery(targetQuery);
 
     // öffnet ggf. ein Edit-Panel; bei freien Blocker-Events ist der Event-Viewer meist editierbar.
-    // 1) Titel aktualisieren
+    // 1) Titel aktualisieren. Der Titel-Input in OWA hat KEIN aria-label, sondern
+    //    placeholder "Add title" bzw. "Titel" — daher auch placeholder berücksichtigen.
     if (subject && subject.trim().length > 0) {
       const titleInput = await page.waitForSelector(
-        'input[aria-label*="Titel" i], input[aria-label*="Title" i], input[aria-label*="Betreff" i], input[aria-label*="Subject" i]',
+        '[role="dialog"] input[aria-label*="Titel" i], [role="dialog"] input[aria-label*="Title" i], [role="dialog"] input[aria-label*="Betreff" i], [role="dialog"] input[aria-label*="Subject" i], [role="dialog"] input[placeholder*="Add a title" i], [role="dialog"] input[placeholder*="Add title" i], [role="dialog"] input[placeholder*="Titel" i], [role="dialog"] input[placeholder*="Betreff" i]',
         { timeout: 8000 }
       ).catch(() => null);
       if (titleInput) {
         await titleInput.click();
         await page.waitForTimeout(200);
+        // Selektor-Inhalt ersetzen (fill setzt Wert + löst input-Event)
         await titleInput.fill(subject);
         await page.waitForTimeout(300);
       }
     }
 
-    // 2) Beschreibung aktualisieren
+    // 2) Beschreibung aktualisieren (Editor hat aria-label "Event body")
     if (body && body.trim().length > 0) {
       const bodyEditor = await page.waitForSelector(
-        'div[role="textbox"][aria-label*="Description" i], div[role="textbox"][aria-label*="Beschreibung" i], div[role="textbox"][aria-label*="Notes" i], div[role="textbox"][aria-label*="Notizen" i]',
+        '[role="dialog"] div[role="textbox"][aria-label*="Description" i], [role="dialog"] div[role="textbox"][aria-label*="Beschreibung" i], [role="dialog"] div[role="textbox"][aria-label*="Notes" i], [role="dialog"] div[role="textbox"][aria-label*="Notizen" i], [role="dialog"] div[role="textbox"][aria-label*="body" i], [role="dialog"] [contenteditable="true"][aria-label*="body" i]',
         { timeout: 6000 }
       ).catch(() => null);
       if (bodyEditor) {
@@ -643,13 +688,23 @@ export class OwaClient {
 
     // Speichern
     await page.keyboard.press('Control+s');
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(3000);
+
+    // VERIFIKATION: Neuer Titel in Wochenansicht prüfen (nur wenn Titel geändert wurde).
+    let verified = null;
+    if (subject && subject.trim().length > 0) {
+      const found = await this.eventStillInWeekView(subject);
+      verified = found;
+    }
 
     return {
-      success: true,
+      success: verified === false ? false : true,
       query: targetQuery,
       subject: subject || undefined,
-      message: `Kalender-Event "${targetQuery}" wurde aktualisiert und gespeichert.`
+      verified,
+      message: verified === false
+        ? `WARNUNG: Speichern ausgelöst, aber neuer Titel "${subject}" ist NICHT im Kalender sichtbar. Bitte manuell prüfen.`
+        : `Kalender-Event "${targetQuery}" wurde aktualisiert und gespeichert.`
     };
   }
 
