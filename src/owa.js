@@ -1285,6 +1285,144 @@ export class OwaClient {
     throw new Error(`convid ${convid} nicht in Ordner ${folder} gefunden`);
   }
 
+  // Verwirft einen E-Mail-Entwurf im Ordner "Entwürfe" (OWA-"Verwerfen"/Discard).
+  // Ablauf: Entwurf per conversation-ID (exakt) oder Betreff-Fragment (Textmatch) finden,
+  // dann per Rechtsklick-Kontextmenü "Verwerfen" klicken; Fallback: Entwurf öffnen und
+  // Toolbar-"Verwerfen" klicken. Bestätigungsdialoge werden abgefangen, das Ergebnis
+  // wird gegen die Entwurfsliste verifiziert (kein blindes Success).
+  async discardDraft({ id, query, folder = 'drafts' } = {}) {
+    const targetQuery = id || query;
+    if (!targetQuery) {
+      throw new Error('Parameter "id" (conversation-ID) oder "query" (Betreff-Fragment) ist erforderlich.');
+    }
+
+    const page = await this.getPage(true);
+    await this.navigateFolder(folder || 'drafts');
+    await page.waitForTimeout(3000);
+    await page.waitForSelector('div[data-convid]', { timeout: 10000 }).catch(() => null);
+
+    const needle = String(targetQuery).toLowerCase();
+    // ID -> exakter conversation-ID-Match; query -> Textmatch auf die Zeile
+    const rowMatches = async (row) => {
+      if (id) {
+        const cid = ((await row.getAttribute('data-convid')) || '').toLowerCase();
+        return cid === needle;
+      }
+      const text = ((await row.innerText().catch(() => '')) || '').toLowerCase();
+      return text.includes(needle);
+    };
+
+    let targetRow = null;
+    for (let i = 0; i < 50; i++) {
+      const rows = await page.$$('div[data-convid]');
+      for (const r of rows) {
+        if (await rowMatches(r)) { targetRow = r; break; }
+      }
+      if (targetRow) break;
+      // scroll
+      await page.evaluate(() => {
+        const list = document.querySelector('[aria-label="Message list"]');
+        if (list) list.scrollTop += 1500;
+      });
+      await page.waitForTimeout(500);
+    }
+    if (!targetRow) {
+      throw new Error(`Entwurf "${targetQuery}" im Ordner "${folder || 'drafts'}" nicht gefunden.`);
+    }
+
+    // 1. Versuch: Kontextmenü (Rechtsklick) -> "Verwerfen"/"Discard"
+    let discarded = false;
+    await targetRow.click({ button: 'right' });
+    await page.waitForTimeout(600);
+    const discardItem = await page.waitForSelector(
+      '[role="menuitem"]:has-text("Verwerfen"), [role="menuitem"]:has-text("Discard"), ' +
+      '[role="menuitem"][aria-label*="Verwerfen" i], [role="menuitem"][aria-label*="Discard" i]',
+      { timeout: 5000 }
+    ).catch(() => null);
+    if (discardItem) {
+      await discardItem.click();
+      discarded = true;
+      await page.waitForTimeout(2000);
+    }
+
+    // 2. Fallback: Entwurf öffnen und Toolbar-"Verwerfen" klicken
+    if (!discarded) {
+      await targetRow.click();
+      await page.waitForTimeout(2000);
+      const toolbarBtn = await page.waitForSelector(
+        'button[aria-label*="Verwerfen" i], button[aria-label*="Discard" i], ' +
+        '[role="button"][aria-label*="Verwerfen" i], [role="button"][aria-label*="Discard" i]',
+        { timeout: 6000 }
+      ).catch(() => null);
+      if (toolbarBtn) {
+        await toolbarBtn.click();
+        discarded = true;
+        await page.waitForTimeout(2000);
+      }
+    }
+
+    // 3. Bestätigungsdialog abfangen (falls OWA nachfragt): Verwerfen/Löschen bestätigen,
+    //    niemals "Abbrechen/Cancel" klicken.
+    for (let i = 0; i < 3 && discarded; i++) {
+      await page.waitForTimeout(800);
+      const confirmed = await page.evaluate(() => {
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+          .filter(d => {
+            const t = (d.innerText || '').toLowerCase();
+            return t.includes('verwerfen') || t.includes('discard') || t.includes('löschen') ||
+                   t.includes('delete') || t.includes('sicher') || t.includes('sure');
+          });
+        for (const root of dialogs) {
+          const els = Array.from(root.querySelectorAll('button, [role="button"]'));
+          const cands = els.map(el => ({
+            el,
+            t: (el.innerText || '').trim().toLowerCase(),
+            l: (el.getAttribute('aria-label') || '').toLowerCase()
+          })).filter(c => {
+            const comb = `${c.t} ${c.l}`.trim();
+            return (comb.includes('verwerfen') || comb.includes('discard') ||
+                    comb.includes('löschen') || comb.includes('delete')) &&
+                   !comb.includes('abbrechen') && !comb.includes('cancel');
+          });
+          if (cands.length) {
+            cands.sort((a, b) => (a.t || 'x').length - (b.t || 'x').length);
+            cands[0].el.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (!confirmed) break;
+      await page.waitForTimeout(1500);
+    }
+
+    if (!discarded) {
+      return {
+        success: false,
+        query: targetQuery,
+        message: `Verwerfen-Button für Entwurf "${targetQuery}" nicht gefunden. Bitte manuell in Outlook prüfen.`
+      };
+    }
+
+    // VERIFIKATION: Entwurf aus der Entwurfsliste entfernt? Nie blind success melden.
+    await page.waitForTimeout(1500);
+    let stillThere = false;
+    const rowsAfter = await page.$$('div[data-convid]');
+    for (const r of rowsAfter) {
+      if (await rowMatches(r)) { stillThere = true; break; }
+    }
+
+    return {
+      success: !stillThere,
+      verified: !stillThere,
+      query: targetQuery,
+      folder: folder || 'drafts',
+      message: stillThere
+        ? `WARNUNG: Verwerfen wurde ausgelöst, aber Entwurf "${targetQuery}" ist noch in der Entwurfsliste sichtbar. Bitte manuell prüfen.`
+        : `Entwurf "${targetQuery}" wurde verworfen (aus der Entwurfsliste entfernt und verifiziert).`
+    };
+  }
+
   async acceptMeeting({ email_id, id, query, subject, folder, send_response = true } = {}) {
     const page = await this.getPage(true);
     const context = browserManager.context;

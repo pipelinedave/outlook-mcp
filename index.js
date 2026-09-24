@@ -234,6 +234,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'outlook_discard_draft',
+        description: 'Verwirft einen E-Mail-Entwurf im Ordner "Entwürfe" (Drafts) in Outlook Web (OWA-"Verwerfen"/Discard per echtem Klick). Nützlich, um veraltete oder doppelte Entwürfe aufzuräumen. Lokalisierung per conversation-ID (data-convid) oder Betreff-Fragment.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'conversation-ID (data-convid) des Entwurfs' },
+            query: { type: 'string', description: 'Betreff-Fragment zum Finden des Entwurfs (falls keine ID bekannt)' },
+            folder: { type: 'string', description: 'Optional: Ordner (Standard: drafts/Entwürfe)' }
+          }
+        }
+      },
+      {
         name: 'outlook_accept_meeting',
         description: 'Nimmt eine Termineinladung (Meeting Request) in Outlook Web an (RSVP "Annehmen"/Accept). Sendet die Annahme-Rückmeldung an die Gegenseite, trägt den Termin in den Firmenkalender ein und übernimmt den Outlook-typischen Archiv-Flow. Lokalisierung per conversation-ID (data-convid) oder Suchbegriff.',
         inputSchema: {
@@ -417,6 +429,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'outlook_archive_email': {
         const res = await owaClient.archiveEmail(args.id, args.folder);
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_discard_draft': {
+        const res = await owaClient.discardDraft({
+          id: args?.id,
+          query: args?.query,
+          folder: args?.folder
+        });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 
