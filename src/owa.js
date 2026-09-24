@@ -500,13 +500,71 @@ export class OwaClient {
     const startDt = normalizeCalendarDate(start) || start;
     const endDt = normalizeCalendarDate(end) || end;
 
-    // Woche/Tag-Ansicht öffnen
-    const calUrl = this.realm
-      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
-      : 'https://outlook.office.com/calendar/view/week';
+    // Angefragter Range als Datums-Strings (YYYY-MM-DD)
+    const rangeStartDate = String(startDt).slice(0, 10);
+    const rangeEndDate = String(endDt).slice(0, 10);
 
-    await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
+    // Zielwoche bestimmen: Montag der Woche, die das Startdatum enthält
+    // (OWA-Wochenansicht beginnt montags).
+    const startDateObj = new Date(rangeStartDate + 'T00:00:00');
+    const weekday = startDateObj.getDay(); // 0 = Sonntag
+    const offsetToMonday = weekday === 0 ? -6 : 1 - weekday;
+    const mondayIso = toIsoDate(new Date(startDateObj.getTime() + offsetToMonday * 86400000));
+
+    // Navigation MIT Zielwoche: Ohne startdate-Parameter öffnet OWA die aktuell
+    // gerenderte Woche — Root Cause des Fehlers "falsche Kalenderwoche" (24.09.2026).
+    const realmParam = this.realm ? `&realm=${encodeURIComponent(this.realm)}` : '';
+    const buildWeekUrl = (iso) => `https://outlook.office.com/calendar/view/week?startdate=${iso}${realmParam}`;
+
+    await page.goto(buildWeekUrl(mondayIso), { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(6000);
+
+    // VERIFIKATION: Gerenderten Wochen-Header lesen und gegen den angefragten Range prüfen.
+    // Nie blind Daten der falschen Woche zurückgeben.
+    let rendered = await readRenderedCalendarWeek(page);
+    const isRequestedWeek = (r) => Boolean(
+      r && r.startDate && r.endDate &&
+      r.startDate <= rangeStartDate && rangeStartDate <= r.endDate
+    );
+
+    if (rendered.startDate && rendered.endDate && !isRequestedWeek(rendered)) {
+      // Falsche Woche gerendert: bis zu 2 Retries über die "Nächste Woche"-Navigation,
+      // danach FEHLER statt falscher Belegungsdaten.
+      let currentMonday = mondayIso;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const nextBtn = page.locator(
+          '[aria-label*="Nächste Woche" i], [aria-label*="Next week" i], [title*="Nächste Woche" i], [title*="Next week" i]'
+        ).first();
+        let clicked = false;
+        try {
+          await nextBtn.waitFor({ state: 'visible', timeout: 5000 });
+          await nextBtn.click({ timeout: 5000 });
+          clicked = true;
+        } catch (e) {
+          // Button nicht gefunden -> Fallback: direkte URL-Navigation auf Montag + 7 Tage
+        }
+        currentMonday = toIsoDate(new Date(new Date(currentMonday + 'T00:00:00').getTime() + 7 * 86400000));
+        if (!clicked) {
+          await page.goto(buildWeekUrl(currentMonday), { waitUntil: 'domcontentloaded' }).catch(() => null);
+        }
+        await page.waitForTimeout(4000);
+        rendered = await readRenderedCalendarWeek(page);
+        if (isRequestedWeek(rendered)) break;
+      }
+
+      if (!isRequestedWeek(rendered)) {
+        throw new Error(
+          `Kalender-Wochenansicht zeigt nicht die angefragte Woche: angefragt ab ${rangeStartDate}, ` +
+          `gerendert ${rendered.startDate || '?'} – ${rendered.endDate || '?'} ` +
+          `(Header: "${(rendered.text || '').slice(0, 120)}"). ` +
+          `Es werden bewusst KEINE falschen Belegungsdaten zurückgegeben. Bitte erneut versuchen oder OWA manuell prüfen.`
+        );
+      }
+    }
+
+    // dataQuality: 'verified' = Wochen-Header gelesen und passt zum Range;
+    // 'unverified' = Header nicht lesbar (Slots werden trotzdem geliefert, mit Warnung).
+    const dataQuality = (rendered.startDate && rendered.endDate) ? 'verified' : 'unverified';
 
     // Belegte Slots robust aus den ARIA-Labels der Kalenderbuttons auslesen
     const busySlots = await page.evaluate(({ startDt, endDt }) => {
@@ -550,13 +608,28 @@ export class OwaClient {
       return slots;
     }, { startDt, endDt });
 
+    // Hinweise zusammenbauen (Verifikationsstatus + Range-Abdeckung)
+    let note = 'Busy-Slots direkt aus ARIA-Labels der Kalender-Event-Elemente extrahiert.';
+    if (dataQuality === 'unverified') {
+      note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
+    }
+    if (rendered.endDate && rangeEndDate > rendered.endDate) {
+      note += ` HINWEIS: Der angefragte Range endet (${rangeEndDate}) nach der gerenderten Woche (${rendered.endDate}) — spätere Tage sind nicht enthalten.`;
+    }
+
     return {
       start: startDt,
       end: endDt,
       calendar: 'Firmenkalender (Outlook Web)',
+      renderedWeek: {
+        text: rendered.text,
+        startDate: rendered.startDate,
+        endDate: rendered.endDate
+      },
+      dataQuality,
       busySlots,
       count: busySlots.length,
-      note: 'Busy-Slots direkt aus ARIA-Labels der Kalender-Event-Elemente extrahiert.'
+      note
     };
   }
 
