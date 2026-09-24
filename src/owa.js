@@ -1242,9 +1242,14 @@ export class OwaClient {
     return { folder, count: emails.length, emails };
   }
 
-  async readEmailByConvId(convid, folder) {
+  async readEmailByConvId(convid, folder, { timeoutMs = 60000 } = {}) {
     const page = await this.getPage(true);
     if (folder) { await this.navigateFolder(folder); }
+    // Hartes Zeitlimit für die Scroll-Enumeration: Ohne Limit lief die Schleife so lange,
+    // dass der MCP-Client mit Timeout -32001 abbrach (Fehlerbild 24.09.2026). Mit Deadline
+    // werfen wir stattdessen einen sauberen, recoverbaren Fehler.
+    const deadline = Date.now() + timeoutMs;
+
     const readPane = async () => {
       const readingPane = await page.waitForSelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView', { timeout: 12000 });
       const rawHtml = await readingPane.innerHTML();
@@ -1252,15 +1257,25 @@ export class OwaClient {
       const title = await readingPane.$eval('h1, h2, [role="heading"]', el => el.innerText).catch(() => '');
       return { title, contentMarkdown: markdown };
     };
+
+    // Playwright-Locator auf die conversation-ID: deutlich weniger CDP-Round-Trips als
+    // das frühere $$- + getAttribute-Scanning jeder Zeile (Hauptursache der Timeouts).
+    const rowLocator = page.locator(`div[data-convid="${String(convid).replace(/["\\]/g, '\\$&')}"]`).first();
+
     // scroll to find the convid in rendered rows
-    for (let i = 0; i < 200; i++) {
-      const rows = await page.$$('div[data-convid]');
-      let target = null;
-      for (const r of rows) {
-        const id = await r.getAttribute('data-convid');
-        if (id === convid) { target = r; break; }
+    for (let i = 0; i < 500; i++) {
+      if (Date.now() > deadline) {
+        throw new Error(
+          `Timeout nach ${Math.round(timeoutMs / 1000)}s: conversation-ID "${convid}" wurde per ` +
+          `Scroll-Enumeration nicht gefunden (READ_EMAIL_TIMEOUT).`
+        );
       }
-      if (target) { await target.click(); await page.waitForTimeout(2200); return await readPane(); }
+      const count = await rowLocator.count().catch(() => 0);
+      if (count > 0) {
+        await rowLocator.click();
+        await page.waitForTimeout(2200);
+        return await readPane();
+      }
       // scroll down the list
       await page.evaluate(() => {
         const lists = document.querySelectorAll('[aria-label="Message list"] [role="listbox"], [aria-label="Message list"]');

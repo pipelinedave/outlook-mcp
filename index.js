@@ -199,12 +199,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'outlook_read_email',
-        description: 'Liest eine E-Mail vollständig im Lesebereich (Markdown) anhand ihrer conversation-ID (data-convid aus bulk_list). Scrollt ggf. automatisch durch den Ordner, bis die conversation gefunden ist.',
+        description: 'Liest eine E-Mail vollständig im Lesebereich (Markdown) anhand ihrer conversation-ID (data-convid aus bulk_list). Scrollt ggf. automatisch durch den Ordner, bis die conversation gefunden ist. Bei Timeout/nicht gefundener ID wird automatisch 1x per Suche recovert (korrigierte conversation-ID aus dem Suchtreffer).',
         inputSchema: {
           type: 'object',
           properties: {
             id: { type: 'string', description: 'conversation-ID (data-convid)' },
-            folder: { type: 'string', description: 'Optional: Ordner, aus dem gelesen werden soll (inbox|sentitems|archive|...)' }
+            folder: { type: 'string', description: 'Optional: Ordner, aus dem gelesen werden soll (inbox|sentitems|archive|...)' },
+            query: { type: 'string', description: 'Optional: Suchbegriff (Betreff/Absender) für den automatischen Recovery-Retry, falls die conversation-ID nicht gefunden wird. Ohne query wird die ID selbst als Suchbegriff verwendet.' }
           },
           required: ['id']
         }
@@ -418,7 +419,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'outlook_read_email': {
-        const res = await owaClient.readEmailByConvId(args.id, args.folder);
+        let res;
+        try {
+          res = await owaClient.readEmailByConvId(args.id, args.folder);
+        } catch (err) {
+          // Automatischer Recovery (genau 1 Retry, kein Loop): Bei Timeout oder nicht
+          // gefundener conversation-ID per Suche nach Betreff/ID suchen, die korrigierte
+          // conversation-ID aus dem ersten abweichenden Treffer übernehmen und erneut lesen.
+          const msg = err?.message || '';
+          const recoverable = /timeout/i.test(msg) || /nicht gefunden nach Scroll-Enumeration/i.test(msg);
+          if (!recoverable) throw err;
+
+          const searchQuery = args.query || args.id;
+          let correctedId = null;
+          try {
+            const searchRes = await owaClient.searchEmails(searchQuery, 5);
+            correctedId = searchRes?.results?.find(r => r.id && r.id !== args.id)?.id || null;
+          } catch (searchErr) {
+            // Suche selbst fehlgeschlagen -> Originalfehler transparent durchreichen
+            throw err;
+          }
+          if (!correctedId) throw err;
+
+          res = await owaClient.readEmailByConvId(correctedId, args.folder || 'inbox');
+          res.recoveredViaSearch = true;
+          res.originalId = args.id;
+          res.correctedId = correctedId;
+        }
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 
