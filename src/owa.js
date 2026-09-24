@@ -101,6 +101,114 @@ export function normalizeCalendarDate(input, timezone = 'Europe/Berlin') {
   return dt;
 }
 
+// ---------------------------------------------------------------------------
+// Kalender-Wochenansicht: Header-Auslesen & -Parsen
+// ---------------------------------------------------------------------------
+
+// Monatnamen DE/EN (lowercase) -> Monatsindex. Wird für das Parsen von
+// OWA-Kalender-Headern und Event-ARIA-Labels benötigt.
+const MONTH_NAMES = {
+  januar: 0, january: 0,
+  februar: 1, february: 1,
+  märz: 2, maerz: 2, march: 2,
+  april: 3,
+  mai: 4, may: 4,
+  juni: 5, june: 5,
+  juli: 6, july: 6,
+  august: 7,
+  september: 8,
+  oktober: 9, october: 9,
+  november: 10,
+  dezember: 11, december: 11
+};
+
+// Date -> ISO-Datumsstring 'YYYY-MM-DD' (lokale Kalenderkomponenten).
+function toIsoDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Parst einen OWA-Wochen-Header-Text in Start-/Enddatum der gerenderten Woche.
+// Erkannte Muster (Beispiele):
+//  - DE: "28. September – 4. Oktober 2026" (Jahr ggf. nur am Ende)
+//  - EN: "September 28 - October 4, 2026"
+// Rückgabe: { startDate, endDate } als ISO-Strings 'YYYY-MM-DD' oder null.
+export function parseWeekHeaderText(text, now = new Date()) {
+  if (!text) return null;
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  const currentYear = now.getFullYear();
+
+  // DE-Muster: "28. September – 4. Oktober 2026"
+  const de = t.match(/(\d{1,2})\.\s*([A-Za-zäöüÄÖÜß]{3,})\.?(?:\s+(\d{4}))?\s*[–—-]\s*(\d{1,2})\.\s*([A-Za-zäöüÄÖÜß]{3,})\.?(?:\s+(\d{4}))?/);
+  if (de) {
+    const startMonth = MONTH_NAMES[de[2].toLowerCase()];
+    const endMonth = MONTH_NAMES[de[5].toLowerCase()];
+    if (startMonth !== undefined && endMonth !== undefined) {
+      const y1 = de[3] ? parseInt(de[3], 10) : (de[6] ? parseInt(de[6], 10) : currentYear);
+      const y2 = de[6] ? parseInt(de[6], 10) : y1;
+      let s = new Date(y1, startMonth, parseInt(de[1], 10));
+      let e = new Date(y2, endMonth, parseInt(de[4], 10));
+      // Jahreswechsel (z.B. "29. Dezember – 4. Januar"): Enddatum in das Folgejahr heben
+      if (e < s) e = new Date(y2 + 1, endMonth, parseInt(de[4], 10));
+      return { startDate: toIsoDate(s), endDate: toIsoDate(e) };
+    }
+  }
+
+  // EN-Muster: "September 28 - October 4, 2026" (Endmonat optional gleich)
+  const en = t.match(/([A-Za-zäöüÄÖÜß]{3,})\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?\s*[–—-]\s*(?:([A-Za-zäöüÄÖÜß]{3,})\.?\s+)?(\d{1,2})(?:,?\s*(\d{4}))?/);
+  if (en) {
+    const startMonth = MONTH_NAMES[en[1].toLowerCase()];
+    const endMonth = en[4] ? MONTH_NAMES[en[4].toLowerCase()] : startMonth;
+    if (startMonth !== undefined && endMonth !== undefined) {
+      const y1 = en[3] ? parseInt(en[3], 10) : (en[6] ? parseInt(en[6], 10) : currentYear);
+      const y2 = en[6] ? parseInt(en[6], 10) : y1;
+      let s = new Date(y1, startMonth, parseInt(en[2], 10));
+      let e = new Date(y2, endMonth, parseInt(en[5], 10));
+      if (e < s) e = new Date(y2 + 1, endMonth, parseInt(en[5], 10));
+      return { startDate: toIsoDate(s), endDate: toIsoDate(e) };
+    }
+  }
+
+  return null;
+}
+
+// Liest den gerenderten Wochen-Header aus der OWA-Kalenderansicht aus und parst ihn.
+// OWA rendert z.B. "28. September – 4. Oktober 2026" (DE) bzw. "September 28 – October 4, 2026" (EN).
+// Rückgabe: { text, startDate, endDate } — startDate/endDate als ISO-Strings 'YYYY-MM-DD',
+// null wenn der Header nicht gefunden oder nicht parsebar war.
+export async function readRenderedCalendarWeek(page) {
+  // Kandidaten-Texte im Browser sammeln: zuerst spezifische Header-Elemente
+  // (Banner/Überschriften), als Fallback der gesamte Seitentext.
+  const candidates = await page.evaluate(() => {
+    const texts = [];
+    const els = document.querySelectorAll('[role="banner"], [role="heading"], h1, h2, [aria-label*="week" i], [aria-label*="Woche" i]');
+    for (const el of els) {
+      const t = (el.getAttribute('aria-label') || el.innerText || '').replace(/\s+/g, ' ').trim();
+      if (t) texts.push(t);
+    }
+    if (document.body) {
+      texts.push((document.body.innerText || '').replace(/\s+/g, ' '));
+    }
+    return texts;
+  }).catch(() => []);
+
+  // Ersten parsebaren Kandidaten verwenden (Header-Elemente kommen zuerst)
+  for (const text of candidates) {
+    const parsed = parseWeekHeaderText(text);
+    if (parsed) {
+      return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate };
+    }
+  }
+
+  return {
+    text: (candidates[0] || '').slice(0, 200),
+    startDate: null,
+    endDate: null
+  };
+}
+
 export class OwaClient {
   constructor(realm = config.defaultRealm) {
     this.realm = realm;
