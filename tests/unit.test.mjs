@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, parseMailRowTimestamp } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -95,6 +95,23 @@ describe('buildCalendarComposeUrl - Kalender DeepLink Generierung', () => {
     });
     assert.ok(!url.includes('body='));
     assert.ok(url.includes('realm=d-velop.de'));
+  });
+});
+
+describe('buildCalendarWeekUrl - Wochenansicht-Navigation (Live-Fail-Fix 24.09.)', () => {
+  test('Realm ZUERST, startdate als zweiter Parameter (bewährte Reihenfolge)', () => {
+    const url = buildCalendarWeekUrl('d-velop.de', '2026-09-28');
+    assert.equal(url, 'https://outlook.office.com/calendar/view/week?realm=d-velop.de&startdate=2026-09-28');
+  });
+
+  test('Ohne Realm nur startdate', () => {
+    const url = buildCalendarWeekUrl(null, '2026-09-28');
+    assert.equal(url, 'https://outlook.office.com/calendar/view/week?startdate=2026-09-28');
+  });
+
+  test('Realm wird URL-encodiert', () => {
+    const url = buildCalendarWeekUrl('adesso.de', '2026-10-05');
+    assert.ok(url.startsWith('https://outlook.office.com/calendar/view/week?realm=adesso.de&startdate=2026-10-05'));
   });
 });
 
@@ -200,6 +217,20 @@ describe('parseWeekHeaderText - Wochen-Header der Kalenderansicht', () => {
     assert.equal(parseWeekHeaderText('', new Date(2026, 8, 24)), null);
     assert.equal(parseWeekHeaderText(null), null);
   });
+
+  test('Live-Fail 24.09.: Ansichtsumschalter "Work week" ist KEIN Wochen-Header (null)', () => {
+    // Der alte Code gab candidates[0]="Work week" mit null-Daten zurück — der
+    // Falschgreifer muss durch die Datums-Muster-Validierung fallen.
+    assert.equal(parseWeekHeaderText('Work week', new Date(2026, 8, 24)), null);
+    assert.equal(parseWeekHeaderText('Arbeitswoche', new Date(2026, 8, 24)), null);
+    assert.equal(parseWeekHeaderText('Month', new Date(2026, 8, 24)), null);
+    assert.equal(parseWeekHeaderText('Monat', new Date(2026, 8, 24)), null);
+  });
+
+  test('DE-Header ohne Jahr nutzt das aktuelle Jahr', () => {
+    const out = parseWeekHeaderText('28. September – 2. Oktober', new Date(2026, 8, 24));
+    assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-02' });
+  });
 });
 
 describe('parseEventLabel - strukturierte Busy-Slots aus ARIA-Labels', () => {
@@ -252,6 +283,80 @@ describe('parseEventLabel - strukturierte Busy-Slots aus ARIA-Labels', () => {
   test('Label ohne erkennbares Datum liefert null', () => {
     assert.equal(parseEventLabel('Besetzt von 09:00 bis 10:00', 2026), null);
     assert.equal(parseEventLabel('', 2026), null);
+  });
+
+  test('DE-Label "von 08:00 bis 10:00" (Live-Fail-Variante) wird geparst', () => {
+    const out = parseEventLabel('MKK-Termin von 08:00 bis 10:00 Montag, 28. September', 2026);
+    assert.equal(out.date, '2026-09-28');
+    assert.equal(out.start, '08:00');
+    assert.equal(out.end, '10:00');
+    assert.equal(out.title, 'MKK-Termin');
+  });
+
+  test('DE-Label mit Bindestrich-Zeitfenster ("14:00 - 15:00") wird geparst', () => {
+    const out = parseEventLabel('Review, 14:00 - 15:00, Montag, 28. September', 2026);
+    assert.equal(out.date, '2026-09-28');
+    assert.equal(out.start, '14:00');
+    assert.equal(out.end, '15:00');
+  });
+
+  test('EN-Label ohne Statuswort ("Team Sync 9:00 to 10:00 Monday, September 28") wird geparst', () => {
+    const out = parseEventLabel('Team Sync 9:00 to 10:00 Monday, September 28', 2026);
+    assert.equal(out.date, '2026-09-28');
+    assert.equal(out.start, '09:00');
+    assert.equal(out.end, '10:00');
+    assert.equal(out.title, 'Team Sync');
+  });
+
+  test('EN-Ganztag-Label ("All day event") wird erkannt', () => {
+    const out = parseEventLabel('Offsite, All day event, Monday, September 28, 2026', 2026);
+    assert.equal(out.date, '2026-09-28');
+    assert.equal(out.start, null);
+    assert.equal(out.end, null);
+    assert.equal(out.allDay, true);
+  });
+
+  test('Tages-Spaltenkopf ("Montag, 28. September") liefert das Datum für den Header-Fallback', () => {
+    const out = parseEventLabel('Montag, 28. September', 2026);
+    assert.equal(out.date, '2026-09-28');
+    assert.equal(out.allDay, true);
+  });
+
+  test('EN-Tages-Spaltenkopf ("Monday, September 28") liefert das Datum', () => {
+    const out = parseEventLabel('Monday, September 28', 2026);
+    assert.equal(out.date, '2026-09-28');
+  });
+});
+
+describe('classifyEventStatus - Wortlisten-Klassifikation der Event-Labels', () => {
+  test('Busy/Besetzt (DE+EN) -> busy', () => {
+    assert.equal(classifyEventStatus('Besetzt von 09:00 bis 10:00 Montag, 28. September'), 'busy');
+    assert.equal(classifyEventStatus('Busy 9:00 AM to 10:00 AM Monday, September 28'), 'busy');
+  });
+
+  test('Tentative/Mit Vorbehalt (DE+EN) -> tentative', () => {
+    assert.equal(classifyEventStatus('Mit Vorbehalt, 14:00 bis 15:00, Montag, 28. September'), 'tentative');
+    assert.equal(classifyEventStatus('Tentative 14:00 to 15:00 Monday, September 28'), 'tentative');
+  });
+
+  test('Free/Frei (DE+EN) -> free', () => {
+    assert.equal(classifyEventStatus('Free 14:00 to 15:00 Monday, September 28'), 'free');
+    assert.equal(classifyEventStatus('Frei, 14:00 bis 15:00, Montag, 28. September'), 'free');
+  });
+
+  test('"Freitag" wird NICHT als free klassifiziert (Wortgrenzen-Pflicht)', () => {
+    assert.equal(classifyEventStatus('Freitag, 28. September'), 'busy');
+    assert.equal(classifyEventStatus('Termin am Freitag, 14:00 bis 15:00'), 'busy');
+  });
+
+  test('Arbeitsort-Banner sind keine Events (non_event)', () => {
+    assert.equal(classifyEventStatus('Arbeitsort: Homeoffice, Ganztägig, Montag, 28. September'), 'non_event');
+    assert.equal(classifyEventStatus('Working location: Home, All day, Monday, September 28'), 'non_event');
+  });
+
+  test('Label ohne Statuswort -> busy (Default für gerenderte Event-Blöcke)', () => {
+    assert.equal(classifyEventStatus('MKK-Termin, 14:00 bis 15:00, Montag, 28. September'), 'busy');
+    assert.equal(classifyEventStatus(''), 'busy');
   });
 });
 
