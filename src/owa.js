@@ -209,6 +209,85 @@ export async function readRenderedCalendarWeek(page) {
   };
 }
 
+// Parst ein OWA-Event-ARIA-Label in einen strukturierten Busy-Slot.
+// Erkannte Muster (Beispiele):
+//  - "Team Meeting, 14:00 to 15:00, Monday, September 28, 2026"
+//  - "Besetzt von 09:00 bis 10:00 Montag, 28. September"
+//  - "Urlaub, Ganztägig, Montag, 28. September 2026"  (All-Day: start/end = null)
+// Rückgabe: { date: 'YYYY-MM-DD', start: 'HH:MM'|null, end: 'HH:MM'|null,
+//             title, allDay, raw } — oder null, wenn kein Datum erkennbar ist.
+export function parseEventLabel(label, defaultYear) {
+  if (!label) return null;
+
+  // Datum extrahieren: DE ("28. September 2026") vor EN ("September 28, 2026") versuchen.
+  // matchAll + Monats-Check: falsche Kandidaten (z.B. "Besetzt 9") werden übersprungen.
+  let day = null;
+  let month = null;
+  let year = null;
+  const deDateRe = /(\d{1,2})\.\s*([A-Za-zäöüÄÖÜß]{3,})\.?(?:\s+(\d{4}))?/g;
+  for (const m of label.matchAll(deDateRe)) {
+    const mo = MONTH_NAMES[m[2].toLowerCase()];
+    if (mo !== undefined) {
+      day = parseInt(m[1], 10);
+      month = mo;
+      year = m[3] ? parseInt(m[3], 10) : null;
+      break;
+    }
+  }
+  if (day === null) {
+    const enDateRe = /([A-Za-zäöüÄÖÜß]{3,})\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?/g;
+    for (const m of label.matchAll(enDateRe)) {
+      const mo = MONTH_NAMES[m[1].toLowerCase()];
+      if (mo !== undefined) {
+        month = mo;
+        day = parseInt(m[2], 10);
+        year = m[3] ? parseInt(m[3], 10) : null;
+        break;
+      }
+    }
+  }
+  if (day === null || month === null) return null;
+  if (year === null) year = defaultYear;
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const dateIso = `${year}-${pad(month + 1)}-${pad(day)}`;
+
+  // Zeitfenster extrahieren: "von 09:00 bis 10:00" / "9:00 AM to 10:00 AM" / "14:00 - 15:00"
+  const timeRe = /(\d{1,2}):(\d{2})\s*(AM|PM)?\s*(?:bis|to|[–—-])\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i;
+  const tm = label.match(timeRe);
+
+  if (!tm) {
+    // Kein Zeitfenster im Label -> Ganztag-Event (start/end bewusst null)
+    const title = label
+      .replace(/[,;]?\s*(Ganztägig|Ganztägiges Ereignis|All day|All-day event).*/i, '')
+      .replace(/[,;:\s]+$/, '')
+      .trim() || '(Ganztägig)';
+    return { date: dateIso, start: null, end: null, title, allDay: true, raw: label };
+  }
+
+  const toMinutes = (h, m, ampm) => {
+    let H = parseInt(h, 10);
+    const M = parseInt(m, 10);
+    const ap = (ampm || '').toUpperCase();
+    if (ap === 'PM' && H < 12) H += 12;
+    if (ap === 'AM' && H === 12) H = 0;
+    return H * 60 + M;
+  };
+  const startMin = toMinutes(tm[1], tm[2], tm[3]);
+  let endMin = toMinutes(tm[4], tm[5], tm[6] || tm[3]);
+  // Über Mitternacht gehende Slots (z.B. "23:30 to 00:30") auf den Folgetag rollen
+  if (endMin <= startMin) endMin += 1440;
+  const fmt = (mins) => `${pad(Math.floor(mins / 60) % 24)}:${pad(mins % 60)}`;
+
+  // Titel = Label-Anteil vor der Zeitangabe (Trennzeichen/Präpositionen am Ende entfernen)
+  const title = label.slice(0, tm.index)
+    .replace(/[,;:\s]+$/, '')
+    .replace(/\s+(von|from)$/i, '')
+    .trim() || '(ohne Titel)';
+
+  return { date: dateIso, start: fmt(startMin), end: fmt(endMin), title, allDay: false, raw: label };
+}
+
 export class OwaClient {
   constructor(realm = config.defaultRealm) {
     this.realm = realm;
@@ -503,6 +582,8 @@ export class OwaClient {
     // Angefragter Range als Datums-Strings (YYYY-MM-DD)
     const rangeStartDate = String(startDt).slice(0, 10);
     const rangeEndDate = String(endDt).slice(0, 10);
+    // Fallback-Jahr für Event-Labels ohne Jahresangabe (OWA lässt das Jahr oft weg)
+    const defaultYear = parseInt(rangeStartDate.slice(0, 4), 10);
 
     // Zielwoche bestimmen: Montag der Woche, die das Startdatum enthält
     // (OWA-Wochenansicht beginnt montags).
@@ -566,50 +647,54 @@ export class OwaClient {
     // 'unverified' = Header nicht lesbar (Slots werden trotzdem geliefert, mit Warnung).
     const dataQuality = (rendered.startDate && rendered.endDate) ? 'verified' : 'unverified';
 
-    // Belegte Slots robust aus den ARIA-Labels der Kalenderbuttons auslesen
-    const busySlots = await page.evaluate(({ startDt, endDt }) => {
+    // Alle Event-Elemente über ihre ARIA-Labels sammeln (roh, Dedupe folgt in Node)
+    const rawLabels = await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('[role="button"][aria-label]'));
-      const targetDate = startDt.slice(0, 10); // z.B. 2026-09-17
-      
-      const parsedDate = new Date(startDt);
-      const dayNum = parsedDate.getDate(); // z.B. 17
-      const weekdayNamesEn = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-      const weekdayNamesDe = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
-      const monthNamesEn = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-      const monthNamesDe = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
-      
-      const weekdayEn = weekdayNamesEn[parsedDate.getDay()];
-      const weekdayDe = weekdayNamesDe[parsedDate.getDay()];
-      const monthEn = monthNamesEn[parsedDate.getMonth()];
-      const monthDe = monthNamesDe[parsedDate.getMonth()];
-
-      const slots = [];
-      const seen = new Set();
-
+      const labels = [];
       for (const btn of buttons) {
-        const label = btn.getAttribute('aria-label') || '';
+        const label = (btn.getAttribute('aria-label') || '').trim();
         if (!label) continue;
-        
-        // Filter auf Busy/Besetzt/Termine
-        const isEvent = label.includes('Busy') || label.includes('Tentative') || label.includes('Besetzt') || label.includes('to ') || label.includes('bis ');
-        if (!isEvent) continue;
-
-        // Prüfen ob Event zum Ziel-Tag gehört (z.B. "Thursday", "Donnerstag", "17", "September")
-        const matchesDay = label.includes(weekdayEn) || label.includes(weekdayDe) || (label.includes(String(dayNum)) && (label.includes(monthEn) || label.includes(monthDe)));
-        
-        if (matchesDay) {
-          if (!seen.has(label)) {
-            seen.add(label);
-            slots.push(label);
-          }
-        }
+        // Nur Event-ähnliche Labels: Zeitfenster ("bis"/"to"), Status (Busy/Besetzt/Tentative)
+        // oder Ganztag-Kennzeichnung
+        const isEvent = label.includes('Busy') || label.includes('Tentative') || label.includes('Besetzt') ||
+          label.includes('to ') || label.includes('bis ') || /ganztägig|all day/i.test(label);
+        if (isEvent) labels.push(label);
       }
+      return labels;
+    });
 
-      return slots;
-    }, { startDt, endDt });
+    // Deduplizieren (gleiche Events können mehrfach im DOM hängen) und strukturiert parsen
+    const seen = new Set();
+    const parsedSlots = [];
+    for (const label of rawLabels) {
+      if (seen.has(label)) continue;
+      seen.add(label);
+      const slot = parseEventLabel(label, defaultYear);
+      if (slot) parsedSlots.push(slot);
+    }
+
+    // Nur Slots zurückgeben, die mit dem angefragten Range [start, end) überlappen.
+    // Ganztag-Events belegen 00:00–24:00 ihres Tages.
+    const rangeStartIso = String(startDt).includes('T') ? startDt : `${startDt}T00:00:00`;
+    const rangeEndIso = String(endDt).includes('T') ? endDt : `${endDt}T23:59:59`;
+    const rangeStartMs = new Date(rangeStartIso).getTime();
+    const rangeEndMs = new Date(rangeEndIso).getTime();
+
+    const busySlots = parsedSlots.filter((slot) => {
+      const dayStartMs = new Date(`${slot.date}T00:00:00`).getTime();
+      const s = slot.allDay ? dayStartMs : new Date(`${slot.date}T${slot.start}:00`).getTime();
+      const e = slot.allDay ? dayStartMs + 86400000 : new Date(`${slot.date}T${slot.end}:00`).getTime();
+      return s < rangeEndMs && e > rangeStartMs;
+    });
+
+    // Stabil nach Datum und Beginn sortieren
+    busySlots.sort((a, b) =>
+      `${a.date}T${a.start || '00:00'}`.localeCompare(`${b.date}T${b.start || '00:00'}`)
+    );
 
     // Hinweise zusammenbauen (Verifikationsstatus + Range-Abdeckung)
-    let note = 'Busy-Slots direkt aus ARIA-Labels der Kalender-Event-Elemente extrahiert.';
+    let note = 'Busy-Slots aus ARIA-Labels der Kalender-Event-Elemente der Wochenansicht extrahiert ' +
+      '(Datum/Zeit strukturiert geparst, dedupliziert, auf den angefragten Zeitraum gefiltert).';
     if (dataQuality === 'unverified') {
       note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
     }
