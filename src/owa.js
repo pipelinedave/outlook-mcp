@@ -288,6 +288,75 @@ export function parseEventLabel(label, defaultYear) {
   return { date: dateIso, start: fmt(startMin), end: fmt(endMin), title, allDay: false, raw: label };
 }
 
+// Parst aus dem Zeilentext einer OWA-Nachrichtenliste/Suchergebniszeile einen
+// Zeitstempel (ms seit Epoch) — oder null, wenn kein Datum erkennbar ist.
+// Unterstützte Muster: "24.09.2026", "24.09." (aktuelles Jahr), "Heute 14:32",
+// "Gestern", Wochentag-Kürzel ("Mo.", "Di.", ...) und freistehende Uhrzeiten ("14:32" = heute).
+// Wird genutzt, um aus Suchergebnissen die NEUESTE Nachricht eines Threads zu wählen.
+export function parseMailRowTimestamp(text, now = new Date()) {
+  if (!text) return null;
+  const t = String(text);
+  const base = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const DAY_MS = 86400000;
+
+  // "Heute" / "Today" (optional mit Uhrzeit)
+  if (/\bheute\b|\btoday\b/i.test(t)) {
+    const tm = t.match(/(\d{1,2}):(\d{2})/);
+    if (tm) return base.getTime() + parseInt(tm[1], 10) * 3600000 + parseInt(tm[2], 10) * 60000;
+    return base.getTime() + DAY_MS - 1; // heute, ohne Uhrzeit -> "spätester heute-Zeitpunkt"
+  }
+
+  // "Gestern" / "Yesterday"
+  if (/\bgestern\b|\byesterday\b/i.test(t)) {
+    return base.getTime() - DAY_MS + 43200000; // Mittag gestern
+  }
+
+  // Vollständiges Datum: 24.09.2026 (optional mit Uhrzeit verfeinert)
+  const full = t.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+  if (full) {
+    const d = new Date(parseInt(full[3], 10), parseInt(full[2], 10) - 1, parseInt(full[1], 10));
+    const tm = t.match(/(\d{1,2}):(\d{2})/);
+    if (tm) d.setHours(parseInt(tm[1], 10), parseInt(tm[2], 10));
+    return d.getTime();
+  }
+
+  // Kurzes Datum: 24.09. (ohne Jahr -> aktuelles Jahr)
+  const short = t.match(/(\d{1,2})\.(\d{1,2})\.(?!\d)/);
+  if (short) {
+    return new Date(now.getFullYear(), parseInt(short[2], 10) - 1, parseInt(short[1], 10)).getTime();
+  }
+
+  // Wochentag (Kürzel oder ausgeschrieben): jüngstes vergangenes Vorkommen (letzte 7 Tage)
+  const weekdayMap = {
+    'so': 0, 'sonntag': 0, 'su': 0, 'sun': 0, 'sunday': 0,
+    'mo': 1, 'montag': 1, 'mon': 1, 'monday': 1,
+    'di': 2, 'dienstag': 2, 'tu': 2, 'tue': 2, 'tuesday': 2,
+    'mi': 3, 'mittwoch': 3, 'we': 3, 'wed': 3, 'wednesday': 3,
+    'do': 4, 'donnerstag': 4, 'th': 4, 'thu': 4, 'thursday': 4,
+    'fr': 5, 'freitag': 5, 'fri': 5, 'friday': 5,
+    'sa': 6, 'samstag': 6, 'sa.': 6, 'sat': 6, 'saturday': 6
+  };
+  const wd = t.match(/\b(So|Mo|Di|Mi|Do|Fr|Sa|Su|Mon|Tue|Wed|Thu|Fri|Sat|Sonntag|Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b\.?/i);
+  if (wd) {
+    const target = weekdayMap[wd[1].toLowerCase().replace(/\.$/, '')];
+    if (target !== undefined) {
+      // Heutige Mails zeigen die Uhrzeit statt des Wochentags -> "Mo." an einem Montag = letzter Montag
+      let diff = (base.getDay() - target + 7) % 7;
+      if (diff === 0) diff = 7;
+      return base.getTime() - diff * DAY_MS + 43200000;
+    }
+  }
+
+  // Freistehende Uhrzeit (eigene Zeile) -> heute. Bewusst anchoring, damit Uhrzeiten
+  // aus dem Mail-Text (z.B. "Meeting um 14:00") nicht fälschlich "heute" bedeuten.
+  const tm = t.match(/(^|\n)\s*(\d{1,2}):(\d{2})\s*(\n|$)/);
+  if (tm) {
+    return base.getTime() + parseInt(tm[2], 10) * 3600000 + parseInt(tm[3], 10) * 60000;
+  }
+
+  return null;
+}
+
 export class OwaClient {
   constructor(realm = config.defaultRealm) {
     this.realm = realm;
@@ -1693,6 +1762,9 @@ export class OwaClient {
     const page = await this.getPage(true);
     const context = browserManager.context;
 
+    // Vorschau der getroffenen Ziel-Mail (Transparenz: welche Thread-Nachricht wurde beantwortet?)
+    let selectedMailPreview = null;
+
     // 1. Target email locating
     if (searchQuery) {
       const url = this.realm
@@ -1716,11 +1788,39 @@ export class OwaClient {
       await page.keyboard.press('Enter');
       await page.waitForTimeout(3500);
 
-      const firstRow = await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 15000 });
-      if (!firstRow) {
+      await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 15000 });
+
+      // NEUESTE Nachricht des Threads wählen (nicht die älteste): Die OWA-Suche sortiert
+      // nach Relevanz — der erste Treffer kann eine tagelange alte Thread-Mail sein
+      // (Fehlerbild 24.09.2026: Doppel-Entwurf auf die Mail vom 21.09. statt 24.09.).
+      // Daher Datum aus den Zeilentexten parsen und die Zeile mit dem jüngsten Datum klicken.
+      const rowInfos = await page.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll('div[data-convid], div[role="option"]'));
+        return rows.map((r, i) => ({
+          index: i,
+          id: r.getAttribute('data-convid') || r.getAttribute('id') || '',
+          text: (r.innerText || '').slice(0, 300)
+        })).filter(r => r.id || r.text);
+      });
+
+      let bestIndex = 0;
+      let bestTs = -Infinity;
+      for (const info of rowInfos) {
+        const ts = parseMailRowTimestamp(info.text);
+        if (ts !== null && ts > bestTs) {
+          bestTs = ts;
+          bestIndex = info.index;
+        }
+      }
+
+      const rows = await page.$$('div[data-convid], div[role="option"]');
+      if (rows.length === 0) {
         throw new Error(`Keine E-Mail für Suchbegriff "${searchQuery}" gefunden.`);
       }
-      await firstRow.click();
+      const selectedRow = rows[bestIndex] || rows[0];
+      selectedMailPreview = ((await selectedRow.innerText().catch(() => '')) || '')
+        .split('\n').map(l => l.trim()).filter(Boolean).slice(0, 3).join(' | ').slice(0, 200);
+      await selectedRow.click();
       await page.waitForTimeout(2000);
     } else if (targetId) {
       if (folder) {
@@ -1907,6 +2007,7 @@ export class OwaClient {
       success: true,
       action: isReplyAll ? 'reply_all' : 'reply',
       subject: emailSubject || undefined,
+      targetMailPreview: selectedMailPreview || undefined,
       preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
       folder: 'Entwürfe (Drafts)',
       message: `Antwort-Entwurf (${isReplyAll ? 'Allen antworten' : 'Antworten'}) erfolgreich erstellt und in "Entwürfe" gespeichert. Verlauf und Signatur wurden beibehalten.`
