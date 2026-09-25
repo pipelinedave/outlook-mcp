@@ -1057,6 +1057,11 @@ export class OwaClient {
     const phase = (capMs) => phaseBudgetMs(remaining(), capMs);
     // Klick-Kosten für die Rationierung: Probe + Klick + Re-Render-Wait.
     const CLICK_COST_MS = 1500 + FREEBUSY_CLICK_RENDER_WAIT_MS;
+    // Klick-Protokoll (Runde-4-Forderung C): Jeder Selektor-Kandidaten-Versuch
+    // wird hier protokolliert (auch "nicht gefunden") und in der Diagnostik
+    // zurückgegeben — so ist sichtbar, welcher Kandidat existierte/welcher
+    // geklickt wurde bzw. dass gar kein Button gefunden wurde.
+    const weekButtonProbe = [];
 
     // Kompakter Budget-Report für die Diagnostik (wo ging die Zeit verloren?)
     const freeBusyBudgetReport = () => ({
@@ -1133,19 +1138,41 @@ export class OwaClient {
       return { rendered, hasEvents: events };
     };
 
-    // Klickt den Vor/Zurück-Button der Wochenansicht (direction > 0 = nächste Woche).
-    const clickWeekButton = async (direction) => {
-      const selector = direction > 0
-        ? '[aria-label*="Nächste Woche" i], [aria-label*="Next week" i], [title*="Nächste Woche" i], [title*="Next week" i]'
-        : '[aria-label*="Vorherige Woche" i], [aria-label*="Previous week" i], [title*="Vorherige Woche" i], [title*="Previous week" i]';
-      const btn = page.locator(selector).first();
-      try {
-        await btn.waitFor({ state: 'visible', timeout: 4000 });
-        await btn.click({ timeout: 4000 });
-        return true;
-      } catch (e) {
-        return false;
+    // Multi-selektorischer Wochen-Button-Klick (Runde-4-Forderung C): Probiert
+    // Kandidaten nacheinander (aria-label DE/EN, title DE/EN, breite Muster,
+    // Chevron-Symbole), protokolliert JEDEN Versuch ins weekButtonProbe und
+    // verifiziert nach dem Klick, dass sich der gerenderte Header wirklich
+    // geändert hat — nur bei nachweislich wirkungslosem Klick ('unchanged') wird
+    // der nächste Kandidat versucht; bei 'unverified' nie (Doppel-Klick-Gefahr,
+    // falls der erste Klick doch gewirkt hat).
+    const clickWeekButton = async (direction, prevStart) => {
+      for (const cand of weekButtonCandidates(direction)) {
+        if (remaining() < CLICK_COST_MS) {
+          weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: null, clicked: false, note: 'Budget aufgebraucht' });
+          break;
+        }
+        const loc = page.locator(cand.selector).first();
+        let found = false;
+        try {
+          await loc.waitFor({ state: 'visible', timeout: Math.min(1000, Math.max(100, remaining())) });
+          found = true;
+        } catch (e) { found = false; }
+        if (!found) {
+          weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: false, clicked: false });
+          continue;
+        }
+        try {
+          await loc.click({ timeout: Math.min(2000, Math.max(100, remaining())) });
+        } catch (e) {
+          weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: false, clickError: String((e && e.message) || e).slice(0, 120) });
+          continue;
+        }
+        const r = await waitRenderAfterClick(prevStart, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
+        weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified });
+        if (shouldTryNextCandidate(r.verified)) continue; // wirkungslos -> nächster Kandidat
+        return { clicked: true, week: r.week, verified: r.verified };
       }
+      return { clicked: false, week: null, verified: 'not-found' };
     };
 
     // Wartet nach einem Button-Klick auf das Re-Render und BEWERTET die Änderung
@@ -1176,6 +1203,7 @@ export class OwaClient {
       // Transport zum Client überleben.
       const diagnostics = assembleFreeBusyDiagnostics({
         early: await collectCalendarDiagnostics(page).catch(() => null),
+        weekButtonProbe,
         abortReason: 'no-calendar-tab',
         budget: freeBusyBudgetReport()
       });
@@ -1207,6 +1235,7 @@ export class OwaClient {
     if (!rendered.startDate && !hasEvents && remaining() < FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS) {
       const diagnostics = assembleFreeBusyDiagnostics({
         early: earlyDiagnostics,
+        weekButtonProbe,
         abortReason: 'early-no-dated-header',
         budget: freeBusyBudgetReport()
       });
@@ -1249,10 +1278,9 @@ export class OwaClient {
           // Erzwungene Korrektur auch bei unbekannter Woche: 1x "Nächste Woche" +
           // Re-Render + erneuter Erkennungsversuch, bevor abgebrochen wird.
           forcedNextRetryDone = true;
-          const forcedClicked = await clickWeekButton(1);
-          if (forcedClicked) {
-            const r = await waitRenderAfterClick(rendered.startDate, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
-            rendered = r.week;
+          const forced = await clickWeekButton(1, rendered.startDate);
+          if (forced.clicked) {
+            rendered = forced.week;
             hasEvents = hasEvents || (await hasEventElements());
           }
           continue;
@@ -1287,9 +1315,9 @@ export class OwaClient {
       // Klick-Rationierung: Klick + Re-Render-Wait müssen ins Restbudget passen
       if (remaining() < CLICK_COST_MS) { abortReason = 'budget'; break; }
 
-      const clicked = await clickWeekButton(Math.sign(deltaWeeks));
-      if (!clicked) {
-        // Button nicht gefunden -> 1x frische Navigation als Fallback (budgetiert)
+      const r = await clickWeekButton(Math.sign(deltaWeeks), rendered.startDate);
+      if (!r.clicked) {
+        // Kein Kandidat wirkungsvoll -> 1x frische Navigation als Fallback (budgetiert)
         if (!gotoRetryDone && remaining() >= 15000) {
           gotoRetryDone = true;
           await gotoCalendar(provenUrl);
@@ -1303,8 +1331,7 @@ export class OwaClient {
       }
       buttonClicks++;
 
-      // Re-Render abwarten und nach JEDEM Klick neu verifizieren
-      const r = await waitRenderAfterClick(rendered.startDate, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
+      // Klick war verifiziert wirkungsvoll (Header geändert) — gerenderte Woche übernehmen
       rendered = r.week;
       hasEvents = hasEvents || (await hasEventElements());
     }
@@ -1316,6 +1343,7 @@ export class OwaClient {
       const diagnostics = assembleFreeBusyDiagnostics({
         fresh: await freshDiag(),
         early: earlyDiagnostics,
+        weekButtonProbe,
         abortReason: abortReason !== 'none' ? abortReason : 'wrong-week',
         budget: freeBusyBudgetReport()
       });
@@ -1336,6 +1364,7 @@ export class OwaClient {
       const diagnostics = assembleFreeBusyDiagnostics({
         fresh: await freshDiag(),
         early: earlyDiagnostics,
+        weekButtonProbe,
         abortReason: abortReason !== 'none' ? abortReason : 'not-rendered',
         budget: freeBusyBudgetReport()
       });
@@ -1454,6 +1483,7 @@ export class OwaClient {
       result.diagnostics = assembleFreeBusyDiagnostics({
         fresh: await freshDiag(),
         early: earlyDiagnostics,
+        weekButtonProbe,
         abortReason,
         budget: freeBusyBudgetReport()
       });
