@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, formatCalendarDiagnostics } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, assembleFreeBusyDiagnostics, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -640,3 +640,182 @@ describe('formatCalendarDiagnostics - Diagnostik-Formatierung für Guards (Runde
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Iteration 4 (Runde-3-Live-Befunde 25.09.): MCP-Timeout -32001 ohne Ergebnis,
+// Diagnostik vom Timeout verschluckt, Button-Klick wirkungslos, outlook_status
+// falsches activeMailboxMatchesRealm:false im Kalender-Tab.
+// ---------------------------------------------------------------------------
+
+describe('FreeBusy-Budget-Konstanten (Runde-4-Forderung A)', () => {
+  test('Gesamtbudget sicher unter dem MCP-Client-Timeout, Rationierung konsistent', () => {
+    assert.ok(FREEBUSY_TOTAL_BUDGET_MS <= 45000);
+    assert.equal(FREEBUSY_MAX_BUTTON_CLICKS, 6);
+    assert.equal(FREEBUSY_CLICK_RENDER_WAIT_MS, 4000);
+    assert.ok(FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS < FREEBUSY_TOTAL_BUDGET_MS);
+  });
+});
+
+describe('phaseBudgetMs - Budget-Rationierung der Phasen (Runde-4-Forderung A)', () => {
+  test('Cap greift, wenn Restzeit größer ist', () => {
+    assert.equal(phaseBudgetMs(45000, 12000), 12000);
+    assert.equal(phaseBudgetMs(45000, 4000), 4000);
+  });
+
+  test('Restzeit begrenzt, wenn sie unter dem Cap liegt', () => {
+    assert.equal(phaseBudgetMs(5000, 12000), 5000);
+  });
+
+  test('Unter der Mindestscheibe wird die Phase geskippt (0) — kein Floor mehr', () => {
+    // Runde-3-Root-Cause: Math.max(1000, ...) ließ Phasen nach Ablauf der
+    // Deadline weiterlaufen und ließ die Phasensumme das Budget sprengen.
+    assert.equal(phaseBudgetMs(1000, 12000), 0);
+    assert.equal(phaseBudgetMs(0, 12000), 0);
+    assert.equal(phaseBudgetMs(-500, 12000), 0);
+  });
+
+  test('Phasen teilen sich EIN Budget: Summe überschreitet das Gesamtbudget nie', () => {
+    // Simulation der getFreeBusy-Phaskette (Navigation, URL-Wait, Render-Wait,
+    // Retry-Stufen, Klicks) gegen das 45s-Gesamtbudget.
+    let remaining = FREEBUSY_TOTAL_BUDGET_MS;
+    const caps = [12000, 4000, 12000, 4000, 8000, 6000, 6000, 6000, 6000, 6000, 6000, 6000];
+    let allocated = 0;
+    for (const cap of caps) {
+      const slice = phaseBudgetMs(remaining, cap);
+      allocated += slice;
+      remaining -= slice;
+    }
+    assert.ok(allocated <= FREEBUSY_TOTAL_BUDGET_MS);
+    assert.equal(remaining, FREEBUSY_TOTAL_BUDGET_MS - allocated);
+  });
+});
+
+describe('affordableClicks - Klick-Rationierung (Runde-4-Forderung A)', () => {
+  const clickCost = 1500 + FREEBUSY_CLICK_RENDER_WAIT_MS; // 5500ms
+
+  test('Volles Budget trägt die maximale Klickanzahl (6)', () => {
+    assert.equal(affordableClicks(FREEBUSY_TOTAL_BUDGET_MS, clickCost, FREEBUSY_MAX_BUTTON_CLICKS), 6);
+  });
+
+  test('Knappes Budget rationiert die Klicks', () => {
+    assert.equal(affordableClicks(20000, clickCost, 6), 3);
+    assert.equal(affordableClicks(5499, clickCost, 6), 0);
+  });
+
+  test('Kein Restbudget -> 0 Klicks', () => {
+    assert.equal(affordableClicks(0, clickCost, 6), 0);
+    assert.equal(affordableClicks(-100, clickCost, 6), 0);
+  });
+});
+
+describe('weekButtonCandidates - Multi-Selektor-Kandidatenliste (Runde-4-Forderung C)', () => {
+  test('Nächste Woche: DE/EN aria-label, title und Chevron-Symbol-Kandidaten', () => {
+    const cands = weekButtonCandidates(1);
+    const sels = cands.map(c => c.selector).join(' | ');
+    assert.ok(sels.includes('Nächste Woche'));
+    assert.ok(sels.includes('Next week'));
+    assert.ok(cands.some(c => c.kind === 'title-de'));
+    assert.ok(cands.some(c => c.kind === 'title-en'));
+    assert.ok(cands.some(c => c.kind.startsWith('symbol-')));
+    assert.ok(cands.every(c => c.selector && c.kind));
+  });
+
+  test('Vorherige Woche: DE/EN-Varianten vorhanden', () => {
+    const cands = weekButtonCandidates(-1);
+    const sels = cands.map(c => c.selector).join(' | ');
+    assert.ok(sels.includes('Vorherige Woche'));
+    assert.ok(sels.includes('Previous week'));
+    assert.ok(cands.some(c => c.kind.startsWith('symbol-')));
+  });
+
+  test('Richtungen überschneiden sich nicht (kein Cross-Matching)', () => {
+    const next = weekButtonCandidates(1).map(c => c.selector);
+    const prev = weekButtonCandidates(-1).map(c => c.selector);
+    for (const s of next) assert.ok(!prev.includes(s));
+  });
+});
+
+describe('evaluateClickVerification - Klick-Verifikation (Runde-4-Forderung C)', () => {
+  test('Header-Datum geändert -> changed', () => {
+    assert.equal(evaluateClickVerification('2026-09-21', { startDate: '2026-09-28' }), 'changed');
+  });
+
+  test('Header-Datum identisch -> unchanged (Klick wirkungslos)', () => {
+    assert.equal(evaluateClickVerification('2026-09-28', { startDate: '2026-09-28' }), 'unchanged');
+  });
+
+  test('Header vor oder nach dem Klick unlesbar -> unverified', () => {
+    assert.equal(evaluateClickVerification(null, { startDate: '2026-09-28' }), 'unverified');
+    assert.equal(evaluateClickVerification('2026-09-28', { startDate: null }), 'unverified');
+    assert.equal(evaluateClickVerification('2026-09-28', null), 'unverified');
+  });
+
+  test('Nur nachweislich wirkungslose Klicks führen zum nächsten Kandidaten', () => {
+    assert.equal(shouldTryNextCandidate('unchanged'), true);
+    assert.equal(shouldTryNextCandidate('changed'), false);
+    assert.equal(shouldTryNextCandidate('unverified'), false);
+  });
+});
+
+describe('assembleFreeBusyDiagnostics - Diagnostik überlebt den Transport (Runde-4-Forderung B)', () => {
+  const early = { url: 'https://outlook.cloud.microsoft/calendar/view/week?startdate=2026-09-28', headerCandidates: ['Work week'], dayHeaderCandidates: [], ariaButtonCount: 3, ariaLabelSample: ['a'] };
+  const fresh = { url: 'https://outlook.office.com/calendar/view/week', headerCandidates: ['28. September – 4. Oktober 2026'], dayHeaderCandidates: ['Montag 28.9.'], ariaButtonCount: 42, ariaLabelSample: ['Team Meeting, 14:00 bis 15:00'] };
+
+  test('Frische Diagnostik gewinnt, früher Snapshot bleibt als urlAfterNavigation erhalten', () => {
+    const out = assembleFreeBusyDiagnostics({ fresh, early, abortReason: 'wrong-week' });
+    assert.equal(out.url, fresh.url);
+    assert.equal(out.urlAfterNavigation, early.url);
+    assert.equal(out.abortReason, 'wrong-week');
+    assert.deepEqual(out.headerCandidates, fresh.headerCandidates);
+  });
+
+  test('Ohne frische Diagnostik (Budget) trägt der frühe Snapshot die Diagnostik', () => {
+    const out = assembleFreeBusyDiagnostics({ fresh: null, early, abortReason: 'budget' });
+    assert.equal(out.url, early.url);
+    assert.equal(out.urlAfterNavigation, early.url);
+    assert.equal(out.abortReason, 'budget');
+  });
+
+  test('Ohne beides: leere, aber strukturierte Diagnostik (kein Crash)', () => {
+    const out = assembleFreeBusyDiagnostics({});
+    assert.equal(out.url, '');
+    assert.deepEqual(out.headerCandidates, []);
+    assert.deepEqual(out.weekButtonProbe, []);
+    assert.equal(out.abortReason, 'none');
+  });
+
+  test('Klick-Protokoll und Budget-Report werden eingebettet', () => {
+    const probe = [{ selector: '[aria-label*="Next week" i]', kind: 'aria-label-en', found: true, clicked: true, verified: 'changed' }];
+    const budget = { totalMs: 45000, usedMs: 12000, remainingMs: 33000 };
+    const out = assembleFreeBusyDiagnostics({ fresh, early, weekButtonProbe: probe, abortReason: 'none', budget });
+    assert.deepEqual(out.weekButtonProbe, probe);
+    assert.deepEqual(out.budget, budget);
+  });
+});
+
+describe('resolveMailboxVerification - Verifikations-Quellen (Runde-4-Forderung D)', () => {
+  test('Enum enthält genau die vier dokumentierten Quellen', () => {
+    assert.deepEqual(MAILBOX_VERIFICATION_SOURCES, ['mail-view', 'calendar-header', 'tab-title', 'unknown']);
+  });
+
+  test('Passender Hint -> true', () => {
+    const v = resolveMailboxVerification(['David Hallmann (david@adesso.de)'], 'adesso.de');
+    assert.equal(v.activeMailboxMatchesRealm, true);
+    assert.ok(v.matchingHint.includes('adesso.de'));
+  });
+
+  test('Hints ohne Passung -> false (nachweislich falsche Mailbox)', () => {
+    const v = resolveMailboxVerification(['david@d-velop.de'], 'adesso.de');
+    assert.equal(v.activeMailboxMatchesRealm, false);
+  });
+
+  test('Keine Hints (Kalender-Tab-Fall) -> null statt false (Kollateral-Bug Runde 3)', () => {
+    const v = resolveMailboxVerification([], 'adesso.de');
+    assert.equal(v.activeMailboxMatchesRealm, null);
+    assert.equal(v.matchingHint, null);
+  });
+
+  test('Ohne Realm -> null (nichts zu matchen)', () => {
+    assert.equal(resolveMailboxVerification(['david@adesso.de'], null).activeMailboxMatchesRealm, null);
+  });
+});
