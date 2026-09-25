@@ -400,6 +400,110 @@ export function formatCalendarDiagnostics(diag) {
   ].join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// getFreeBusy: Zeitbudget, Klick-Rationierung & Diagnostik-Assemblierung
+// (Iteration 4, Live-Befunde Runde 3 vom 25.09.: Der Gesamt-Call lief in den
+// MCP-Client-Timeout (-32001), bevor irgendetwas serialisiert wurde — die
+// Diagnostik wurde erst NACH der Eskalationsleiter erhoben und ging verloren.)
+// ---------------------------------------------------------------------------
+
+// Hartes Gesamtzeitbudget für den KOMPLETTEN getFreeBusy-Call. Muss sicher
+// UNTER dem MCP-Client-Timeout liegen (Runde 3: -32001 bei ~60s oder darunter).
+export const FREEBUSY_TOTAL_BUDGET_MS = 45000;
+
+// Rationierung der Button-Klicks gegen das Budget (Runde-4-Forderung A):
+// max. 6 Klicks mit je max. 4s Re-Render-Wartezeit.
+export const FREEBUSY_MAX_BUTTON_CLICKS = 6;
+export const FREEBUSY_CLICK_RENDER_WAIT_MS = 4000;
+
+// Früher Kontroll-Return: Liegt nach Navigation + Render-Warten kein datierter
+// Header vor UND das Restbudget reicht nicht mehr für die Eskalationsleiter
+// (frische Navigation ~15s bzw. Button-Klicks), wird SOFORT error+diagnostics
+// zurückgegeben statt weiterzuklicken.
+export const FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS = 12000;
+
+// Teilt das Gesamtbudget auf Phasen auf: Eine Phase bekommt nie mehr als ihr
+// Cap und nie mehr als die Restzeit; unterhalb der Mindestscheibe wird sie
+// GESKIPPT (0). Runde-3-Root-Cause: Der `Math.max(1000, ...)`-Floor ließ Phasen
+// nach Ablauf der Deadline weiterlaufen, und die Summe der Phasen (goto 30s +
+// URL-Wait 6s + Render-Wait 20s + Retry-Goto 36s + Retry-Wait 15s) sprengte
+// das Budget, obwohl jede Einzelphase gegen `remaining()` gekappt war.
+export function phaseBudgetMs(remainingMs, capMs, minSliceMs = 1500) {
+  if (!remainingMs || remainingMs <= 0 || !capMs || capMs <= 0) return 0;
+  const slice = Math.min(capMs, remainingMs);
+  return slice >= minSliceMs ? slice : 0;
+}
+
+// Wie viele Button-Klicks sind im Restbudget noch bezahlbar (Klick + Re-Render-Wait)?
+export function affordableClicks(remainingMs, clickCostMs, maxClicks) {
+  if (!clickCostMs || clickCostMs <= 0) return Math.max(0, maxClicks || 0);
+  if (!remainingMs || remainingMs <= 0) return 0;
+  return Math.max(0, Math.min(maxClicks || 0, Math.floor(remainingMs / clickCostMs)));
+}
+
+// Kandidaten-Selektoren für die Wochen-Vor/Zurück-Buttons (Runde-4-Forderung C):
+// multi-selektorisch — aria-label (DE/EN), title (DE/EN), breitere Wortmuster und
+// symbolbasierte Chevron-Kandidaten. Reihenfolge = Versuchreihenfolge; jeder
+// Versuch wird ins Klick-Protokoll (weekButtonProbe) geschrieben, auch
+// "kein Button gefunden".
+export function weekButtonCandidates(direction) {
+  if (direction > 0) {
+    return [
+      { selector: '[aria-label*="Nächste Woche" i]', kind: 'aria-label-de' },
+      { selector: '[aria-label*="Next week" i]', kind: 'aria-label-en' },
+      { selector: '[title*="Nächste Woche" i]', kind: 'title-de' },
+      { selector: '[title*="Next week" i]', kind: 'title-en' },
+      { selector: '[role="button"][aria-label*="Nächste" i]', kind: 'aria-label-de-broad' },
+      { selector: '[role="button"][aria-label*="Next" i]', kind: 'aria-label-en-broad' },
+      { selector: '[role="button"]:has([data-icon-name*="ChevronRight" i])', kind: 'symbol-chevron-right' },
+      { selector: '[role="button"][aria-label*="chevron-right" i], [role="button"][aria-label*="chevron right" i]', kind: 'symbol-aria-chevron' }
+    ];
+  }
+  return [
+    { selector: '[aria-label*="Vorherige Woche" i]', kind: 'aria-label-de' },
+    { selector: '[aria-label*="Previous week" i]', kind: 'aria-label-en' },
+    { selector: '[title*="Vorherige Woche" i]', kind: 'title-de' },
+    { selector: '[title*="Previous week" i]', kind: 'title-en' },
+    { selector: '[role="button"][aria-label*="Vorherige" i]', kind: 'aria-label-de-broad' },
+    { selector: '[role="button"][aria-label*="Previous" i]', kind: 'aria-label-en-broad' },
+    { selector: '[role="button"]:has([data-icon-name*="ChevronLeft" i])', kind: 'symbol-chevron-left' },
+    { selector: '[role="button"][aria-label*="chevron-left" i], [role="button"][aria-label*="chevron left" i]', kind: 'symbol-aria-chevron' }
+  ];
+}
+
+// Klick-Verifikation (Runde-4-Forderung C): Nach dem Klick MUSS sich der
+// gerenderte Header ändern (Datum), sonst gilt der Klick als wirkungslos.
+// 'unverified' = vor ODER nach dem Klick war kein datierter Header lesbar —
+// die Änderung ist nicht bewertbar (Doppel-Klick-Gefahr).
+export function evaluateClickVerification(prevStart, newWeek) {
+  const newStart = newWeek && newWeek.startDate ? newWeek.startDate : null;
+  if (!prevStart || !newStart) return 'unverified';
+  return newStart !== prevStart ? 'changed' : 'unchanged';
+}
+
+// Nur bei NACHWEISLICH wirkungslosem Klick (Header lesbar und UNVERÄNDERT) wird
+// der nächste Selektor-Kandidat versucht — bei 'unverified' nie (Gefahr des
+// Doppel-Advancierens, wenn der erste Klick doch gewirkt hat).
+export function shouldTryNextCandidate(verified) {
+  return verified === 'unchanged';
+}
+
+// Assembliert die FreeBusy-Diagnostik für Fehler-/unverified-Responses
+// (Runde-4-Forderung B): Der frühe Snapshot (direkt nach Navigation erhoben)
+// bleibt immer erhalten, auch wenn das Budget für eine frische Erhebung nicht
+// mehr reicht. Klick-Protokoll, Abbruchgrund und Budget-Report kommen hinzu.
+export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null } = {}) {
+  const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
+  const out = {
+    ...base,
+    weekButtonProbe,
+    abortReason
+  };
+  if (early && early.url) out.urlAfterNavigation = early.url;
+  if (budget) out.budget = budget;
+  return out;
+}
+
 // Parst ein OWA-Event-ARIA-Label in einen strukturierten Busy-Slot.
 // Erkannte Muster (Beispiele):
 //  - "Team Meeting, 14:00 to 15:00, Monday, September 28, 2026"
@@ -601,6 +705,23 @@ export function parseMailRowTimestamp(text, now = new Date()) {
   }
 
   return null;
+}
+
+// Quellen der Mailbox-Verifikation (Runde-4-Forderung D). Live-Befund 25.09.:
+// Im Kalender-Tab lieferte die bisherige (Mail-Ansicht-)Heuristik LEERE Hints,
+// wodurch checkStatus fälschlich activeMailboxMatchesRealm:false meldete.
+export const MAILBOX_VERIFICATION_SOURCES = ['mail-view', 'calendar-header', 'tab-title', 'unknown'];
+
+// Reine Verifikationslogik: Passt ein Hint zum Realm? Ohne Hints oder ohne
+// Realm ist das Ergebnis bewusst NULL (unbekannt) statt false — ein fehlender
+// Hint ist KEIN Nachweis einer falschen Mailbox (Kollateral-Bug Runde 3).
+export function resolveMailboxVerification(hints, realmDomain) {
+  const list = Array.isArray(hints) ? hints : [];
+  if (!realmDomain || list.length === 0) {
+    return { activeMailboxMatchesRealm: null, matchingHint: null };
+  }
+  const matchingHint = list.find((h) => String(h).toLowerCase().includes(realmDomain)) || null;
+  return { activeMailboxMatchesRealm: matchingHint !== null, matchingHint };
 }
 
 export class OwaClient {
@@ -908,38 +1029,76 @@ export class OwaClient {
     const mondayIso = toIsoDate(new Date(startDateObj.getTime() + offsetToMonday * 86400000));
 
     // ---------------------------------------------------------------------
-    // Navigations-Strategie (Iteration 3, Live-Befunde Runde 2 vom 25.09.):
+    // Navigations-Strategie (Iteration 4, Live-Befunde Runde 3 vom 25.09.):
     // Der startdate-Param wird von outlook.cloud.microsoft NICHT zuverlässig
     // befolgt (zukünftige Woche renderte leer, aktuelle Woche funktionierte).
     // Er bleibt nur noch OPTIMIERUNG (spart Klicks, wenn er wirkt) — vertraut
     // wird ihm NIE. PRIMÄRPFAD: bewährte Kalender-URL, gerenderte Woche
-    // ermitteln, dann per Vor/Zurück-Buttons zur Zielwoche navigieren
-    // (max. 12 Klicks, Re-Render + Verifikation nach jedem Klick).
+    // ermitteln, dann per Vor/Zurück-Buttons zur Zielwoche navigieren.
+    //
+    // NEU Runde 4 (MCP-Timeout -32001 ohne Ergebnisobjekt): ALLE Phasen
+    // (Navigation, Klicks, Re-Render-Warten, Extraktion, Diagnostik) teilen
+    // sich EIN hartes Gesamtbudget von 45s — sicher unter dem MCP-Client-
+    // Timeout. Ist es aufgebraucht, wird sofort das Beste zurückgegeben, was
+    // vorhanden ist (inkl. Diagnostik). Der Call läuft NIE ins Client-Timeout.
     // ---------------------------------------------------------------------
     const optimizedUrl = buildCalendarWeekUrl(this.realm, mondayIso); // mit startdate (Optimierung)
     const provenUrl = this.realm
       ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
       : 'https://outlook.office.com/calendar/view/week';
 
-    // Globales Zeitbudget: Das Tool muss auch im Fehlerfall rechtzeitig mit klarer
-    // Meldung zurückkehren (statt in einen MCP-Timeout zu laufen).
-    const deadline = Date.now() + 55000;
-    const remaining = () => Math.max(1000, deadline - Date.now());
+    // Hartes Gesamtzeitbudget für den KOMPLETTEN Call.
+    const budgetStart = Date.now();
+    const deadline = budgetStart + FREEBUSY_TOTAL_BUDGET_MS;
+    const remaining = () => deadline - Date.now();
+    // Phasen-Scheibe: nie größer als das Cap, nie größer als die Restzeit,
+    // 0 (skip) unterhalb der Mindestscheibe — KEIN Floor mehr, der Phasen nach
+    // Ablauf der Deadline weiterlaufen ließ (Root Cause Runde 3).
+    const phase = (capMs) => phaseBudgetMs(remaining(), capMs);
+    // Klick-Kosten für die Rationierung: Probe + Klick + Re-Render-Wait.
+    const CLICK_COST_MS = 1500 + FREEBUSY_CLICK_RENDER_WAIT_MS;
+
+    // Kompakter Budget-Report für die Diagnostik (wo ging die Zeit verloren?)
+    const freeBusyBudgetReport = () => ({
+      totalMs: FREEBUSY_TOTAL_BUDGET_MS,
+      usedMs: Date.now() - budgetStart,
+      remainingMs: Math.max(0, remaining())
+    });
+
+    // Fehler-Ergebnis MIT Diagnostik (Runde-4-Forderung B): Kein nackter Throw
+    // mehr — das Objekt überlebt den MCP-Transport vollständig.
+    const errorResult = (message, extra = {}) => ({
+      status: 'error',
+      error: message,
+      start: startDt,
+      end: endDt,
+      requestedRange: { startDate: rangeStartDate, endDate: rangeEndDate },
+      ...extra
+    });
+
+    // Frische Diagnostik nur erheben, wenn das Restbudget die teure
+    // DOM-Traversierung noch trägt; sonst liefert der frühe Snapshot weiter.
+    const freshDiag = () => (remaining() > 4000
+      ? collectCalendarDiagnostics(page).catch(() => null)
+      : Promise.resolve(null));
 
     // URL-Verifikation: OWA leitet bei ungültiger Session/Route client-seitig um
     // (z.B. zurück auf /mail/) — die Ziel-URL allein beweist noch nichts.
-    const waitOnCalendarUrl = async (timeoutMs) => {
-      const urlDeadline = Date.now() + timeoutMs;
+    const waitOnCalendarUrl = async (budgetMs) => {
+      const urlDeadline = Date.now() + budgetMs;
       while (Date.now() < urlDeadline) {
         if ((page.url() || '').includes('/calendar')) return true;
+        if (Date.now() + 500 > urlDeadline) break;
         await page.waitForTimeout(500);
       }
       return (page.url() || '').includes('/calendar');
     };
 
     const gotoCalendar = async (url) => {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }).catch(() => null);
-      return waitOnCalendarUrl(Math.min(6000, remaining()));
+      const gotoBudget = phase(12000);
+      if (gotoBudget <= 0) return false;
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: gotoBudget }).catch(() => null);
+      return waitOnCalendarUrl(phase(4000));
     };
 
     // Prüft, ob Event-Elemente (Zeit- oder Ganztag-Labels) im Grid gerendert sind.
@@ -954,16 +1113,22 @@ export class OwaClient {
 
     // Zustandswarten statt starrem Timeout: auf gerenderten Wochen-/Tages-Header
     // ODER Event-Elemente warten (Live-Fail 24.09.2026: 6s reichten nicht, das Grid
-    // war noch nicht da -> 0 Slots, "Work week" als einziger Text).
-    const waitForCalendarRendered = async (timeoutMs) => {
-      const waitDeadline = Date.now() + timeoutMs;
+    // war noch nicht da -> 0 Slots, "Work week" als einziger Text). Poll-Intervall
+    // 500ms mit Budget-Check je Iteration (Runde-4-Forderung A).
+    const waitForCalendarRendered = async (budgetMs) => {
+      const waitDeadline = Date.now() + budgetMs;
       let rendered = { text: null, startDate: null, endDate: null };
       let events = false;
-      while (Date.now() < waitDeadline) {
+      while (Date.now() < waitDeadline && remaining() > 0) {
         rendered = await readRenderedCalendarWeek(page);
+        if (rendered.startDate) {
+          events = await hasEventElements();
+          break;
+        }
         events = await hasEventElements();
-        if (rendered.startDate || events) break;
-        await page.waitForTimeout(1000);
+        if (events) break;
+        if (Date.now() + 500 > waitDeadline || remaining() <= 0) break;
+        await page.waitForTimeout(500);
       }
       return { rendered, hasEvents: events };
     };
@@ -983,22 +1148,21 @@ export class OwaClient {
       }
     };
 
-    // Wartet nach einem Button-Klick auf das Re-Render (Header-Änderung) und liefert
-    // die neu erkannte Woche — oder unknown, wenn der Header weiter unlesbar ist.
-    const waitRenderAfterClick = async (prevStart) => {
-      const renderDeadline = Date.now() + Math.min(8000, remaining());
-      let updated = null;
-      while (Date.now() < renderDeadline) {
-        updated = await readRenderedCalendarWeek(page);
-        if (updated.startDate && updated.startDate !== prevStart) return updated;
-        await page.waitForTimeout(800);
+    // Wartet nach einem Button-Klick auf das Re-Render und BEWERTET die Änderung
+    // (Runde-4-Forderung C): 'changed' = Header-Datum hat sich geändert (Klick
+    // wirkte), 'unchanged' = Header lesbar und identisch (Klick wirkungslos),
+    // 'unverified' = Header vor/nach dem Klick nicht datierbar (nicht bewertbar).
+    // Poll-Intervall 500ms, Budget-Check je Iteration, kein blindes Nachwarten mehr.
+    const waitRenderAfterClick = async (prevStart, budgetMs) => {
+      const waitDeadline = Date.now() + Math.min(budgetMs, Math.max(0, remaining()));
+      let week = { text: null, startDate: null, endDate: null };
+      while (Date.now() < waitDeadline) {
+        week = await readRenderedCalendarWeek(page);
+        if (week.startDate) break;
+        if (Date.now() + 500 > waitDeadline || remaining() <= 0) break;
+        await page.waitForTimeout(500);
       }
-      // Header nach Klick nicht lesbar geworden: kurz nachwarten, dann Ergebnis werten
-      // (kein blindes Re-Klicken — Gefahr des Doppel-Advancierens).
-      await page.waitForTimeout(1500);
-      const recheck = await readRenderedCalendarWeek(page);
-      if (recheck && recheck.startDate) return recheck;
-      return { text: null, startDate: null, endDate: null };
+      return { week, verified: evaluateClickVerification(prevStart, week) };
     };
 
     // 1) Optimierungsversuch MIT startdate (spart Button-Klicks, wenn der Param wirkt)
@@ -1008,13 +1172,26 @@ export class OwaClient {
       onCalendar = await gotoCalendar(provenUrl);
     }
     if (!onCalendar) {
-      throw new Error(
+      // Runde 4: Fehler-Objekt MIT Diagnostik statt Throw — sie muss den
+      // Transport zum Client überleben.
+      const diagnostics = assembleFreeBusyDiagnostics({
+        early: await collectCalendarDiagnostics(page).catch(() => null),
+        abortReason: 'no-calendar-tab',
+        budget: freeBusyBudgetReport()
+      });
+      return errorResult(
         `Kalender-Tab konnte nicht erreicht werden (URL nach Navigation: ${page.url() || 'unbekannt'}). ` +
-        `Möglicherweise ist die Session abgelaufen — bitte outlook_login erneut ausführen oder OWA manuell prüfen.`
+        `Möglicherweise ist die Session abgelaufen — bitte outlook_login erneut ausführen oder OWA manuell prüfen.`,
+        { diagnostics }
       );
     }
 
-    let { rendered, hasEvents } = await waitForCalendarRendered(Math.min(20000, remaining()));
+    // FRÜHER DIAGNOSTIK-SNAPSHOT (Runde-4-Forderung B): Direkt nach der Navigation
+    // erheben und im Kontext halten — URL, Header-Kandidaten und ARIA-Sample
+    // überleben so jeden späteren Abbruch-/Budget-Pfad.
+    const earlyDiagnostics = await collectCalendarDiagnostics(page).catch(() => null);
+
+    let { rendered, hasEvents } = await waitForCalendarRendered(phase(8000));
 
     // VERIFIKATION: Gerenderten Wochen-Header gegen den angefragten Range prüfen.
     // Nie blind Daten der falschen Woche zurückgeben.
@@ -1023,42 +1200,65 @@ export class OwaClient {
       r.startDate <= rangeStartDate && rangeStartDate <= r.endDate
     );
 
+    // FRÜHER KONTROLL-RETURN (Runde-4-Forderung B): Kein datierter Header und
+    // keine Events nach Navigation + Warten — wenn das Restbudget die
+    // Eskalationsleiter (frische Navigation ~15s bzw. Button-Klicks) nicht mehr
+    // tragen kann, sofort error+diagnostics zurückgeben statt weiterzuklicken.
+    if (!rendered.startDate && !hasEvents && remaining() < FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS) {
+      const diagnostics = assembleFreeBusyDiagnostics({
+        early: earlyDiagnostics,
+        abortReason: 'early-no-dated-header',
+        budget: freeBusyBudgetReport()
+      });
+      return errorResult(
+        `Früher Abbruch: Nach Navigation und Warten weder ein datierter Wochen-Header noch Event-Elemente ` +
+        `im Kalender-Tab gefunden; das Restbudget reicht nicht mehr für die Eskalationsleiter. ` +
+        `Bitte erneut versuchen bzw. Session prüfen (outlook_login).`,
+        { renderedWeek: rendered, diagnostics }
+      );
+    }
+
     // Button-basierte Wochen-Korrektur (PRIMÄRPFAD): Vor/Zurück bis die gerenderte
-    // Woche der Zielwoche entspricht. Eskalationsleiter bei unbekannter gerendeter
-    // Woche: 1x frische Navigation -> 1x erzwungenes "Nächste Woche" -> Abbruch
-    // mit reicher Diagnostik (Guard unten).
-    const MAX_BUTTON_CLICKS = 12;
+    // Woche der Zielwoche entspricht. Rationierung gegen das Gesamtbudget
+    // (Runde-4-Forderung A): max. 6 Klicks, jeder Klick nur bei ausreichendem
+    // Restbudget; Eskalationsstufen (frische Navigation, Fernsprung) nur, wenn
+    // das Budget sie noch trägt — sonst Abbruch mit dem, was da ist.
+    const MAX_BUTTON_CLICKS = FREEBUSY_MAX_BUTTON_CLICKS;
     let gotoRetryDone = false;
     let forcedNextRetryDone = false;
     let farJumpDone = false;
     let buttonClicks = 0;
+    let abortReason = 'none';
 
-    for (let step = 0; step < 40 && Date.now() < deadline; step++) {
+    for (let step = 0; step < 30; step++) {
       if (rendered.startDate && isRequestedWeek(rendered)) break;
+      if (remaining() <= 0) { abortReason = 'budget'; break; }
 
       if (!rendered.startDate) {
-        // Gerenderte Woche UNBEKANNT: Eskalationsleiter
-        if (!gotoRetryDone) {
+        // Gerenderte Woche UNBEKANNT: Eskalationsleiter (nur bei ausreichendem Budget)
+        if (!gotoRetryDone && remaining() >= 15000) {
           // 1x frisch navigieren und erneut zustandsbasiert warten
           gotoRetryDone = true;
           await gotoCalendar(provenUrl);
-          const retry = await waitForCalendarRendered(Math.min(15000, remaining()));
+          const retry = await waitForCalendarRendered(phase(6000));
           rendered = retry.rendered;
           hasEvents = hasEvents || retry.hasEvents;
           continue;
         }
-        if (!forcedNextRetryDone) {
+        if (!forcedNextRetryDone && remaining() >= CLICK_COST_MS + 1000) {
           // Erzwungene Korrektur auch bei unbekannter Woche: 1x "Nächste Woche" +
           // Re-Render + erneuter Erkennungsversuch, bevor abgebrochen wird.
           forcedNextRetryDone = true;
           const forcedClicked = await clickWeekButton(1);
           if (forcedClicked) {
-            rendered = await waitRenderAfterClick(rendered.startDate);
+            const r = await waitRenderAfterClick(rendered.startDate, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
+            rendered = r.week;
             hasEvents = hasEvents || (await hasEventElements());
           }
           continue;
         }
-        break; // Nichts hilft -> Guard unten wirft mit reicher Diagnostik
+        abortReason = 'no-dated-header';
+        break; // Nichts hilft -> Guard unten liefert Fehler MIT Diagnostik
       }
 
       // Gerenderte Woche BEKANNT: Delta in Wochen berechnen und per Buttons navigieren
@@ -1067,65 +1267,83 @@ export class OwaClient {
       );
       if (deltaWeeks === 0) break; // Zielwoche gerendert -> unten bewerten
 
-      if (buttonClicks >= MAX_BUTTON_CLICKS || Math.abs(deltaWeeks) > MAX_BUTTON_CLICKS) {
+      if (buttonClicks >= MAX_BUTTON_CLICKS) { abortReason = 'max-clicks'; break; }
+
+      if (Math.abs(deltaWeeks) > MAX_BUTTON_CLICKS) {
         // Zu weit entfernt für Button-Klicks: 1x startdate-URL als Fernsprung
-        // (Optimierung), danach wird wieder verifiziert.
-        if (!farJumpDone) {
+        // (Optimierung), danach wird wieder verifiziert — nur bei ausreichendem Budget.
+        if (!farJumpDone && remaining() >= 15000) {
           farJumpDone = true;
           await gotoCalendar(optimizedUrl);
-          const retry = await waitForCalendarRendered(Math.min(15000, remaining()));
+          const retry = await waitForCalendarRendered(phase(6000));
           rendered = retry.rendered;
           hasEvents = hasEvents || retry.hasEvents;
           continue;
         }
+        abortReason = 'too-far';
         break;
       }
 
+      // Klick-Rationierung: Klick + Re-Render-Wait müssen ins Restbudget passen
+      if (remaining() < CLICK_COST_MS) { abortReason = 'budget'; break; }
+
       const clicked = await clickWeekButton(Math.sign(deltaWeeks));
       if (!clicked) {
-        // Button nicht gefunden -> 1x frische Navigation als Fallback, dann Abbruch
-        if (!gotoRetryDone) {
+        // Button nicht gefunden -> 1x frische Navigation als Fallback (budgetiert)
+        if (!gotoRetryDone && remaining() >= 15000) {
           gotoRetryDone = true;
           await gotoCalendar(provenUrl);
-          const retry = await waitForCalendarRendered(Math.min(15000, remaining()));
+          const retry = await waitForCalendarRendered(phase(6000));
           rendered = retry.rendered;
           hasEvents = hasEvents || retry.hasEvents;
           continue;
         }
+        abortReason = 'no-week-button';
         break;
       }
       buttonClicks++;
 
       // Re-Render abwarten und nach JEDEM Klick neu verifizieren
-      rendered = await waitRenderAfterClick(rendered.startDate);
+      const r = await waitRenderAfterClick(rendered.startDate, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
+      rendered = r.week;
       hasEvents = hasEvents || (await hasEventElements());
     }
 
-    // Reiche Diagnostik sammeln (für Guards + unverified-Response) — Kernforderung Runde 3
-    const diagnostics = await collectCalendarDiagnostics(page);
-    const diagBlock = formatCalendarDiagnostics(diagnostics);
-
     // GUARD 1: Falsche Woche gerendert -> keine Daten statt falscher Daten.
+    // Runde 4: Als Fehler-Objekt MIT Diagnostik zurückgeben (transportfest),
+    // nicht als Throw, der die Diagnostik im Timeout verschlucken kann.
     if (rendered.startDate && !isRequestedWeek(rendered)) {
-      throw new Error(
+      const diagnostics = assembleFreeBusyDiagnostics({
+        fresh: await freshDiag(),
+        early: earlyDiagnostics,
+        abortReason: abortReason !== 'none' ? abortReason : 'wrong-week',
+        budget: freeBusyBudgetReport()
+      });
+      return errorResult(
         `Kalender-Wochenansicht zeigt nicht die angefragte Woche: angefragt ab ${rangeStartDate}, ` +
         `gerendert ${rendered.startDate} – ${rendered.endDate || '?'} ` +
         `(Header: "${(rendered.text || '').slice(0, 120)}"). ` +
-        `Es werden bewusst KEINE falschen Belegungsdaten zurückgegeben.\n` +
-        `Diagnostik:\n${diagBlock}`
+        `Es werden bewusst KEINE falschen Belegungsdaten zurückgegeben.`,
+        { renderedWeek: rendered, diagnostics }
       );
     }
 
     // GUARD 2 (defensiv, geschärft): Weder datierter Header noch Event-Elemente nach
-    // Navigation + Warten + Retry -> Kalenderansicht nicht erreicht/nicht gerendert.
-    // Klare Fehlermeldung MIT Diagnostik statt leerer unverified-Response.
+    // Navigation + Warten + timeboxter Eskalation -> Kalenderansicht nicht erreicht/
+    // nicht gerendert. Fehler-Objekt MIT Diagnostik statt Throw.
     // (Leere Woche mit datiertem Header ist legitim.)
     if (!rendered.startDate && !hasEvents) {
-      throw new Error(
+      const diagnostics = assembleFreeBusyDiagnostics({
+        fresh: await freshDiag(),
+        early: earlyDiagnostics,
+        abortReason: abortReason !== 'none' ? abortReason : 'not-rendered',
+        budget: freeBusyBudgetReport()
+      });
+      return errorResult(
         `Kalenderansicht nicht geladen — Kalender-Tab nicht erreicht oder Woche nicht gerendert. ` +
-        `Weder ein datierter Wochen-Header noch Event-Elemente gefunden (nach Navigation, Warten und Retry). ` +
-        `Bitte erneut versuchen bzw. Session prüfen (outlook_login).\n` +
-        `Diagnostik:\n${diagBlock}`
+        `Weder ein datierter Wochen-Header noch Event-Elemente gefunden (nach Navigation, Warten und timeboxter Eskalation). ` +
+        `Bitte erneut versuchen bzw. Session prüfen (outlook_login).`,
+        { renderedWeek: rendered, diagnostics }
       );
     }
 
@@ -1207,11 +1425,15 @@ export class OwaClient {
     if (dataQuality === 'unverified') {
       note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
     }
+    if (dataQuality === 'verified' && abortReason !== 'none') {
+      note += ` HINWEIS: Navigation vorzeitig beendet (${abortReason}); die angezeigte Woche wurde verifiziert.`;
+    }
     if (rendered.endDate && rangeEndDate > rendered.endDate) {
       note += ` HINWEIS: Der angefragte Range endet (${rangeEndDate}) nach der gerenderten Woche (${rendered.endDate}) — spätere Tage sind nicht enthalten.`;
     }
 
     const result = {
+      status: 'ok',
       start: startDt,
       end: endDt,
       calendar: 'Firmenkalender (Outlook Web)',
@@ -1225,10 +1447,16 @@ export class OwaClient {
       count: busySlots.length,
       note
     };
-    // Reiche Diagnostik bei unverifizierten Daten mitliefern (Kernforderung Runde 3):
-    // URL, Header-/Tageskopf-Kandidaten und ARIA-Sample des gerenderten DOMs.
+    // Reiche Diagnostik bei unverifizierten Daten mitliefern (Runde-3/4-Forderung):
+    // URL (inkl. früher Snapshot), Header-/Tageskopf-Kandidaten, ARIA-Sample,
+    // Klick-Protokoll, Abbruchgrund und Budget-Report.
     if (dataQuality === 'unverified') {
-      result.diagnostics = diagnostics;
+      result.diagnostics = assembleFreeBusyDiagnostics({
+        fresh: await freshDiag(),
+        early: earlyDiagnostics,
+        abortReason,
+        budget: freeBusyBudgetReport()
+      });
     }
     return result;
   }
