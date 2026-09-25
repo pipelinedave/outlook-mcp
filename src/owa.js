@@ -1505,8 +1505,26 @@ export async function pollUntilEventGrid({ hasEvents, budgetMs, pollMs = FREEBUS
 // nie ohne erneute Wochen-Bestätigung.
 
 // Protokolleintrag, wenn ohne Probe/Klick bereits die Zielwoche gerendert ist.
-export function weekProbeSkipEntry(renderedStart) {
-  return { skipped: 'target-week-verified', renderedWeek: renderedStart || null, clicked: false };
+// `note` kennzeichnet, WO der Guard gegriffen hat (Live-Befund 25.09.2026:
+// der Guard stand vorher nur in der aeusseren Schritt-Schleife und griff
+// deshalb zu spaet — nach dem Klick auf "Next week").
+export function weekProbeSkipEntry(renderedStart, note = null) {
+  return {
+    skipped: 'target-week-verified',
+    renderedWeek: renderedStart || null,
+    clicked: false,
+    ...(note ? { note } : {})
+  };
+}
+
+// Enthaelt die gerenderte Wochenansicht das angefragte Startdatum?
+// Reine Funktion (unit-testbar), EIN Definition fuer beide Stellen: die
+// aeussere Schritt-Schleife und der Klick-Guard in clickWeekButton.
+export function renderedWeekContains(rendered, dateIso) {
+  return Boolean(
+    rendered && rendered.startDate && rendered.endDate && dateIso &&
+    rendered.startDate <= dateIso && dateIso <= rendered.endDate
+  );
 }
 
 // Darf in dieselbe Richtung erneut geklickt werden?
@@ -2393,7 +2411,39 @@ export class OwaClient {
     const clickWeekButton = async (direction, prevStart) => {
       let foundAny = false;
       let clickedAny = false;
+      // Live-Befund 25.09.2026 (Z~2400): Der Guard "Zielwoche verifiziert ->
+      // kein Klick" stand nur AUSSERHALB dieser Schleife, in der
+      // Schritt-Schleife. Live-Trace:
+      //   1. aria-label-de  found:false
+      //   2. aria-label-en  found:true clicked:true verified:'unverified'
+      //   3. skipped:'target-week-verified'
+      // Der aeussere Guard griff also erst, NACHDEM Kandidat 2 bereits
+      // geklickt hatte — bei Schritt 3 war der verifizierte Zustand noch gar
+      // nicht in `rendered`. Der Guard gehoert VOR die Probe, in DIESER
+      // Schleife. Der Header-Read ist memoisiert (nur der erste Kandidat
+      // kostet einen Read) und wird nach jedem Klick verworfen, weil erst
+      // der Klick die Woche veraendern kann.
+      let targetWeekChecked = false;
+      let targetWeekNow = null;
+      const targetWeekReached = async () => {
+        if (!targetWeekChecked) {
+          targetWeekChecked = true;
+          let wk = null;
+          try { wk = await readRenderedCalendarWeek(page); } catch (e) { wk = null; }
+          targetWeekNow = renderedWeekContains(wk, rangeStartDate) ? wk : null;
+        }
+        return targetWeekNow;
+      };
       for (const cand of weekButtonCandidates(direction)) {
+        // GUARD VOR DER PROBE: verifizierte Zielwoche -> kein Klick, Skip, Abbruch.
+        const reached = await targetWeekReached();
+        if (reached) {
+          weekButtonProbe.push(weekProbeSkipEntry(reached.startDate, 'guard-vor-klick'));
+          return {
+            clicked: false, week: reached, verified: 'target-week-reached',
+            targetReached: true, foundAny, clickedAny
+          };
+        }
         if (remaining() < CLICK_COST_MS) {
           weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: null, clicked: false, note: 'Budget aufgebraucht' });
           break;
@@ -2416,6 +2466,10 @@ export class OwaClient {
           continue;
         }
         clickedAny = true;
+        // Ab hier kann sich die gerenderte Woche geaendert haben — der
+        // memoierte Guard-Zustand ist damit veraltet.
+        targetWeekChecked = false;
+        targetWeekNow = null;
         const r = await waitRenderAfterClick(prevStart, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
         weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified });
         if (shouldTryNextCandidate(r.verified)) continue; // wirkungslos -> nächster Kandidat
@@ -2472,10 +2526,10 @@ export class OwaClient {
 
     // VERIFIKATION: Gerenderten Wochen-Header gegen den angefragten Range prüfen.
     // Nie blind Daten der falschen Woche zurückgeben.
-    const isRequestedWeek = (r) => Boolean(
-      r && r.startDate && r.endDate &&
-      r.startDate <= rangeStartDate && rangeStartDate <= r.endDate
-    );
+    // EINE Definition fuer die Zielwochen-Pruefung: der Klick-Guard in
+    // clickWeekButton und diese aeussere Schleife duerfen nicht
+    // auseinanderlaufen (Live-Befund 25.09.2026).
+    const isRequestedWeek = (r) => renderedWeekContains(r, rangeStartDate);
 
     // FRÜHER KONTROLL-RETURN (Runde-4-Forderung B): Kein datierter Header und
     // keine Events nach Navigation + Warten — wenn das Restbudget die
@@ -2546,6 +2600,14 @@ export class OwaClient {
           }
           forcedNextRetryDone = true;
           const forced = await clickWeekButton(1, rendered.startDate);
+          if (forced.targetReached) {
+            // Zielwoche war bereits verifiziert -> uebernehmen und beenden.
+            // Kein Fehlerpfad: "kein Klick" waere hier falsch, weil der
+            // naechste GUARD sonst "week-mismatch" melden wuerde.
+            rendered = forced.week;
+            hasEvents = hasEvents || (await hasEventElements());
+            break;
+          }
           if (forced.clicked) {
             rendered = forced.week;
             hasEvents = hasEvents || (await hasEventElements());
@@ -2593,6 +2655,14 @@ export class OwaClient {
       }
 
       const r = await clickWeekButton(direction, rendered.startDate);
+      if (r.targetReached) {
+        // Zielwoche verifiziert -> uebernehmen und die Klick-Schleife
+        // verlassen. Bewusst VOR dem !r.clicked-Zweig: ein Skipped-Klick ist
+        // kein Fehlschlag.
+        rendered = r.week;
+        hasEvents = hasEvents || (await hasEventElements());
+        break;
+      }
       if (!r.clicked) {
         // Kein Kandidat wirkungsvoll -> 1x frische Navigation als Fallback (budgetiert)
         if (!gotoRetryDone && remaining() >= 15000) {
