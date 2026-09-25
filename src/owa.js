@@ -579,16 +579,22 @@ export function deriveEventLabelFromNode(node, { pats = EVENT_LABEL_PATTERNS, co
   for (const s of sources) {
     if (!hasSignature(s.value)) continue;
     if (hasDate(s.value)) return { label: s.value, reason: null, source: s.source, timeSource: 'label' };
-    // Zeit ohne Datum: Datum aus der Spaltenposition ergaenzen, wenn belegt
-    const geo = geometryLabel(node, { columns, ruler, weekStartIso, re });
+    // Signatur ohne Datum: Datum aus der Spaltenposition ergaenzen, wenn belegt.
+    // Ganztag laeuft ueber den All-Day-Weg — seine y-Position ist KEINE Zeit.
+    const geo = re.allDay.test(s.value)
+      ? geometryAllDayLabel(node, { columns, weekStartIso })
+      : geometryLabel(node, { columns, ruler, weekStartIso });
     if (geo) return { label: geo, reason: null, source: s.source, timeSource: 'label+geometry-date' };
     return { label: null, reason: 'no-date', source: s.source, timeSource: null };
   }
 
   // 2) Nur Text: Zeit+Datum aus der Geometrie ableiten
   if (text) {
-    const geo = geometryLabel(node, { columns, ruler, weekStartIso, re });
-    if (geo) return { label: geo, reason: null, source: 'text', timeSource: 'geometry' };
+    // "Urlaub, all day" o.ae. -> Ganztag-Label, NIE eine erfundene Uhrzeit.
+    const geo = re.allDay.test(text)
+      ? geometryAllDayLabel(node, { columns, weekStartIso })
+      : geometryLabel(node, { columns, ruler, weekStartIso });
+    if (geo) return { label: geo, reason: null, source: 'text', timeSource: re.allDay.test(text) ? 'geometry-date' : 'geometry' };
     if (hasSignature(text)) return { label: null, reason: 'no-date', source: 'text', timeSource: null };
     // Signatur vorhanden, aber keine Zeit/Datum ableitbar -> eigener Grund
     if (text.length > 1) {
@@ -611,19 +617,40 @@ export function deriveEventLabelFromNode(node, { pats = EVENT_LABEL_PATTERNS, co
   return { label: null, reason: 'no-event-signature', source: null, timeSource: null };
 }
 
-// Geometrie-Weg: Tag aus der Spalten-x-Position, Zeit aus dem Raster-y,
-// Ende aus der Chip-Hoehe. Jeder Teil muss belegt sein, sonst null.
-// Voraussetzung: der Knoten liegt nachweislich im Grid-Body (inGrid) —
-// sonst wuerde Toolbar-Text ("Work week") zu einem erfundenen Slot.
-function geometryLabel(node, { columns = [], ruler = [], weekStartIso = null } = {}) {
+// Wochentag aus der Spalten-x-Position (Spalten 0..n = Montag..). Rein
+// geometrisch, braucht nur Tageskoepfe + bekannten Wochenstart.
+function dateFromColumn(node, { columns = [], weekStartIso = null } = {}) {
   if (node.inGrid !== true) return null;
   const rect = node.rect || {};
   const colIndex = mapXToDayColumn(columns, Number.isFinite(rect.left) ? rect.left : rect.x);
   if (colIndex < 0 || !weekStartIso) return null;
-  const base = new Date(`${String(weekStartIso).slice(0, 10)}T00:00:00Z`);
+  const base = new Date(String(weekStartIso).slice(0, 10) + 'T00:00:00Z');
   if (Number.isNaN(base.getTime())) return null;
   base.setUTCDate(base.getUTCDate() + colIndex);
-  const dateIso = toIsoDate(base);
+  return toIsoDate(base);
+}
+
+// Titel des Chips: die erste Textquelle, die NICHT selbst eine Uhrzeit traegt
+// (sonst wuerde "14:00 to 15:00" zum Titel). All-Day-/Statusmarker werden
+// abgeschnitten, damit sie nicht doppelt im Label landen.
+function chipTitle(node) {
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const raw = [norm(node.ariaLabel), norm(node.title), norm(node.text)]
+    .find((t) => t && !/\d{1,2}:\d{2}/.test(t)) || '';
+  return raw
+    .replace(/[,;]?\s*\b(all[\s-]?day|ganzt(ä|ae)gig|ganztages|busy|besetzt|tentative|free|frei|recurring event|wiederkehrend)\b\s*,?/gi, ' ')
+    .replace(/\s*[,;]\s*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Geometrie-Weg fuer ZEITBASIERTE Events: Start aus dem Raster-y, Ende aus der
+// Chip-Hoehe, Tag aus der Spalte. Jeder Teil muss belegt sein, sonst null.
+function geometryLabel(node, { columns = [], ruler = [], weekStartIso = null } = {}) {
+  if (node.inGrid !== true) return null;
+  const rect = node.rect || {};
+  const dateIso = dateFromColumn(node, { columns, weekStartIso });
+  if (!dateIso) return null;
   const hourPx = estimateHourPx(ruler);
   const start = mapYToClockTime(ruler, rect.top, { hourPx });
   if (!start) return null;
@@ -632,9 +659,17 @@ function geometryLabel(node, { columns = [], ruler = [], weekStartIso = null } =
     const mins = Math.round((Number(rect.height) / hourPx) * 60 / 15) * 15;
     end = addMinutes(start, Math.max(15, Math.min(720, mins)));
   }
-  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
-  const title = [norm(node.ariaLabel), norm(node.title), norm(node.text)].find((t) => t && !/\d{1,2}:\d{2}/.test(t)) || '';
-  return buildGeometryEventLabel({ title, start, end, dateIso });
+  return buildGeometryEventLabel({ title: chipTitle(node), start, end, dateIso });
+}
+
+// Geometrie-Weg fuer GANZTAG-Events: nur der Tag aus der Spalte. Ein Ganztag-
+// Event darf NIEMALS eine Uhrzeit bekommen — der All-Day-Eintrag liegt in
+// seiner eigenen Zeile, seine y-Position ist keine Zeitangabe.
+function geometryAllDayLabel(node, { columns = [], weekStartIso = null } = {}) {
+  if (node.inGrid !== true) return null;
+  const dateIso = dateFromColumn(node, { columns, weekStartIso });
+  if (!dateIso) return null;
+  return buildGeometryEventLabel({ title: chipTitle(node), allDay: true, dateIso });
 }
 
 function addMinutes(hhmm, minutes) {
@@ -926,6 +961,8 @@ export async function collectCalendarCandidates(page) {
 // Kandidaten-/Census-Grenzen: haalten den Scan und die MCP-Antwort klein.
 const CENSUS_MAX_NODES = 14;
 const SCAN_MAX_ELEMENTS = 6000;
+// Rohe Struktur-Knoten fuer die Geometrie-Ableitung (Datentraeger, grosszuegig).
+const SCAN_MAX_STRUCTURE_NODES = 200;
 
 // Sucht die Kandidaten-Knoten und liefert Label-Liste + Diagnostik.
 // `weekStartIso` (Montag der gerenderten Woche) ermoeglicht die Datums-
@@ -934,7 +971,7 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
   let collectError = null;
   try {
     const res = await page.evaluate(
-      ({ pats, plan, clockStrict, weekStart, fastMode }) => {
+      ({ pats, plan, clockStrict, weekStart, fastMode, maxElements, maxCensusNodes }) => {
         const re = {};
         for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
         const clockOnlyRe = new RegExp(clockStrict, 'i');
@@ -942,6 +979,27 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         const cap = (a, n) => a.slice(0, n);
         const safeQSA = (sel) => { try { return document.querySelectorAll(sel); } catch (e) { return []; } };
         const safeAttr = (el, name) => { try { return el.getAttribute ? el.getAttribute(name) : null; } catch (e) { return null; } };
+        // Billige Attribut-Existenzpruefung (kein Layout). hasAttribute fehlt
+        // bei einfachen Test-Fakes -> dann ueber die Attribut-Liste.
+        const hasAttr = (el, name) => {
+          try {
+            if (typeof el.hasAttribute === 'function') return el.hasAttribute(name);
+          } catch (e) { /* weiter mit dem Fallback */ }
+          try {
+            const as = el.attributes;
+            if (!as) return false;
+            for (let i = 0; i < as.length; i++) if (as[i] && as[i].name === name) return true;
+          } catch (e) { /* kein Attributzugang -> false */ }
+          return false;
+        };
+        const hasDataAttr = (el) => {
+          try {
+            const as = el.attributes;
+            if (!as) return false;
+            for (let i = 0; i < as.length; i++) if (as[i] && as[i].name && as[i].name.indexOf('data-') === 0) return true;
+          } catch (e) { /* kein Attributzugang -> false */ }
+          return false;
+        };
         const rectOf = (el) => {
           try {
             const r = el.getBoundingClientRect();
@@ -1014,7 +1072,7 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         let scannedCount = 0;
         let truncated = false;
         for (const el of (fastMode ? [] : safeQSA('*'))) {
-          if (scannedCount >= 6000) { truncated = true; break; }
+          if (scannedCount >= maxElements) { truncated = true; break; }
           scannedCount++;
           const r = rectOf(el);
           if (!areaOf(r)) continue;
@@ -1046,7 +1104,7 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         if (region) {
           let seen = 0;
           for (const el of safeQSA('*')) {
-            if (seen >= 6000) { truncated = true; break; }
+            if (seen >= maxElements) { truncated = true; break; }
             seen++;
             const r = rectOf(el);
             if (!areaOf(r)) continue;
@@ -1071,6 +1129,8 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         const nonEventLabels = [];
         const candidates = [];
         const allLabels = [];
+        // Event-Signatur OHNE Datum — der Geometrie-Weg macht daraus ein Label.
+        const dateMissing = [];
         const sourceTried = [];
         let hiddenCount = 0;
         let sourceUsed = null;
@@ -1084,8 +1144,15 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
             .filter((t) => t && t.length <= 300);
           let hit = false;
           for (const t of texts) {
-            if (isEventSignature(t)) { allLabels.push(t); hit = true; }
-            else {
+            if (isEventSignature(t)) {
+              // Ein Label NUR mit Zeit ("Urlaub, all day", "14:00 to 15:00")
+              // ist fuer den Parser wertlos (kein Datum). Solche Treffer
+              // werden NICHT als Label gemeldet, sondern der Geometrie
+              // ueberlassen — sonst zaehlt eventElementsFound Knoten, aus
+              // denen kein Slot werden kann.
+              if (re.dateish.test(t)) { allLabels.push(t); hit = true; }
+              else if (dateMissing.indexOf(t) < 0) dateMissing.push(t);
+            } else {
               const r = reasonOf(t);
               if (r === 'header-misclassified') headerLike.push(t);
               else if (r) nonEventLabels.push({ label: t, reason: r });
@@ -1113,9 +1180,17 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
           } else if (step.source === 'text') {
             nodes = structureNodes;
           } else {
-            // title/data-attr: alle Knoten MIT Flaeche im Dokument (bewusst
-            // breit — diese Attribute sind billig zu lesen und eindeutig).
+            // title/data-attr: bewusst breit, aber mit einem BILLIGEN Vorfilter.
+            // describe() liest innerText und erzwingt damit ein Layout — das
+            // darf nicht fuer jedes der ~15k Elemente einer echten OWA-Seite
+            // passieren (sonst frisst der Scan das 45s-Budget). Der Vorfilter
+            // prueft nur, ob das Attribut ueberhaupt vorhanden ist.
+            let broadScanned = 0;
             for (const el of safeQSA('*')) {
+              if (broadScanned >= SCAN_MAX_ELEMENTS) { truncated = true; break; }
+              broadScanned++;
+              if (step.source === 'title' && !hasAttr(el, 'title')) continue;
+              if (step.source === 'data-attr' && !hasDataAttr(el)) continue;
               const r = rectOf(el);
               if (areaOf(r)) nodes.push(describe(el));
             }
@@ -1139,9 +1214,11 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
           headerLikeLabels: cap(dedupe(headerLike), 20),
           nonEventLabels: cap(dedupeReasons(nonEventLabels), 20),
           candidates: cap(candidates, 20),
+          // Signatur ohne Datum: sichtbar, aber kein verwertbares Label.
+          dateMissingLabels: cap(dateMissing, 20),
           // Rohe Struktur-Knoten fuer die Node-seitige Geometrie-Ableitung
           // (grosszuegiges Limit: das ist der eigentliche Datentraeger).
-          structureNodes: fastMode ? [] : cap(structureNodes, 200),
+          structureNodes: fastMode ? [] : cap(structureNodes, SCAN_MAX_STRUCTURE_NODES),
           census: fastMode
             ? { skipped: 'fast-mode' }
             : {
@@ -1150,11 +1227,19 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
               dayColumns: cap(dayColumns, 10),
               clockRuler: cap(clockRuler, 16),
               structureNodes: structureNodes.length,
-              scanned: cap(structureNodes, CENSUS_MAX_NODES)
+              scanned: cap(structureNodes, maxCensusNodes)
             }
         };
       },
-      { pats: EVENT_LABEL_PATTERNS, plan: eventSourcePlan(preferSelector), clockStrict: CLOCK_LABEL_PATTERN, weekStart: weekStartIso, fastMode: fast === true }
+      {
+        pats: EVENT_LABEL_PATTERNS,
+        plan: eventSourcePlan(preferSelector),
+        clockStrict: CLOCK_LABEL_PATTERN,
+        weekStart: weekStartIso,
+        fastMode: fast === true,
+        maxElements: SCAN_MAX_ELEMENTS,
+        maxCensusNodes: CENSUS_MAX_NODES
+      }
     );
     // GEOMETRIE-Pfad (Node-seitig, gleiche Prueflogik wie der Rest):
     // Struktur-Knoten aus dem Grid-Body werden ueber deriveEventLabelFromNode
@@ -1183,7 +1268,8 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
       const seen = new Set();
       res.labels = res.labels.filter((l) => (seen.has(l) ? false : (seen.add(l), true))).slice(0, 60);
       res.eventElementsFound = res.labels.length;
-      if (!res.sourceUsed) res.sourceUsed = 'text+geometry';
+      res.sourceUsed = res.sourceUsed === 'text' || !res.sourceUsed ? 'text+geometry' : res.sourceUsed;
+      if (!res.selectorUsed || res.selectorUsed === '(keine-quelle-mit-treffer)') res.selectorUsed = '(struktur:text+geometry)';
     }
     if (geoRejections.length) {
       const known = new Set(res.nonEventLabels.map((e) => e.label));
@@ -2585,6 +2671,10 @@ export class OwaClient {
     // Der zuletzt erfolgreiche Selektor wird ZUERST probiert. Diese Sammlung —
     // nicht die Vorab-Probe — entscheidet ueber eventElementsFound, dataQuality
     // und eventWaitOutcome.
+    const rawLabels = eventCollection.labels;
+    const eventElementsFound = eventCollection.eventElementsFound;
+    const selectorUsed = eventCollection.selectorUsed;
+
     const eventCollection = await collectCalendarEventLabels(page, {
       preferSelector: lastEventSelector,
       weekStartIso: rendered.startDate || mondayIso
@@ -2605,10 +2695,6 @@ export class OwaClient {
     // echte Event-Knoten gelesen wurden. Sonst 'unverified-empty' — dann ist
     // busySlots:[] AUSDRUECKLICH kein "Kalender ist frei".
     const dataQuality = resolveDataQuality({ weekVerified, eventElementsFound });
-
-    const rawLabels = eventCollection.labels;
-    const eventElementsFound = eventCollection.eventElementsFound;
-    const selectorUsed = eventCollection.selectorUsed;
 
     // Deduplizieren (gleiche Events können mehrfach im DOM hängen), strukturiert parsen
     // und anhand der Wortliste klassifizieren (Busy/Tentative/Free). Jede Verwerfung
@@ -2667,6 +2753,10 @@ export class OwaClient {
     );
 
     // Hinweise zusammenbauen (Verifikationsstatus + Range-Abdeckung)
+      'Prev/Next-Ableitung) die Zielwoche, sind KEINE Button-Klicks nötig; Buttons nur bei Abweichung.';
+    if (dataQuality === 'unverified') {
+      note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
+    }
     let note = 'Busy-Slots aus ARIA-Labels der Kalender-Event-Elemente der Wochenansicht extrahiert ' +
       '(Datum/Zeit strukturiert geparst, Work-Location-Pseudo-Slots entfernt, Zeit-Duplikate zusammengeführt, ' +
       'per Wortliste klassifiziert, auf den angefragten Zeitraum gefiltert). ' +
@@ -2676,10 +2766,6 @@ export class OwaClient {
         `0 Event-Knoten gelesen (Quellen: ${(eventCollection.sourceTried || []).map((s) => s.source).join(', ') || 'keine'}). ` +
         `busySlots=[] bedeutet hier KEINEN leeren Kalender, sondern ein nicht auslesbares Grid — ` +
         `NICHT als "frei" verwenden.`;
-    }
-      'Prev/Next-Ableitung) die Zielwoche, sind KEINE Button-Klicks nötig; Buttons nur bei Abweichung.';
-    if (dataQuality === 'unverified') {
-      note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
     }
     if (dataQuality === 'verified' && abortReason !== 'none') {
       note += ` HINWEIS: Navigation vorzeitig beendet (${abortReason}); die angezeigte Woche wurde verifiziert.`;
@@ -2694,6 +2780,10 @@ export class OwaClient {
 
     const result = {
       status: 'ok',
+        text: rendered.text,
+        startDate: rendered.startDate,
+        endDate: rendered.endDate
+      },
       start: startDt,
       end: endDt,
       calendar: 'Firmenkalender (Outlook Web)',
@@ -2701,14 +2791,10 @@ export class OwaClient {
       // Wochen-Nachweis getrennt von der Event-Belastbarkeit (Defekt 2): die
       // Wochen-Verifikation funktioniert und bleibt so sichtbar.
       weekVerified,
-        text: rendered.text,
+      dataQuality,
       // Maschinenlesbare Ehrlichkeit: nur bei dataQuality==='verified' sind
       // busySlots eine belastbare Aussage ueber Belegung.
       busySlotsReliable: isBelievableBusySlots(dataQuality),
-        startDate: rendered.startDate,
-        endDate: rendered.endDate
-      },
-      dataQuality,
       busySlots,
       count: busySlots.length,
       note
@@ -2726,6 +2812,10 @@ export class OwaClient {
         early: earlyDiagnostics,
         weekButtonProbe,
         abortReason,
+        rejectionReasons: rejectionReasons.slice(0, 40),
+        waitedForEventsMs: Math.round(eventWait.waitedMs),
+        eventWaitOutcome: eventWait.outcome
+      });
         budget: freeBusyBudgetReport(),
         eventElementsFound,
         selectorUsed,
@@ -2738,10 +2828,9 @@ export class OwaClient {
       if (eventCollection.sourceTried) diag.sourceTried = eventCollection.sourceTried;
       if (eventCollection.census) diag.census = eventCollection.census;
       if (eventCollection.collectError) diag.collectError = eventCollection.collectError;
-        rejectionReasons: rejectionReasons.slice(0, 40),
-        waitedForEventsMs: Math.round(eventWait.waitedMs),
-        eventWaitOutcome: eventWait.outcome
-      });
+      if (eventCollection.dateMissingLabels && eventCollection.dateMissingLabels.length) {
+        diag.dateMissingLabels = eventCollection.dateMissingLabels;
+      }
       const warnings = [
         slotExtractionWarning(eventElementsFound, busySlots.length),
         eventWaitWarning({ outcome: eventWait.outcome, waitedMs: eventWait.waitedMs, budgetMs: eventWaitBudget })

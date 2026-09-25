@@ -1845,6 +1845,22 @@ describe('deriveEventLabelFromNode - Label aus einem beliebigen Grid-Knoten', ()
     assert.equal(r.reason, 'no-area');
   });
 
+  test('12) Ganztag-Chip bekommt KEINE Uhrzeit aus der Geometrie', () => {
+    // "Urlaub, all day" liegt in der All-Day-Zeile, ihre y-Position ist keine
+    // Zeit. Ohne den All-Day-Sonderweg wuerde daraus "Urlaub, 12:00 to 15:00".
+    const r = deriveEventLabelFromNode(node({ text: 'Urlaub, all day' }), { pats, ...geo });
+    assert.equal(r.reason, null);
+    assert.equal(r.label, 'Urlaub, all day event, Tuesday, September 29, 2026');
+    const slot = parseEventLabel(r.label, 2026);
+    assert.equal(slot.allDay, true);
+    assert.equal(slot.start, null);
+  });
+
+  test('13) Ganztag OHNE Spaltenposition wird verworfen (kein geratenes Datum)', () => {
+    const r = deriveEventLabelFromNode(node({ text: 'Urlaub, all day', inGrid: false }), { pats, ...geo });
+    assert.equal(r.label, null);
+  });
+
   test('11) offsetParent===null ist KEIN Hard-K.O. (Virtualisierung)', () => {
     const r = deriveEventLabelFromNode(
       node({ ariaLabel: 'Block, 13:00 to 18:30, Wednesday, September 30, 2026', offsetParentNull: true, area: true }),
@@ -2063,6 +2079,76 @@ describe('collectCalendarEventLabels - Quellen-Leiter + Struktur-Census (Defekt 
       assert.ok(res.census.structureNodes >= 1);
       assert.ok(res.census.scanned.length >= 1);
       assert.ok('tag' in res.census.scanned[0] && 'rect' in res.census.scanned[0]);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Der eigentliche Defekt-1-Nachweis: eine Wochenansicht, in der die
+  // Event-Chips WEDER aria-label NOCH title NOCH data-* tragen (nur
+  // sichtbarer Text + Position) — der Fall, an dem [aria-label] scheitert.
+  // Erwartung: alle 6 KW-40-Termine werden rekonstruiert. Fixture aus den
+  // Runde-4-Labels (6 Live-Labels, dort aus dem DOM gelesen).
+  // -------------------------------------------------------------------
+  const kw40WeekDoc = () => {
+    // 5 Arbeitsspalten (Mo..Fr) a 120px ab x=140, Tageskopf-Unterkante 150
+    const COL_LEFT = 140, COL_W = 120, HEADER_BOTTOM = 150;
+    // Stundenraster 07:00 (top 150) bis 20:00, 50px je Stunde
+    const HOUR_TOP = 150, HOUR_PX = 50, FIRST_HOUR = 7;
+    const yFor = (hour, min = 0) => HOUR_TOP + (hour - FIRST_HOUR) * HOUR_PX + (min / 60) * HOUR_PX;
+    const col = (i) => ({ tagName: 'TH', getAttribute: (n) => (n === 'role' ? 'columnheader' : null), getBoundingClientRect: () => ({ left: COL_LEFT + i * COL_W, top: 120, width: COL_W, height: HEADER_BOTTOM - 120, x: COL_LEFT + i * COL_W, y: 120 }), innerText: '', attributes: [] });
+    const hour = (h) => ({ tagName: 'DIV', getAttribute: () => null, getBoundingClientRect: () => ({ left: 60, top: yFor(h), width: 40, height: 20, x: 60, y: yFor(h) }), innerText: `${String(h).padStart(2, '0')}:00`, attributes: [] });
+    // Chip OHNE Attribute, nur sichtbarer Text
+    const chip = (colIdx, h1, m1, h2, m2, text) => {
+      const top = yFor(h1, m1);
+      const height = Math.max(20, yFor(h2, m2) - top);
+      return { tagName: 'DIV', className: '', getAttribute: () => null, getBoundingClientRect: () => ({ left: COL_LEFT + colIdx * COL_W + 5, top, width: COL_W - 10, height, x: COL_LEFT + colIdx * COL_W + 5, y: top }), innerText: text, offsetParent: null, children: [], attributes: [] };
+    };
+    const chips = [
+      chip(0, 9, 0, 12, 0, 'Stadt Osnabrück I Portalintegration OpenRathaus'),
+      chip(0, 14, 0, 15, 0, 'Austausch Mathis:David:Alex'),
+      chip(1, 8, 0, 9, 0, 'Teammeeting Team 1 - Local Administration'),
+      chip(1, 13, 0, 15, 0, "Stadt Hörstel: CMIS Übertragungsfehler 'Field repo[355]'"),
+      chip(2, 13, 0, 18, 30, 'Block'),
+      chip(2, 8, 0, 9, 0, 'Urlaub, all day')
+    ];
+    // Chrome-Rauschen: Toolbar-Text, der NICHT im Grid-Body liegt
+    const toolbar = { tagName: 'BUTTON', getAttribute: (n) => (n === 'aria-label' ? 'Work week' : null), getBoundingClientRect: () => ({ left: 700, top: 60, width: 120, height: 30, x: 700, y: 60 }), innerText: 'Work week', attributes: [] };
+    const els = [col(0), col(1), col(2), col(3), col(4)]
+      .concat([7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20].map(hour))
+      .concat([toolbar], chips);
+    return {
+      querySelectorAll: (sel) => {
+        if (sel === '[role="columnheader"], [role="grid"] th, th') return [col(0), col(1), col(2), col(3), col(4)];
+        if (sel === '*') return els;
+        return [];
+      },
+      querySelector: () => null,
+      body: null
+    };
+  };
+
+  test('Defekt-1-Nachweis: alle 6 KW-40-Termine werden aus reinem Text+Geometrie rekonstruiert', async () => {
+    await withFakeDocument(kw40WeekDoc(), async () => {
+      const res = await collectCalendarEventLabels(fakePage, { weekStartIso: '2026-09-28' });
+      assert.equal(res.sourceUsed, 'text+geometry', `sourceUsed=${res.sourceUsed}`);
+      assert.equal(res.eventElementsFound, 6, `Labels: ${JSON.stringify(res.labels, null, 1)}`);
+
+      const slots = res.labels.map((l) => parseEventLabel(l, 2026)).filter(Boolean);
+      assert.equal(slots.length, 6);
+      const key = (s) => `${s.date} ${s.start || 'all-day'}-${s.end || ''} ${s.title}`;
+      const byKey = new Set(slots.map(key));
+      for (const expected of [
+        '2026-09-28 09:00-12:00 Stadt Osnabrück I Portalintegration OpenRathaus',
+        '2026-09-28 14:00-15:00 Austausch Mathis:David:Alex',
+        '2026-09-29 08:00-09:00 Teammeeting Team 1 - Local Administration',
+        "2026-09-29 13:00-15:00 Stadt Hörstel: CMIS Übertragungsfehler 'Field repo[355]'",
+        '2026-09-30 13:00-18:30 Block',
+        '2026-09-30 all-day- Urlaub'
+      ]) {
+        assert.ok(byKey.has(expected), `fehlt: ${expected} | vorhanden: ${[...byKey].join(' ;; ')}`);
+      }
+      // Toolbar-Text darf KEIN Slot werden
+      assert.equal(slots.filter((s) => /work week/i.test(s.title)).length, 0);
     });
   });
 });
