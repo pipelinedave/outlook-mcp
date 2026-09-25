@@ -1998,7 +1998,15 @@ export const EVENT_WAIT_ABORT_REASONS = {
   // Lesbarkeit des Grids, KEIN freier Kalender.
   noNodesInTargetWeek: 'no-event-nodes-in-target-week',
   // BUG 4: Ohne konfigurierten Zielzeitraum ist keine Qualifikation moeglich.
-  targetUnknown: 'wait-target-unknown'
+  targetUnknown: 'wait-target-unknown',
+  // FIX 2 (Live-Lauf 5): ein DATIERTER Header der FALSCHEN Woche. Das ist ein
+  // GEGENBELEG, kein Beleg — und es ist auch kein Leer-Beweis: die Ansicht
+  // zeigt nachweislich eine andere Woche als die angefragte. In Lauf 5 war es
+  // das, was nach FIX 1 (Header = angezeigte Woche) uebrig bleibt: 10 echte
+  // Event-Knoten, alle ausserhalb des Zeitraums, und ein Header, der KW 39
+  // statt KW 40 sagt. Vorher fiel das unter 'events-outside-requested-range'
+  // bzw. - bei 0 Knoten - sogar unter den Leer-Beweis 'rendered-empty-proven'.
+  headerOutsideRange: 'header-outside-requested-range'
 };
 
 // Die fuenf Beobachtungs-Kategorien der Wartephase. Genau EINE Klassifikation,
@@ -2011,7 +2019,10 @@ export const EVENT_WAIT_STATES = {
   stillLoading: 'still-loading',
   outsideRange: 'events-outside-requested-range',
   emptyCandidate: 'empty-candidate',
-  targetUnknown: 'target-unknown'
+  targetUnknown: 'target-unknown',
+  // FIX 2: datierter Header, der die Zielwoche NICHT enthaelt. Vor der
+  // Event-Zahl, weil der Header die staerkere Information traegt.
+  headerOutsideRange: 'header-outside-requested-range'
 };
 
 // Zaehlt Labels, die den angefragten Zeitraum treffen. Bewusst ueber DIESELBE
@@ -2048,6 +2059,14 @@ export function eventWaitObservationState({
   const n = Number(eventElementsFound) || 0;
   const inRange = Number(inRangeLabels) || 0;
   // Ohne Zielzeitraum ist KEIN datumsqualifizierter Beleg moeglich — auch dann
+//
+// FIX 2 (Live-Lauf 5): 'found' ist BEREICHS-qualifiziert, nicht nur
+// DATUMS-qualifiziert. Live: eventWaitDateQualified:true bei
+// eventWaitInRangeLabels:0 -> found nach 41ms von 20000ms Budget. Ein
+// datierter Header der FALSCHEN Woche ist ein GEGENBELEG ("die Ansicht zeigt
+// nachweislich eine andere Woche"), kein Beleg. Er bekommt deshalb einen
+// eigenen, benannten Zustand (header-outside-requested-range) und loest
+// weder 'found' noch den Leer-Beweis aus.
   // nicht, wenn Labels vorhanden sind: "im angefragten Zeitraum" ist ohne
   // Zielzeitraum nicht definierbar. Diese Pruefung steht VOR den Beleg-
   // Kriterien, sonst wuerde ein weekenblind konfigurierter Aufruf doch noch
@@ -2055,14 +2074,25 @@ export function eventWaitObservationState({
   if (!targetConfigured) {
     return { category: EVENT_WAIT_STATES.targetUnknown, dateQualified: false, evidence: null, eventElementsFound: n, inRangeLabels: inRange, loading: Boolean(loading) };
   }
+  // Beleg 1: der ANGEZEIGTE Header (nicht ein Nav-Button, vgl. FIX 1) traegt
+  // die Zielwoche. renderedWeekContains prueft den GANZEN Range, nicht nur den
+  // Start — ein Header, der die Zielwoche nur teilweise ueberlappt, gilt nicht
+  // als Beleg fuer die angefragte Woche.
   if (renderedWeekContains(weekHeader, targetStart)) {
     return { category: EVENT_WAIT_STATES.targetWeek, dateQualified: true, evidence: 'week-header', eventElementsFound: n, inRangeLabels: inRange, loading: Boolean(loading) };
   }
+  // Beleg 2: mindestens ein Label aus dem angefragten Zeitraum.
   if (inRange > 0) {
     return { category: EVENT_WAIT_STATES.inRange, dateQualified: true, evidence: 'in-range-label', eventElementsFound: n, inRangeLabels: inRange, loading: Boolean(loading) };
   }
   if (loading) {
     return { category: EVENT_WAIT_STATES.stillLoading, dateQualified: false, evidence: null, eventElementsFound: n, inRangeLabels: inRange, loading: true };
+  }
+  // FIX 2: Header ist DATIERT, aber die Zielwoche ist nicht drin. VOR der
+  // Event-Zahl, weil der Header die staerkere Information traegt: er sagt
+  // nicht nur "nichts passt", sondern "es ist die falsche Woche".
+  if (weekHeader && weekHeader.startDate && weekHeader.endDate) {
+    return { category: EVENT_WAIT_STATES.headerOutsideRange, dateQualified: false, evidence: null, eventElementsFound: n, inRangeLabels: inRange, loading: false, renderedWeek: `${weekHeader.startDate}–${weekHeader.endDate}` };
   }
   if (n > 0) {
     // Live-Fall Runde 4: 18 Knoten, alle ausserhalb des angefragten Zeitraums.
@@ -2090,6 +2120,8 @@ export async function waitForCalendarEvents({
     polls: 0,
     loadingPolls: 0,
     outsideRangePolls: 0,
+    // FIX 2: Polls mit datiertem Header der FALSCHEN Woche.
+    headerOutsideRangePolls: 0,
     loading: false,
     dateQualified: false,
     abortReason: null,
@@ -2108,6 +2140,10 @@ export async function waitForCalendarEvents({
   let polls = 0;
   let loadingPolls = 0;
   let outsideRangePolls = 0;
+  // FIX 2: "Header der falschen Woche" ist ein eigener Zaehler — sichtbar
+  // getrennt von "Events ausserhalb des Zeitraums", weil es andere Ursache
+  // UND andere Konsequenz hat (die Woche ist bekannt und falsch).
+  let headerOutsideRangePolls = 0;
   let quietSince = null;   // Beginn des ununterbrochenen Ruhe-Fensters
   let lastLoading = false;
   let lastState = EVENT_WAIT_STATES.emptyCandidate;
@@ -2121,7 +2157,7 @@ export async function waitForCalendarEvents({
     if (st.dateQualified) {
       return {
         found: true, outcome: 'found', waitedMs: waited(), polls, loadingPolls, outsideRangePolls,
-        loading: lastLoading, dateQualified: true, evidence: st.evidence,
+        headerOutsideRangePolls, loading: lastLoading, dateQualified: true, evidence: st.evidence,
         weekHeader: o.weekHeader || null, inRangeLabels: st.inRangeLabels, abortReason: null
       };
     }
@@ -2136,13 +2172,20 @@ export async function waitForCalendarEvents({
       // nachweislich geaendert hat. Es wird bis zum Budget weiter gepollt.
       outsideRangePolls++;
       quietSince = null;
+    } else if (st.category === EVENT_WAIT_STATES.headerOutsideRange) {
+      // FIX 2: datierter Header der falschen Woche. startet KEIN Ruhe-Fenster
+      // (es ist ein GEGENBELEG, kein Leer-Beweis) und invalidiert ein
+      // bestehendes. Es wird bis zum Budget weiter gepollt — die Zielwoche
+      // kann noch umschalten (Klick/Navigation/Rendering).
+      headerOutsideRangePolls++;
+      quietSince = null;
     } else if (st.category === EVENT_WAIT_STATES.emptyCandidate) {
       if (quietSince === null) quietSince = now();
       const quietMs = waited() - (quietSince - startedAt);
       if (quietMs >= (settleMs || 0)) {
         return {
           found: false, outcome: 'not-found', waitedMs: waited(), polls, loadingPolls, outsideRangePolls,
-          loading: false, dateQualified: false, weekHeader: o.weekHeader || null,
+          headerOutsideRangePolls, loading: false, dateQualified: false, weekHeader: o.weekHeader || null,
           abortReason: EVENT_WAIT_ABORT_REASONS.renderedEmpty
         };
       }
@@ -2155,13 +2198,16 @@ export async function waitForCalendarEvents({
   }
   return {
     found: false, outcome: 'budget-exhausted', waitedMs: waited(), polls, loadingPolls, outsideRangePolls,
-    loading: lastLoading, dateQualified: false, lastState,
-    // BUG 4: Der Abbruchgrund nennt den zuletzt beobachteten Zustand, damit
-    // "Budget erschoepft, weil die falsche Woche stand" von "Budget erschoepft,
-    // weil gar nichts kam" unterscheidbar bleibt.
-    abortReason: lastState === EVENT_WAIT_STATES.outsideRange
-      ? EVENT_WAIT_ABORT_REASONS.eventsOutsideRange
-      : EVENT_WAIT_ABORT_REASONS.budgetExhausted
+    headerOutsideRangePolls, loading: lastLoading, dateQualified: false, lastState,
+    // BUG 4/FIX 2: der Abbruchgrund nennt den zuletzt beobachteten Zustand,
+    // damit "Budget erschoepft, weil die falsche Woche stand" (Header
+    // datiert) von "Budget erschoepft, weil Events ausserhalb standen" und von
+    // "Budget erschoepft, weil gar nichts kam" unterscheidbar bleibt.
+    abortReason: lastState === EVENT_WAIT_STATES.headerOutsideRange
+      ? EVENT_WAIT_ABORT_REASONS.headerOutsideRange
+      : lastState === EVENT_WAIT_STATES.outsideRange
+        ? EVENT_WAIT_ABORT_REASONS.eventsOutsideRange
+        : EVENT_WAIT_ABORT_REASONS.budgetExhausted
   };
 }
 
@@ -2287,6 +2333,12 @@ export function reconcileEventWait({ wait = null, eventElementsFound = 0, waitBu
   }
   if (w.abortReason === EVENT_WAIT_ABORT_REASONS.eventsOutsideRange) {
     return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.eventsOutsideRange };
+  }
+  // FIX 2: der datierte Header der falschen Woche ist ein eigener Grund und
+  // wird nicht auf den generischen Budget-Abbruch abgebildet — sonst waere er
+  // im Ergebnis nicht mehr von "es kam gar nichts" unterscheidbar.
+  if (w.abortReason === EVENT_WAIT_ABORT_REASONS.headerOutsideRange) {
+    return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.headerOutsideRange };
   }
   return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.budgetExhausted };
 }
@@ -2666,7 +2718,15 @@ export function canClickSameDirection({ lastClickDirection = null, direction = 0
 // Abbruchgruende sind seit dem datumsqualifizierten Umbau praeziser als die
 // Ausgaenge, und zwei davon (falsche Woche sichtbar / Zielwoche ohne Knoten)
 // fallen sonst in die generischen Texte fuer "nichts gefunden".
-export function eventWaitWarning({ outcome, waitedMs = 0, budgetMs = null, abortReason = null } = {}) {
+export function eventWaitWarning({ outcome, waitedMs = 0, budgetMs = null, abortReason = null, renderedWeek = null } = {}) {
+  if (abortReason === EVENT_WAIT_ABORT_REASONS.headerOutsideRange) {
+    return `Nach ${Math.round(waitedMs)}ms Wartephase (Budget ${budgetMs === null ? 'n/a' : budgetMs}ms) stand ein ` +
+      `DATIERTER Wochen-Header im DOM, der die angefragte Woche NICHT enthaelt` +
+      `${renderedWeek ? ` (Header: ${renderedWeek})` : ''}. ` +
+      `Das ist ein Gegenbeleg, kein Beleg: die Ansicht zeigt nachweislich eine andere Woche. ` +
+      `Weder Treffer noch Leer-Beweis — bis zum Budget weitergepollt. ` +
+      `Siehe diagnostics.renderedWeek/weekHeaderLabels.`;
+  }
   if (abortReason === EVENT_WAIT_ABORT_REASONS.eventsOutsideRange) {
     return `Nach ${Math.round(waitedMs)}ms Wartephase (Budget ${budgetMs === null ? 'n/a' : budgetMs}ms) waren ` +
       `Event-Knoten im DOM sichtbar, aber KEINER aus dem angefragten Zeitraum. ` +
@@ -4366,6 +4426,11 @@ export class OwaClient {
     //    NUR im Bestätigungsdialog suchen (nicht im Editor-Dialog [0], der ebenfalls
     //    einen "Delete"-Button hat). Erkennung über Bestätigungs-Marker im Dialogtext.
     for (let i = 0; i < 5; i++) {
+      // FIX 2: der eigene Zaehler fuer "datierter Header der falschen Woche".
+      // Ohne dieses Feld laesst sich in Runde 6 nicht unterscheiden, ob der
+      // Wartepfad an einem Header-Gegenbeleg oder an echter Leere gescheitert ist.
+      diag.eventWaitHeaderOutsideRangePolls = eventWait.headerOutsideRangePolls || 0;
+      if (eventWait.lastState) diag.eventWaitLastState = eventWait.lastState;
       await page.waitForTimeout(800);
       const confirmHit = await page.evaluate(() => {
         // Nur Dialoge, die wie eine Lösch-Bestätigung aussehen (Textmarker)

@@ -720,7 +720,22 @@ describe('Bug 4 — der Warte-Loop ist datumsqualifiziert', () => {
     const res = await runWait(doc, { clock, readWeek: async () => WRONG_HEADER });
     assert.equal(res.found, false, 'ein Header der falschen Woche ist kein Beleg');
     assert.equal(res.outcome, 'budget-exhausted');
-    assert.equal(res.abortReason, EVENT_WAIT_ABORT_REASONS.eventsOutsideRange);
+    // FIX 2: der datierte Header der falschen Woche hat jetzt einen EIGENEN,
+    // benannten Abbruchgrund. Vorher fiel er unter 'events-outside-range' —
+    // damit war im Ergebnis nicht mehr unterscheidbar, ob die Woche falsch war
+    // (Header) oder die Events ausserhalb lagen. Der Header traegt die
+    // staerkere Information ("es ist die falsche Woche") und wird zuerst
+    // geprueft.
+    assert.equal(res.abortReason, EVENT_WAIT_ABORT_REASONS.headerOutsideRange);
+    assert.equal(res.abortReason, 'header-outside-requested-range');
+    assert.notEqual(res.abortReason, EVENT_WAIT_ABORT_REASONS.renderedEmpty,
+      'und es ist schon gar kein Leer-Beweis — der Header widerspricht ihm');
+    assert.equal(res.dateQualified, false);
+    // Es wurde bis zum Budget gepollt, nicht abgebrochen.
+    assert.ok(res.polls > 30, `es wurde bis zum Budget gepollt (war ${res.polls} Polls)`);
+    assert.ok(res.waitedMs >= 20000 - FREEBUSY_EVENT_WAIT_POLL_MS,
+      `das Budget wurde ausge schoepft (war ${res.waitedMs}ms)`);
+    assert.ok(res.headerOutsideRangePolls > 30, 'jeder Poll sah den Header-Gegenbeleg');
   });
 
   test('OHNE Zielzeitraum: kein "found", sondern ein benannter Konfigurationsfehler', async () => {
