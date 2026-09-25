@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -1038,5 +1038,174 @@ describe('resolveMailboxVerification - Verifikations-Quellen (Runde-4-Forderung 
 
   test('Ohne Realm -> null (nichts zu matchen)', () => {
     assert.equal(resolveMailboxVerification(['david@adesso.de'], null).activeMailboxMatchesRealm, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Iteration 6 (Live-Befund Runde 5 vom 25.09.): Slot-Extraktion lieferte 0,
+// obwohl dieselben Events in Runde 4 als ARIA-Labels im DOM nachweisbar waren.
+// ---------------------------------------------------------------------------
+
+describe('parseEventLabel - Live-Labels Runde 5 (OWA-Realformate)', () => {
+  const LIVE_LABELS = [
+    'Stadt Osnabrück I Portalintegration OpenRathaus, 09:00 to 12:00, Monday, September 28, 2026, Microsoft Teams-Besprechung',
+    'Austausch Mathis:David:Alex, 14:00 to 15:00, Monday, September 28, 2026, Microsoft Teams-Besprechung, By Schnieders, Ale',
+    'Teammeeting Team 1 - Local Administration, 08:00 to 09:00, Tuesday, September 29, 2026, Microsoft Teams Meeting, By Schn…',
+    "Stadt Hörstel: CMIS Übertragungsfehler 'Field repo[355]', 13:00 to 15:00, Tuesday, September 29, 2026, https://video.hoe…",
+    'Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy, Recurring event',
+    'Urlaub, all day event, Wednesday, September 30, 2026, Busy'
+  ];
+
+  test('alle 6 Live-Labels parsen zu korrekten Slots', () => {
+    const slots = LIVE_LABELS.map((l) => parseEventLabel(l, 2026));
+    assert.equal(slots.length, 6);
+    for (const s of slots) assert.ok(s, 'jedes Live-Label muss parsen');
+
+    assert.deepEqual(
+      { date: slots[0].date, start: slots[0].start, end: slots[0].end, title: slots[0].title, allDay: slots[0].allDay },
+      { date: '2026-09-28', start: '09:00', end: '12:00', title: 'Stadt Osnabrück I Portalintegration OpenRathaus', allDay: false }
+    );
+    // Titel mit Doppelpunkten bleibt intakt; "By …"-Abschnitt wird abgeschnitten
+    assert.equal(slots[1].title, 'Austausch Mathis:David:Alex');
+    assert.equal(slots[1].start, '14:00');
+    assert.equal(slots[2].title, 'Teammeeting Team 1 - Local Administration');
+    // Titel mit Komma + Doppelpunkt + Klammern bleibt intakt
+    assert.equal(slots[3].title, "Stadt Hörstel: CMIS Übertragungsfehler 'Field repo[355]'");
+    assert.equal(slots[3].date, '2026-09-29');
+    // "Busy, Recurring event" wird als Folge-Attribut abgeschnitten
+    assert.equal(slots[4].title, 'Block');
+    assert.equal(slots[4].end, '18:30');
+    // Ganztag: allDay, start/end null, Titel vor dem Marker
+    assert.equal(slots[5].allDay, true);
+    assert.equal(slots[5].start, null);
+    assert.equal(slots[5].end, null);
+    assert.equal(slots[5].title, 'Urlaub');
+    assert.equal(slots[5].date, '2026-09-30');
+  });
+});
+
+describe('partitionSlotsByRange - Range-Filter [start, end) (Runde-5-Forderung)', () => {
+  const rangeStart = new Date('2026-09-28T00:00:00').getTime();
+  const rangeEnd = new Date('2026-10-02T23:59:59').getTime();
+
+  test('allDay am 30.09. liegt im Range -> behalten', () => {
+    const allDay = { date: '2026-09-30', start: null, end: null, allDay: true, title: 'Urlaub', status: 'busy' };
+    const { kept, rejected } = partitionSlotsByRange([allDay], rangeStart, rangeEnd);
+    assert.equal(kept.length, 1);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('Slot vor dem Range -> date-out-of-range', () => {
+    const before = { date: '2026-09-25', start: '09:00', end: '10:00', allDay: false, title: 'Alt', status: 'busy' };
+    const { kept, rejected } = partitionSlotsByRange([before], rangeStart, rangeEnd);
+    assert.equal(kept.length, 0);
+    assert.equal(rejected[0].reason, 'date-out-of-range');
+  });
+
+  test('freier Slot -> free (keine Belegung)', () => {
+    const free = { date: '2026-09-29', start: '09:00', end: '10:00', allDay: false, title: 'Frei', status: 'free' };
+    const { kept, rejected } = partitionSlotsByRange([free], rangeStart, rangeEnd);
+    assert.equal(kept.length, 0);
+    assert.equal(rejected[0].reason, 'free');
+  });
+
+  test('überlappender Slot am Rand -> behalten', () => {
+    const edge = { date: '2026-10-02', start: '22:00', end: '23:00', allDay: false, title: 'Spät', status: 'busy' };
+    const { kept } = partitionSlotsByRange([edge], rangeStart, rangeEnd);
+    assert.equal(kept.length, 1);
+  });
+});
+
+describe('slotExtractionWarning + Slot-Extraktions-Diagnostik (Runde-5-Kernlücke)', () => {
+  test('0 Slots trotz Event-Elementen -> Widerspruchs-Warnung', () => {
+    const w = slotExtractionWarning(6, 0);
+    assert.ok(w && /Widerspruch/.test(w));
+    assert.ok(/6 Event-Element/.test(w));
+  });
+
+  test('kein Widerspruch bei 0 Events oder >0 Slots', () => {
+    assert.equal(slotExtractionWarning(0, 0), null);
+    assert.equal(slotExtractionWarning(6, 3), null);
+  });
+
+  test('assembleFreeBusyDiagnostics übernimmt die Slot-Extraktions-Felder', () => {
+    const d = assembleFreeBusyDiagnostics({
+      eventElementsFound: 6,
+      selectorUsed: '[role="button"][aria-label]',
+      rawEventLabels: ['Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy'],
+      rejectionReasons: [{ label: 'x', reason: 'date-out-of-range' }]
+    });
+    assert.equal(d.eventElementsFound, 6);
+    assert.equal(d.selectorUsed, '[role="button"][aria-label]');
+    assert.equal(d.rawEventLabels.length, 1);
+    assert.equal(d.rejectionReasons[0].reason, 'date-out-of-range');
+  });
+
+  test('ohne Slot-Felder bleiben sie weg (Rückwärtskompatibilität)', () => {
+    const d = assembleFreeBusyDiagnostics({ abortReason: 'none' });
+    assert.equal('eventElementsFound' in d, false);
+    assert.equal('selectorUsed' in d, false);
+    assert.equal('rejectionReasons' in d, false);
+  });
+});
+
+describe('collectCalendarEventLabels - gemeinsamer Kollektionspfad & Sichtbarkeits-Toleranz (Runde 5)', () => {
+  const fakeEl = (label, { width = 120, height = 24, offsetParent = null } = {}) => ({
+    getAttribute: (n) => (n === 'aria-label' ? label : null),
+    getBoundingClientRect: () => ({ width, height }),
+    offsetParent
+  });
+
+  const withFakeDocument = async (doc, fn) => {
+    const prev = globalThis.document;
+    globalThis.document = doc;
+    try { return await fn(); } finally { globalThis.document = prev; }
+  };
+
+  const fakePage = { evaluate: async (fn) => fn() };
+
+  test('offsetParent-null Event mit rect>0 wird toleriert (kein Hard-K.O.)', async () => {
+    const doc = {
+      querySelectorAll: (sel) => (sel === '[role="button"][aria-label]'
+        ? [fakeEl('Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy', { offsetParent: null, width: 120, height: 24 })]
+        : [])
+    };
+    const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage));
+    assert.equal(res.eventElementsFound, 1);
+    assert.equal(res.hiddenCount, 0); // rect>0 -> sichtbar, obwohl offsetParent null
+    assert.equal(res.selectorUsed, '[role="button"][aria-label]');
+    assert.equal(res.labels.length, 1);
+  });
+
+  test('Fallback auf breiteren aria-label-Scan, wenn der Button-Selektor leer ist', async () => {
+    const doc = {
+      querySelectorAll: (sel) => (sel === '[aria-label]'
+        ? [fakeEl('Urlaub, all day event, Wednesday, September 30, 2026, Busy')]
+        : [])
+    };
+    const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage));
+    assert.equal(res.eventElementsFound, 1);
+    assert.equal(res.selectorUsed, '[aria-label]');
+  });
+
+  test('Header-artiges Label (Datum ohne Zeit) -> headerLikeLabels, kein Event', async () => {
+    const doc = {
+      querySelectorAll: (sel) => (sel === '[role="button"][aria-label]'
+        ? [fakeEl('28 September – 4 October, 2026, Jump to a specific date or date range.')]
+        : [])
+    };
+    const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage));
+    assert.equal(res.eventElementsFound, 0);
+    assert.equal(res.headerLikeLabels.length, 1);
+  });
+
+  test('Arbeitsort-Banner wird als Nicht-Event verworfen', async () => {
+    const doc = {
+      querySelectorAll: (sel) => (sel === '[role="button"][aria-label]'
+        ? [fakeEl('Arbeitsort, 09:00 to 17:00, Monday, September 28, 2026')]
+        : [])
+    };
+    const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage));
+    assert.equal(res.eventElementsFound, 0);
   });
 });
