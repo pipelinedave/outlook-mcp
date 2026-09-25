@@ -915,7 +915,20 @@ export async function collectCalendarCandidates(page) {
       ariaButtonCount: buttons.length,
       ariaLabelSample
     };
-  }).catch(() => ({ headerTexts: [], dayHeaderTexts: [], navTexts: [], ariaButtonCount: 0, ariaLabelSample: [] }));
+  }).catch((e) => ({
+    // BUG 5 (Diagnose, Runde 4): Der frueher nackte `catch` lieferte exakt die
+    // Form "nichts gefunden". Damit waren zwei voellig verschiedene Ursachen NICHT
+    // unterscheidbar:
+    //   H1: der Header-Bereich war noch nicht gerendert,
+    //   H2: dieses evaluate selbst ist fehlgeschlagen (ReferenceError/Timeout) —
+    //       die Kandidatenliste ist dann namlich ebenfalls leer.
+    // Live-Runde 4 zeigte headerCandidates/dayHeaderCandidates/weekNavCandidates
+    // alle LEER bei gleichzeitig vorhandenen Event-Chips (anderer evaluate,
+    // erfolgreich). Der Fehler wird deshalb benannt statt als "nichts gefunden"
+    // maskiert zu werden.
+    headerTexts: [], dayHeaderTexts: [], navTexts: [], ariaButtonCount: 0, ariaLabelSample: [],
+    collectError: String((e && e.message) || e).slice(0, 160)
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,9 +1458,13 @@ export function resolveRenderedWeekFromCandidates({ headerTexts = [], dayHeaderT
 // Liest die gerenderte Kalenderwoche aus der OWA-Wochenansicht aus.
 // Rückgabe: { text, startDate, endDate } — startDate/endDate als ISO-Strings
 // 'YYYY-MM-DD', alles null wenn der Header nicht gefunden oder nicht parsebar war.
+// `readError` ist nur gesetzt, wenn das evaluate selbst fehlschlug: "Header noch
+// nicht gerendert" und "Auswertung fehlgeschlagen" sind sonst nicht unterscheidbar
+// (BUG 5, Live-Runde 4).
 export async function readRenderedCalendarWeek(page) {
   const collected = await collectCalendarCandidates(page);
-  return resolveRenderedWeekFromCandidates(collected);
+  const week = resolveRenderedWeekFromCandidates(collected);
+  return collected && collected.collectError ? { ...week, readError: collected.collectError } : week;
 }
 
 // Sammelt reiche Diagnostik für Fehlerfälle und unverified-Responses (Kernforderung
@@ -1464,7 +1481,11 @@ export async function collectCalendarDiagnostics(page) {
     dayHeaderCandidates: collected.dayHeaderTexts,
     weekNavCandidates: collected.navTexts,
     ariaButtonCount: collected.ariaButtonCount,
-    ariaLabelSample: collected.ariaLabelSample
+    ariaLabelSample: collected.ariaLabelSample,
+    // BUG 5: 'collectError' present -> der Header wurde nicht "nicht gefunden",
+    // sondern die Auswertung selbst ist gescheitert. Ohne dieses Feld sind beide
+    // Faelle in der Diagnostik identisch (alle Kandidatenlisten leer).
+    collectError: collected.collectError || null
   };
 }
 
@@ -1476,6 +1497,10 @@ export function formatCalendarDiagnostics(diag) {
     : '(keine)';
   return [
     `URL: ${diag.url || 'unbekannt'}`,
+    // BUG 5: 'Header-Auswertung FEHLGESCHLAGEN' ist eine andere Ursache als
+    // 'keine Kandidaten' (= Header noch nicht gerendert). Ohne diese Zeile sind
+    // beide in der Diagnostik nicht unterscheidbar.
+    `Header-Auswertung: ${diag.collectError ? `FEHLGESCHLAGEN (${String(diag.collectError).slice(0, 120)})` : 'ok'}`,
     `Header-Kandidaten: ${fmtList(diag.headerCandidates, 8)}`,
     `Tageskopf-Kandidaten: ${fmtList(diag.dayHeaderCandidates, 8)}`,
     `Wochen-Nav-Kandidaten: ${fmtList(diag.weekNavCandidates, 4)}`,
@@ -1530,6 +1555,13 @@ export const FREEBUSY_EVENT_WAIT_POLL_MS = 500;
 // würde der Poll nach ~1 Poll mit "not-found" enden — genau der Defekt, den
 // die stale Vorabmeldung verdeckt hat.
 export const FREEBUSY_EVENT_WAIT_SETTLE_MS = 1000;
+
+// BUG 5 (Live-Befund 26.09.2026, Lauf 4): Budget fuer das WARTEN auf einen
+// datierbaren Wochen-Header (Zustand 1). Live war die Verweigerung des
+// Wochen-Klicks korrekt, kam aber nach 13ms — es wurde auf eine Ansicht
+// verzichtet, deren Header noch gar nicht gerendert war. Der Wert ist eine
+// PHASE des Gesamtbudgets, kein Extra: phase() deckelt ihn gegen die Restzeit.
+export const FREEBUSY_VIEW_WAIT_BUDGET_MS = 8000;
 
 // ---------------------------------------------------------------------------
 // Lade-Indikatoren (Spinner) — EIGENE Kategorie, kein Event-Kandidat
@@ -1648,40 +1680,150 @@ export async function pollUntilEventGrid({ hasEvents, budgetMs, pollMs = FREEBUS
 // einer booleschen Vorabmeldung. Es gibt keine Stale-Boolean-Shortcut-Stelle
 // mehr, die den Poll ueberspringen koennte.
 //
-// Beobachtungsprotokoll je Poll: { eventElementsFound, loading }
-//   eventElementsFound > 0        -> 'found', sofort belegt fertig
-//   loading === true               -> Spinner: NOCH NICHT FERTIG, weiter pollen
-//   0 Events, kein Spinner         -> Ruhe-Fenster sammeln; erst nach
-//                                     settleMs ununterbrochen ruhig ->
-//                                     'not-found' mit abortReason
-//                                     'rendered-empty-proven' (BELEGT leer)
-//   Budget erschoepft               -> 'budget-exhausted' mit abortReason
+// Beobachtungsprotokoll je Poll (Bug 3; in Bug 4 auf datumsqualifiziert umgestellt):
+//   datumsqualifizierter Beleg  -> 'found' (Header der Zielwoche ODER ein Label
+//                                            aus dem angefragten Zeitraum)
+//   loading === true            -> Spinner: NOCH NICHT FERTIG, weiter pollen
+//   Events, alle ausserhalb des angefragten Zeitraums
+//                               -> weder Treffer noch Leer-Beweis: weiter pollen
+//                                  bis zum Budget, Abbruchgrund
+//                                  'events-outside-requested-range'
+//   0 Events, kein Spinner      -> Ruhe-Fenster sammeln; erst nach settleMs
+//                                  ununterbrochen ruhig -> 'not-found' mit
+//                                  abortReason 'rendered-empty-proven'
+//   Budget erschoepft            -> 'budget-exhausted' mit abortReason
 //                                     'wait-budget-exhausted' (Budget
 //                                     tatsaechlich ausge schoepft)
+// ---------------------------------------------------------------------------
+// Bug 4 — der Warte-Loop ist WOCHENBLIND (Live-Befund 26.09.2026, Lauf 4)
+// ---------------------------------------------------------------------------
+// Live-Kennzahlen des Kontrolllaufs (Angefragt: KW 40 ab 2026-09-28):
+//     eventWaitPolls: 1   waitedForEventsMs: 13   eventWaitBudgetMs: 20000
+//     eventWaitOutcome: 'found'   abortReason: null
+// 13 von 20000ms = 0,07 % des Budgets. Grund: `eventElementsFound > 0` war mit
+// 18 Event-Knoten der FALSCHEN Woche (KW 39, 21.–26.09.) erfuellt. Die
+// Abbruchbedingung der Wartephase war reine Knotenzahl — sie kann das Datum
+// nicht unterscheiden. `eventElementsFound` ist die Laenge von `labels`
+// (Kollektor), und der Range-Filter (`date-out-of-range') laeuft ERST danach in
+// der Abschluss-Sammlung. Die Wartephase erfuhr die falsche Woche also nie.
+//
+// DIE REGEL: `found` ist erst belegt, wenn DATUMSQUALIFIZIERTER Beleg vorliegt:
+//   (1) ein datierbarer Wochen-Header (startDate+endDate) der Zielwoche, ODER
+//   (2) mindestens ein Label aus dem angefragten Zeitraum.
+// Beide Belege werden WAEHREND des Wartens bei jedem Poll neu erhoben — der
+// Kalender darf zwischen den Polls umschalten, ein einmaliger Vorab-Blick am
+// Anfang waere genau der Fehler, den diese Regel abstellt.
+// Ohne Zielwoche konfiguriert ist KEIN Beleg moeglich; dann wird 'found'
+// ausdruecklich NICHT gemeldet ('wait-target-unknown'), damit ein
+// weekenblind konfigurierter Aufruf nicht still Erfolg meldet.
 export const EVENT_WAIT_ABORT_REASONS = {
   renderedEmpty: 'rendered-empty-proven',
   budgetExhausted: 'wait-budget-exhausted',
   notPolled: 'wait-not-polled',
-  budgetUnavailable: 'wait-budget-unavailable'
+  budgetUnavailable: 'wait-budget-unavailable',
+  // BUG 4: Events sichtbar, aber keins aus dem angefragten Zeitraum. Das ist
+  // KEIN Leer-Beweis (der Leer-Beweis bleibt 'rendered-empty-proven') und auch
+  // kein Treffer — die Ansicht zeigt dann etwas anderes als die Zielwoche.
+  eventsOutsideRange: 'events-outside-requested-range',
+  // BUG 4: Die Zielwoche wurde datumsqualifiziert belegt (Header gerendert),
+  // aber es wurde kein einziger Event-Knoten gelesen. Das ist eine fehlende
+  // Lesbarkeit des Grids, KEIN freier Kalender.
+  noNodesInTargetWeek: 'no-event-nodes-in-target-week',
+  // BUG 4: Ohne konfigurierten Zielzeitraum ist keine Qualifikation moeglich.
+  targetUnknown: 'wait-target-unknown'
 };
+
+// Die fuenf Beobachtungs-Kategorien der Wartephase. Genau EINE Klassifikation,
+// damit "noch nicht fertig", "nachweislich leer", "falsche Woche" und
+// "datumsqualifiziert fertig" nicht wieder an mehreren Stellen auseinanderlaufen
+// (das war der Live-Befund: 'found' nach einem Poll, weil NUR die Zahl zaehlte).
+export const EVENT_WAIT_STATES = {
+  targetWeek: 'target-week-rendered',
+  inRange: 'in-range-labels',
+  stillLoading: 'still-loading',
+  outsideRange: 'events-outside-requested-range',
+  emptyCandidate: 'empty-candidate',
+  targetUnknown: 'target-unknown'
+};
+
+// Zaehlt Labels, die den angefragten Zeitraum treffen. Bewusst ueber DIESELBE
+// Prueflogik wie die Abschluss-Extraktion (parseEventLabel + partitionSlotsByRange):
+// wenn die Wartephase eine andere Definition benutzt als die Extraktion, kann
+// sie "fertig" melden, fuer die es am Ende keine Slots gibt.
+export function countLabelsInRange(labels = [], { rangeStartMs = null, rangeEndMs = null, defaultYear = null } = {}) {
+  const parsed = [];
+  let undated = 0;
+  for (const label of labels || []) {
+    const slot = parseEventLabel(label, defaultYear);
+    if (!slot) { undated++; continue; }
+    parsed.push(slot);
+  }
+  const measurable = Number.isFinite(rangeStartMs) && Number.isFinite(rangeEndMs);
+  if (!measurable) return { inRange: 0, outOfRange: 0, undated, unmeasured: true };
+  const { kept, rejected } = partitionSlotsByRange(parsed, rangeStartMs, rangeEndMs);
+  let outOfRange = 0;
+  for (const r of rejected) if (r.reason === 'date-out-of-range') outOfRange++;
+  return { inRange: kept.length, outOfRange, undated: parsed.length - kept.length - outOfRange, unmeasured: false };
+}
+
+// Klassifiziert EINE Beobachtung der Wartephase. Reine Funktion, EIN Aufrufort.
+// `weekHeader` ist das Ergebnis des Wochen-Reads, `inRangeLabels` die Zahl der
+// Labels aus dem angefragten Zeitraum.
+export function eventWaitObservationState({
+  eventElementsFound = 0,
+  loading = false,
+  weekHeader = null,
+  inRangeLabels = 0,
+  targetStart = null,
+  targetConfigured = false
+} = {}) {
+  const n = Number(eventElementsFound) || 0;
+  const inRange = Number(inRangeLabels) || 0;
+  // Ohne Zielzeitraum ist KEIN datumsqualifizierter Beleg moeglich — auch dann
+  // nicht, wenn Labels vorhanden sind: "im angefragten Zeitraum" ist ohne
+  // Zielzeitraum nicht definierbar. Diese Pruefung steht VOR den Beleg-
+  // Kriterien, sonst wuerde ein weekenblind konfigurierter Aufruf doch noch
+  // 'found' melden.
+  if (!targetConfigured) {
+    return { category: EVENT_WAIT_STATES.targetUnknown, dateQualified: false, evidence: null, eventElementsFound: n, inRangeLabels: inRange, loading: Boolean(loading) };
+  }
+  if (renderedWeekContains(weekHeader, targetStart)) {
+    return { category: EVENT_WAIT_STATES.targetWeek, dateQualified: true, evidence: 'week-header', eventElementsFound: n, inRangeLabels: inRange, loading: Boolean(loading) };
+  }
+  if (inRange > 0) {
+    return { category: EVENT_WAIT_STATES.inRange, dateQualified: true, evidence: 'in-range-label', eventElementsFound: n, inRangeLabels: inRange, loading: Boolean(loading) };
+  }
+  if (loading) {
+    return { category: EVENT_WAIT_STATES.stillLoading, dateQualified: false, evidence: null, eventElementsFound: n, inRangeLabels: inRange, loading: true };
+  }
+  if (n > 0) {
+    // Live-Fall Runde 4: 18 Knoten, alle ausserhalb des angefragten Zeitraums.
+    return { category: EVENT_WAIT_STATES.outsideRange, dateQualified: false, evidence: null, eventElementsFound: n, inRangeLabels: inRange, loading: false };
+  }
+  return { category: EVENT_WAIT_STATES.emptyCandidate, dateQualified: false, evidence: null, eventElementsFound: n, inRangeLabels: inRange, loading: false };
+}
 
 export async function waitForCalendarEvents({
   observe,
   budgetMs,
   pollMs = FREEBUSY_EVENT_WAIT_POLL_MS,
   settleMs = FREEBUSY_EVENT_WAIT_SETTLE_MS,
+  targetStart = null,
   now = () => Date.now(),
   sleep
 } = {}) {
   const startedAt = now();
   const waited = () => now() - startedAt;
+  const targetConfigured = Boolean(targetStart);
   const result = (extra) => ({
     found: false,
     outcome: 'not-found',
     waitedMs: waited(),
     polls: 0,
     loadingPolls: 0,
+    outsideRangePolls: 0,
     loading: false,
+    dateQualified: false,
     abortReason: null,
     ...extra
   });
@@ -1689,41 +1831,69 @@ export async function waitForCalendarEvents({
     // Kein Budget -> ehrlich benennen statt "0 Polls bei 20s Budget" zu melden.
     return result({ outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.budgetUnavailable });
   }
+  if (!targetConfigured) {
+    // BUG 4: Ohne Zielwoche kann diese Phase nichts datumsqualifizieren. Sie
+    // pollt deshalb nicht 20s auf eine Beleglosigkeit, sondern benennt es.
+    return result({ outcome: 'not-found', abortReason: EVENT_WAIT_ABORT_REASONS.targetUnknown });
+  }
   const doSleep = typeof sleep === 'function' ? sleep : (ms) => new Promise((r) => setTimeout(r, ms));
   let polls = 0;
   let loadingPolls = 0;
+  let outsideRangePolls = 0;
   let quietSince = null;   // Beginn des ununterbrochenen Ruhe-Fensters
   let lastLoading = false;
+  let lastState = EVENT_WAIT_STATES.emptyCandidate;
   while (waited() < budgetMs) {
     polls++;
     // eslint-disable-next-line no-await-in-loop
     const o = (await observe()) || {};
-    const found = Number(o.eventElementsFound) > 0;
-    lastLoading = o.loading === true;
-    if (found) {
-      return { found: true, outcome: 'found', waitedMs: waited(), polls, loadingPolls, loading: lastLoading, abortReason: null };
+    const st = eventWaitObservationState({ ...o, targetStart, targetConfigured });
+    lastState = st.category;
+    lastLoading = st.loading === true;
+    if (st.dateQualified) {
+      return {
+        found: true, outcome: 'found', waitedMs: waited(), polls, loadingPolls, outsideRangePolls,
+        loading: lastLoading, dateQualified: true, evidence: st.evidence,
+        weekHeader: o.weekHeader || null, inRangeLabels: st.inRangeLabels, abortReason: null
+      };
     }
     if (lastLoading) {
       // BEWEIS FUER "NOCH NICHT FERTIG": der Spinner haelt den Poll am Leben.
       loadingPolls++;
       quietSince = null;
-    } else {
+    } else if (st.category === EVENT_WAIT_STATES.outsideRange) {
+      // BUG 4: Events sind da, aber keine aus dem angefragten Zeitraum. Das
+      // startet KEIN Ruhe-Fenster — ein Leer-Beweis waere hier eine Falschaussage.
+      // Genauso wird ein bestehendes Ruhe-Fenster invalidiert, weil sich das DOM
+      // nachweislich geaendert hat. Es wird bis zum Budget weiter gepollt.
+      outsideRangePolls++;
+      quietSince = null;
+    } else if (st.category === EVENT_WAIT_STATES.emptyCandidate) {
       if (quietSince === null) quietSince = now();
       const quietMs = waited() - (quietSince - startedAt);
       if (quietMs >= (settleMs || 0)) {
         return {
-          found: false, outcome: 'not-found', waitedMs: waited(), polls, loadingPolls,
-          loading: false, abortReason: EVENT_WAIT_ABORT_REASONS.renderedEmpty
+          found: false, outcome: 'not-found', waitedMs: waited(), polls, loadingPolls, outsideRangePolls,
+          loading: false, dateQualified: false, weekHeader: o.weekHeader || null,
+          abortReason: EVENT_WAIT_ABORT_REASONS.renderedEmpty
         };
       }
+    } else {
+      quietSince = null;
     }
     if (waited() + pollMs >= budgetMs) break;
     // eslint-disable-next-line no-await-in-loop
     await doSleep(pollMs);
   }
   return {
-    found: false, outcome: 'budget-exhausted', waitedMs: waited(), polls, loadingPolls,
-    loading: lastLoading, abortReason: EVENT_WAIT_ABORT_REASONS.budgetExhausted
+    found: false, outcome: 'budget-exhausted', waitedMs: waited(), polls, loadingPolls, outsideRangePolls,
+    loading: lastLoading, dateQualified: false, lastState,
+    // BUG 4: Der Abbruchgrund nennt den zuletzt beobachteten Zustand, damit
+    // "Budget erschoepft, weil die falsche Woche stand" von "Budget erschoepft,
+    // weil gar nichts kam" unterscheidbar bleibt.
+    abortReason: lastState === EVENT_WAIT_STATES.outsideRange
+      ? EVENT_WAIT_ABORT_REASONS.eventsOutsideRange
+      : EVENT_WAIT_ABORT_REASONS.budgetExhausted
   };
 }
 
@@ -1748,15 +1918,59 @@ export function loadIndicatorReason({ eventElementsFound = 0, loading = false } 
 // `collect(preferSelector)` liefert das Ergebnis von collectCalendarEventLabels
 // im 'fast'-Modus. Die zuletzt erfolgreiche Quelle wird als preferSelector
 // weitergereicht (dieselbe Leiter, dieselbe Reihenfolge).
-export function makeEventObserver(collect) {
+//
+// BUG 4: Die Beobachtung ist nicht mehr "wie viele Knoten", sondern
+//   { eventElementsFound, loading, weekHeader, inRangeLabels }.
+// `readWeek()` liest den gerenderten Wochen-Header; `range` definiert den
+// angefragten Zeitraum (in ms, wie in getFreeBusy). OHNE `range` bleibt
+// `inRangeLabels` null (unmeasured) — die Wartephase meldet dann bewusst
+// 'wait-target-unknown' und NIEMALS 'found'. Ein weekenblind gebauter Beobachter
+// ist damit nicht mehr moeglich, ohne dass es benannt wird.
+//
+// Der Header-Read ist zeitlich gedrosselt (headerReadIntervalMs): readWeek geht
+// ueber collectCalendarCandidates und liest document.body.innerText. Bei 500ms
+// Pollintervall und 20s Budget waeren das 40 teure Reads; gedrosselt wird der
+// Wochenzustand trotzdem bei JEDEM Poll geprueft, an dem er die Entscheidung
+// ueberhaupt aendern kann (wenn inRangeLabels > 0, ist ohnehin entschieden).
+export function makeEventObserver(collect, {
+  readWeek = null,
+  range = null,
+  defaultYear = null,
+  headerReadIntervalMs = FREEBUSY_EVENT_WAIT_POLL_MS * 2,
+  now = () => Date.now()
+} = {}) {
   if (typeof collect !== 'function') throw new TypeError('makeEventObserver: collect muss eine Funktion sein');
   let lastSelector = null;
+  let lastHeaderReadAt = -Infinity;
+  let lastHeader = null;
+  const rangeStartMs = range && Number.isFinite(range.rangeStartMs) ? range.rangeStartMs : null;
+  const rangeEndMs = range && Number.isFinite(range.rangeEndMs) ? range.rangeEndMs : null;
+  const readWeekThrottled = async () => {
+    if (typeof readWeek !== 'function') return null;
+    const t = now();
+    if (t - lastHeaderReadAt < (headerReadIntervalMs || 0)) return lastHeader;
+    lastHeaderReadAt = t;
+    try { lastHeader = await readWeek(); } catch (e) { lastHeader = null; }
+    return lastHeader;
+  };
   const observeCalendarEvents = async () => {
     // eslint-disable-next-line no-await-in-loop
     const r = await collect(lastSelector) || {};
     const n = Number(r.eventElementsFound) || 0;
     if (n > 0 && r.selectorUsed) lastSelector = r.selectorUsed;
-    return { eventElementsFound: n, loading: r.loading === true };
+    // In-Range-Zaehlung mit DERSELBEN Prueflogik wie die Abschluss-Extraktion.
+    const counts = countLabelsInRange(r.labels || [], { rangeStartMs, rangeEndMs, defaultYear });
+    // Der Wochen-Read wird nur gebraucht, wenn die Labels allein nicht
+    // qualifizieren koennen — und dann gedrosselt.
+    const weekHeader = counts.inRange > 0 ? null : await readWeekThrottled();
+    return {
+      eventElementsFound: n,
+      loading: r.loading === true,
+      weekHeader,
+      inRangeLabels: counts.unmeasured ? null : counts.inRange,
+      labelsOutOfRange: counts.unmeasured ? null : counts.outOfRange,
+      labelsUndated: counts.undated
+    };
   };
   // Der zuletzt erfolgreiche Selektor wird auch fuer die abschliessende
   // vollstaendige Sammlung gebraucht (dieselbe Leiter, erstes probieren).
@@ -1776,14 +1990,35 @@ export function reconcileEventWait({ wait = null, eventElementsFound = 0, waitBu
   if (Number(waitBudgetMs) > 0 && (!Number.isFinite(polls) || polls === 0)) {
     // Budget war da, aber es wurde nicht gepollt -> das ist ein Defekt, kein
     // DOM-Zustand. Muss benannt werden, statt als 'not-found' durchzurutschen.
+    // ABER: BUG 4 — wenn die Wartephase gar nicht starten durfte, weil kein
+    // Zielzeitraum konfiguriert war, ist 'not-polled' eine Falschaussage (es
+    // wurde nicht "nicht gepollt", es war nicht pollbar). Der echte Grund der
+    // Wartephase steht dann in w.abortReason und wird zuerst genannt.
+    if (wait && wait.abortReason === EVENT_WAIT_ABORT_REASONS.targetUnknown) {
+      return { outcome: 'not-found', abortReason: EVENT_WAIT_ABORT_REASONS.targetUnknown };
+    }
     return { outcome: 'not-polled', abortReason: EVENT_WAIT_ABORT_REASONS.notPolled };
   }
   const w = wait || {};
+  // BUG 4: Die Wartephase endet datumsqualifiziert (z.B. der Wochen-Header der
+  // Zielwoche war gerendert), die Abschluss-Sammlung las aber 0 Knoten. Das ist
+  // ein GEMESSENER Zustand, kein Logikfehler und kein Leer-Beweis: der Header
+  // war da, das Grid war nicht lesbar. 'budget-exhausted' waere hier eine
+  // Falschaussage (das Budget wurde gar nicht ausgeschoepft).
+  if (w.dateQualified === true) {
+    return { outcome: 'found', abortReason: EVENT_WAIT_ABORT_REASONS.noNodesInTargetWeek };
+  }
   if (w.abortReason === EVENT_WAIT_ABORT_REASONS.renderedEmpty) {
     return { outcome: 'not-found', abortReason: EVENT_WAIT_ABORT_REASONS.renderedEmpty };
   }
   if (w.abortReason === EVENT_WAIT_ABORT_REASONS.budgetUnavailable) {
     return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.budgetUnavailable };
+  }
+  if (w.abortReason === EVENT_WAIT_ABORT_REASONS.targetUnknown) {
+    return { outcome: 'not-found', abortReason: EVENT_WAIT_ABORT_REASONS.targetUnknown };
+  }
+  if (w.abortReason === EVENT_WAIT_ABORT_REASONS.eventsOutsideRange) {
+    return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.eventsOutsideRange };
   }
   return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.budgetExhausted };
 }
@@ -1866,19 +2101,80 @@ export const WEEK_CLICK_GUARD_REASONS = {
   click: 'click'
 };
 
+// ---------------------------------------------------------------------------
+// BUG 5 — die drei Zustaende der Wochenansicht (Live-Befund 26.09.2026, Lauf 4)
+// ---------------------------------------------------------------------------
+// Live-Befund Runde 4 (belegt, nicht vermutet):
+//   urlAfterNavigation: .../calendar/view/week?...&startdate=2026-09-28
+//   renderedWeek: { text: null, startDate: null, endDate: null }
+//   headerCandidates: []  dayHeaderCandidates: []  weekNavCandidates: []
+//   census.dayColumns: []   weekVerified: false
+//   weekButtonProbe: { skipped: 'view-not-ready', clicked: false,
+//                       note: 'guard-vor-klick' }   abortReason: 'view-not-ready'
+//   -> 0,07 % des Event-Wartebudgets verbraucht, 1 Poll.
+// Der Inhalt war KW 39, also die Woche VOR der Zielwoche. Der Guard hat den
+// Klick korrekt verweigert — und genau damit die einzige Navigation verhindert,
+// die zur Zielwoche gefuehrt haette. Das Werkzeug verweigerte, wo es handeln
+// musste.
+//
+// URSACHE, an der Quelle belegt (nicht geraten):
+//   1) waitForCalendarRendered() hatte im Zweig `else if (events) break;`:
+//      "kein Header, aber Body-Events" galt als FERTIG. Genau das ist der
+//      Live-Zustand (18 Event-Knoten, 0 Header) — die Ansicht wurde also nach
+//      dem ersten Poll (~500ms) verlassen, long bevor der Header gerendert
+//      sein konnte. Beleg: waitedForEventsMs 13 / polls 1 bei Budget 20000.
+//   2) Der Guard selbst war richtig: ohne Header ist die Wochenlage UNBEKANNT.
+//      Er wurde nur viel zu frue gefragt.
+// Also: die Wochen-Navigation ist nicht als Defekt belegt (Runde 3 hat per
+// Klick auf "Next week" eine datierbare Zielwoche erreicht, und in Runde 3
+// existierten die Nav-Indikatoren "… (Week 39)"/"… (Week 41)" — in Runde 4
+// waren sie nicht da, passend zu "Header-Bereich noch nicht gerendert").
+// Der Fix ist deshalb eine ZUSTANDSKORREKTUR, kein Reparaturversuch an der
+// Navigation: Zustand 1 wird abgeWARTET (mit Budget und Spinner-Respekt),
+// Zustand 3 darf klicken — mit anschliessender Verifikation des Headers.
+export const WEEK_VIEW_STATES = {
+  // Ansicht bereit, Zielwoche gerendert -> fertig, KEIN Klick.
+  targetWeek: 'target-week-reached',
+  // Ansicht bereit, aber falsche Woche -> Wochen-Navigation Klick ist erlaubt.
+  wrongWeek: 'wrong-week',
+  // Ansicht nicht bereit (kein datierbarer Header) -> WARTEN, nicht klicken.
+  notReady: 'view-not-ready'
+};
+
+// DIE Zustandsklassifikation. Einzige Quelle fuer "welcher Zustand gilt" —
+// benutzt von der aeusseren Schritt-Schleife UND vom Klickpfad (ueber
+// weekClickDecision). Bewusst OHNE die alte hasEvents-Ausnahme: die Annahme
+// "sichtbare Events belegen eine gerenderte Ansicht" hat den Live-Befund
+// ueberlebt, obwohl sie im Klickpfad nie wirksam war (dort wurde hasEvents gar
+// nicht durchgereicht) — sie steht damit fuer einen Zustand, den es nicht gibt.
+// Ohne datierbaren Header ist die Wochen- und damit die BUTTON-Position
+// unbekannt: die Wochen-Buttons liegen im Header-Bereich, der genau dann noch
+// nicht da ist. Klicken kann dort nichts treffen und im schlechtesten Fall die
+// Zielwoche ueberspringen.
+export function weekViewState({ rendered = null, targetStart = null } = {}) {
+  const headerRendered = Boolean(rendered && rendered.startDate && rendered.endDate);
+  if (!headerRendered) {
+    return { state: WEEK_VIEW_STATES.notReady, ready: false, week: rendered || null, clickable: false };
+  }
+  if (renderedWeekContains(rendered, targetStart)) {
+    return { state: WEEK_VIEW_STATES.targetWeek, ready: true, week: rendered || null, clickable: false };
+  }
+  return { state: WEEK_VIEW_STATES.wrongWeek, ready: true, week: rendered || null, clickable: true };
+}
+
 // EIN Entscheidungs-Funktion, benutzt von der aeusseren Schritt-Schleife UND
 // vom Klickpfad. Beide Stellen konnten vorher auseinanderlaufen — genau das war
-// der Live-Befund. Reine Funktion, damit der Draht testbar ist.
-export function weekClickDecision({ rendered, targetStart, hasEvents = false } = {}) {
-  if (renderedWeekContains(rendered, targetStart)) {
-    return { skip: true, reason: WEEK_CLICK_GUARD_REASONS.targetReached, rendered: rendered || null, clickable: false };
+// der Live-Befund. Reine Funktion, damit der Draht testbar ist. Sie ist eine
+// Abbildung von weekViewState: EIN Zustand, EIN Mapping, keine zweite Wahrheit.
+export function weekClickDecision({ rendered, targetStart } = {}) {
+  const view = weekViewState({ rendered, targetStart });
+  if (view.state === WEEK_VIEW_STATES.targetWeek) {
+    return { skip: true, reason: WEEK_CLICK_GUARD_REASONS.targetReached, state: view.state, rendered: view.week, clickable: false };
   }
-  // Ansicht nicht gerendert? Dann ist die Wochen-/Button-Position unbekannt.
-  const headerRendered = Boolean(rendered && rendered.startDate && rendered.endDate);
-  if (!headerRendered && !hasEvents) {
-    return { skip: true, reason: WEEK_CLICK_GUARD_REASONS.viewNotReady, rendered: rendered || null, clickable: false };
+  if (view.state === WEEK_VIEW_STATES.notReady) {
+    return { skip: true, reason: WEEK_CLICK_GUARD_REASONS.viewNotReady, state: view.state, rendered: view.week, clickable: false };
   }
-  return { skip: false, reason: WEEK_CLICK_GUARD_REASONS.click, rendered: rendered || null, clickable: true };
+  return { skip: false, reason: WEEK_CLICK_GUARD_REASONS.click, state: view.state, rendered: view.week, clickable: true };
 }
 
 // Protokolleintrag fuer eine Guard-Entscheidung. BEIDE Ausgaenge werden
@@ -1886,7 +2182,7 @@ export function weekClickDecision({ rendered, targetStart, hasEvents = false } =
 // Guard, der nicht existiert, unterscheidbar. Genau daran ist der Live-Befund
 // gescheitert: `note:'guard-vor-klick'` hätte sofort verraten, dass der Guard
 // nicht griff.
-export function weekProbeGuardEntry(decision, note = 'guard-vor-klick') {
+export function weekProbeGuardEntry(decision, note = 'guard-vor-klick', waitedMs = null) {
   const renderedStart = decision && decision.rendered ? decision.rendered.startDate : null;
   if (decision && decision.reason === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
     return {
@@ -1894,7 +2190,11 @@ export function weekProbeGuardEntry(decision, note = 'guard-vor-klick') {
       renderedWeek: renderedStart || null,
       clicked: false,
       guard: WEEK_CLICK_GUARD_REASONS.viewNotReady,
-      note
+      note,
+      // BUG 5: unterscheidet "sofort verweigert" von "erst nach dem
+      // Wartebudget verweigert". Im Live-Fall war die Verweigerung korrekt,
+      // sie kam aber nach 13ms — also viel zu frue.
+      ...(Number.isFinite(waitedMs) ? { waitedMs: Math.round(waitedMs) } : {})
     };
   }
   return { ...weekProbeSkipEntry(renderedStart, note), guard: WEEK_CLICK_GUARD_REASONS.targetReached };
@@ -1903,6 +2203,67 @@ export function weekProbeGuardEntry(decision, note = 'guard-vor-klick') {
 // ---------------------------------------------------------------------------
 // Der ECHTE Klickpfad — exportiert und per Dependency-Injection testbar
 // ---------------------------------------------------------------------------
+// Zustand 1: WARTEN statt klicken — die Wartefunktion fuer den fehlenden
+// Wochen-Header. Exportiert und per Dependency-Injection testbar, weil sie der
+// Pfad ist, der in Runde 4 viel zu frue verlassen wurde.
+// ---------------------------------------------------------------------------
+// Kernpunkt: der Wochenzustand wird bei JEDEM Poll neu gelesen. Der Kalender
+// darf zwischen den Polls umschalten — "warte bis der Header da ist" heisst
+// "pruefe waehrend des Wartens", nicht "einmal am Anfang schauen". Ein Spinner
+// (loading) verhindert das Ruhe-Fenster genauso wie in der Event-Wartephase:
+// "noch nicht fertig" ist ein eigener Zustand, kein Leer-Beweis.
+//
+// Rueckgabe: { state, rendered, polls, waitedMs, exhausted }
+//   state === 'view-not-ready' && exhausted === true -> ehrlicher Abbruch
+export async function waitForWeekViewReady({
+  readWeek = null,
+  sleep = null,
+  budgetMs = 0,
+  pollMs = FREEBUSY_EVENT_WAIT_POLL_MS,
+  settleMs = FREEBUSY_EVENT_WAIT_SETTLE_MS,
+  readEvents = null,
+  targetStart = null,
+  now = () => Date.now()
+} = {}) {
+  const startedAt = now();
+  const waited = () => now() - startedAt;
+  const doSleep = typeof sleep === 'function' ? sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  let polls = 0;
+  let loadingPolls = 0;
+  let quietSince = null;
+  let last = { text: null, startDate: null, endDate: null };
+  if (typeof readWeek !== 'function' || !(budgetMs > 0)) {
+    return { state: WEEK_VIEW_STATES.notReady, rendered: last, polls: 0, loadingPolls: 0, waitedMs: waited(), exhausted: true };
+  }
+  while (waited() < budgetMs) {
+    polls++;
+    // eslint-disable-next-line no-await-in-loop
+    last = (await readWeek()) || last;
+    const state = weekViewState({ rendered: last, targetStart });
+    if (state.state !== WEEK_VIEW_STATES.notReady) {
+      return { state: state.state, rendered: last, polls, loadingPolls, waitedMs: waited(), exhausted: false };
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const stillLoading = typeof readEvents === 'function' ? ((await readEvents()) || {}).loading === true : false;
+    if (stillLoading) {
+      // BEWEIS FUER "NOCH NICHT FERTIG" — der Spinner haelt den Poll am Leben
+      // und macht ein bestehendes Ruhe-Fenster ungueltig.
+      loadingPolls++;
+      quietSince = null;
+    } else {
+      if (quietSince === null) quietSince = now();
+      const quietMs = waited() - (quietSince - startedAt);
+      if (quietMs >= (settleMs || 0)) {
+        return { state: WEEK_VIEW_STATES.notReady, rendered: last, polls, loadingPolls, waitedMs: waited(), exhausted: true, settled: true };
+      }
+    }
+    if (waited() + pollMs >= budgetMs) break;
+    // eslint-disable-next-line no-await-in-loop
+    await doSleep(pollMs);
+  }
+  return { state: WEEK_VIEW_STATES.notReady, rendered: last, polls, loadingPolls, waitedMs: waited(), exhausted: true };
+}
+
 // Bis 0d47105 lag dieser Code als Closure in getFreeBusy. Der Test
 // (tests/week-probe-guard.test.mjs) baute die Schleife NACH — er rief nie
 // diesen Code. Genau darum war der Guard "durch Code-Review belegt, nicht
@@ -1919,11 +2280,12 @@ export async function runWeekButtonClick({
   probe = [],
   candidates = null,
   readWeek = null,
-  hasEvents = false,
   afterClick = null,
   clickWaitMs = FREEBUSY_CLICK_RENDER_WAIT_MS,
   clickCostMs = FREEBUSY_CLICK_RENDER_WAIT_MS,
-  remainingMs = () => Infinity
+  remainingMs = () => Infinity,
+  waitForReady = null,
+  onGuardBlocked = null
 } = {}) {
   const list = Array.isArray(candidates) && candidates.length ? candidates : weekButtonCandidates(direction);
   const notReached = (reason, rendered) => ({
@@ -1936,23 +2298,51 @@ export async function runWeekButtonClick({
   // Nach jedem Klick wird er verworfen, weil erst der Klick die Woche aendern kann.
   let targetWeekChecked = false;
   let targetWeekNow = null;
+  let waitedMs = 0;
   const guardNow = async () => {
     if (!targetWeekChecked) {
       targetWeekChecked = true;
       let wk = null;
       try { wk = await readWeek(); } catch (e) { wk = null; }
-      targetWeekNow = weekClickDecision({ rendered: wk, targetStart, hasEvents });
+      targetWeekNow = weekClickDecision({ rendered: wk, targetStart });
     }
     return targetWeekNow;
   };
+
+  // BUG 5, Zustand 1: WARTEN statt klicken. Wird nur gebraucht, wenn der Guard
+  // "Ansicht nicht bereit" sagt; ein Guard, der die Zielwoche bestaetigt, wartet
+  // nie. Die gelieferte Wartephase wird in waitedMs summiert und im
+  // Probe-Eintrag ausgewiesen — damit ist im Live-Fall sichtbar, ob der Klick
+  // nach 13ms oder nach dem Wartebudget verweigert wurde.
+  const waitOnce = async () => {
+    if (typeof waitForReady !== 'function') return null;
+    const w = await waitForReady();
+    if (w && Number.isFinite(Number(w.waitedMs))) waitedMs += Number(w.waitedMs);
+    // Der memoisierte Guard-Zustand ist nach dem Warten veraltet: der Header
+    // kann jetzt datierbar sein.
+    targetWeekChecked = false;
+    targetWeekNow = null;
+    return w || null;
+  };
+
   let foundAny = false;
   let clickedAny = false;
 
   for (const cand of list) {
     // GUARD VOR DER PROBE — fuer JEDE Entscheidung wird protokolliert.
-    const decision = await guardNow();
+    let decision = await guardNow();
+    if (decision.reason === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
+      // Zustand 1: erst warten, dann neu entscheiden. Der Kalender kann
+      // waehrend des Wartens umschalten — deshalb wird der Wochenzustand nach
+      // dem Warten frisch gelesen, nicht aus dem alten Urteil uebernommen.
+      await waitOnce();
+      decision = await guardNow();
+    }
     if (decision.skip) {
-      probe.push(weekProbeGuardEntry(decision));
+      probe.push(weekProbeGuardEntry(decision, 'guard-vor-klick', waitedMs));
+      if (typeof onGuardBlocked === 'function') {
+        onGuardBlocked({ reason: decision.reason, waitedMs: Math.round(waitedMs), polls: probe.length });
+      }
       return notReached(decision.reason, decision.rendered);
     }
     if (remainingMs() < clickCostMs) {
@@ -2004,7 +2394,27 @@ export function canClickSameDirection({ lastClickDirection = null, direction = 0
 }
 
 // Hinweis, wenn die Event-Wartephase ohne echte Events endete. Reine Funktion.
-export function eventWaitWarning({ outcome, waitedMs = 0, budgetMs = null } = {}) {
+// BUG 4: `abortReason` ist das fuehrende Unterscheidungsmerkmal — die
+// Abbruchgruende sind seit dem datumsqualifizierten Umbau praeziser als die
+// Ausgaenge, und zwei davon (falsche Woche sichtbar / Zielwoche ohne Knoten)
+// fallen sonst in die generischen Texte fuer "nichts gefunden".
+export function eventWaitWarning({ outcome, waitedMs = 0, budgetMs = null, abortReason = null } = {}) {
+  if (abortReason === EVENT_WAIT_ABORT_REASONS.eventsOutsideRange) {
+    return `Nach ${Math.round(waitedMs)}ms Wartephase (Budget ${budgetMs === null ? 'n/a' : budgetMs}ms) waren ` +
+      `Event-Knoten im DOM sichtbar, aber KEINER aus dem angefragten Zeitraum. ` +
+      `Die Ansicht zeigt damit etwas anderes als die angefragte Woche — das ist weder ein Treffer ` +
+      `noch ein Leer-Beweis. Siehe diagnostics.renderedWeek/weekNavCandidates.`;
+  }
+  if (abortReason === EVENT_WAIT_ABORT_REASONS.noNodesInTargetWeek) {
+    return `Der Wochen-Header der angefragten Woche war datumsqualifiziert belegt, aber im DOM wurde ` +
+      `KEIN einziger Event-Knoten gelesen. 0 Busy-Slots bedeuten damit KEINEN leeren Kalender, ` +
+      `sondern ein nicht auslesbares Grid der richtigen Woche (siehe diagnostics.census/sourceTried).`;
+  }
+  if (abortReason === EVENT_WAIT_ABORT_REASONS.targetUnknown) {
+    return `Die Event-Wartephase lief ohne konfigurierten Zielzeitraum und konnte deshalb keinen ` +
+      `datumsqualifizierten Beleg erbringen. Sie wurde NICHT gepollt — das ist ein ` +
+      `Konfigurationsfehler des Aufrufers, kein DOM-Zustand.`;
+  }
   if (outcome === 'found') return null;
   if (outcome === 'not-found') {
     return `Nach ${Math.round(waitedMs)}ms Wartephase (Budget ${budgetMs === null ? 'n/a' : budgetMs}ms) ` +
@@ -2838,12 +3248,20 @@ export class OwaClient {
     // Event-Wartephase gepollt wird. Genau das war die Root Cause
     // (eventWaitPolls 0 bei 20s Budget). Ihre Rueckgabe steuert nur noch
     // GUARD 2; die Wartephase hat einen eigenen Beobachter (makeEventObserver).
+    //
+    // BUG 5: Die Probe liefert jetzt auch den Lade-Indikator. Grund: der
+    // Live-Zustand war "Body hat Events, Header fehlt" — und die
+    // Gnadenfrist fuer den Header wird waehrend eines Spinners nicht
+    // abgearbeitet, weil ein Spinner beweist, dass die Ansicht noch laedt.
     let lastEventSelector = null;
-    const hasEventElements = async () => {
+    let lastEventProbe = { events: false, loading: false };
+    const probeEvents = async () => {
       const r = await collectCalendarEventLabels(page, { preferSelector: lastEventSelector, weekStartIso: mondayIso, fast: true });
       if (r.eventElementsFound > 0 && r.selectorUsed) lastEventSelector = r.selectorUsed;
-      return r.eventElementsFound > 0;
+      lastEventProbe = { events: r.eventElementsFound > 0, loading: r.loading === true };
+      return lastEventProbe;
     };
+    const hasEventElements = async () => (await probeEvents()).events;
 
     // Zustandswarten statt starrem Timeout: auf gerenderten Wochen-/Tages-Header
     // ODER Event-Elemente warten (Live-Fail 24.09.2026: 6s reichten nicht, das Grid
@@ -2855,26 +3273,92 @@ export class OwaClient {
     // ab -> die Slot-Extraktion lief, bevor die Events im DOM waren. Jetzt bekommt
     // ein datierter Header eine kurze Gnadenfrist, in der weiter auf Events gepollt
     // wird (budgetiert), damit die Extraktion nicht ins Leere greift.
+    //
+    // BUG 5 (Live-Befund 26.09., Lauf 4): der Zweig `else if (events) break;`
+    // behandelte "kein Header, aber Body-Events" als FERTIG. Genau das war der
+    // Live-Zustand (18 Event-Knoten, 0 Header) — die Schleife verliess die
+    // Ansicht nach dem ersten Poll, lange bevor der Header gerendert sein konnte.
+    // Beleg: waitedForEventsMs 13 / polls 1 bei Budget 20000, headerCandidates
+    // leer, WOCHENDANN aber 18 Event-Knoten im DOM. Der Header fehlt nicht, weil
+    // die Ansicht fertig ist, sondern weil sie noch nicht fertig ist: er ist die
+    // einzige belastbare Wochenquelle UND der Bereich, in dem die Wochen-Buttons
+    // liegen. Ohne ihn ist die Wochenlage unbekannt — das ist Zustand 1
+    // ("warten"), nicht "fertig".
+    // Der Zweig gibt der Ansicht darum dieselbe Gnadenfrist wie einem Header und
+    // verlaengert sie, solange ein Spinner steht.
     const EVENT_GRACE_MS = 2500;
     const waitForCalendarRendered = async (budgetMs) => {
       const waitDeadline = Date.now() + budgetMs;
       let rendered = { text: null, startDate: null, endDate: null };
       let events = false;
       let headerSeenAt = null;
+      let eventsSeenAt = null;
       while (Date.now() < waitDeadline && remaining() > 0) {
         rendered = await readRenderedCalendarWeek(page);
         events = await hasEventElements();
+        const loading = lastEventProbe.loading === true;
         if (rendered.startDate) {
           if (!headerSeenAt) headerSeenAt = Date.now();
           if (events) break;
           if (Date.now() - headerSeenAt >= EVENT_GRACE_MS) break; // Gnadenfrist abgelaufen
         } else if (events) {
-          break;
+          // Header fehlt, Body rendert bereits Events -> Zustand 1, nicht "fertig".
+          if (!eventsSeenAt || loading) eventsSeenAt = Date.now();
+          if (Date.now() - eventsSeenAt >= EVENT_GRACE_MS) break; // Gnadenfrist abgelaufen
         }
         if (Date.now() + 500 > waitDeadline || remaining() <= 0) break;
         await page.waitForTimeout(500);
       }
       return { rendered, hasEvents: events };
+    };
+
+    // Zustand 1: WARTEN statt klicken (BUG 5). Der Wochenzustand wird bei jedem
+    // Poll neu gelesen — "warte bis der Header da ist" heisst "pruefe waehrend
+    // des Wartens", nicht "einmal am Anfang schauen". Der Spinner haelt den Poll
+    // am Leben und macht das Ruhe-Fenster ungueltig.
+    //
+    // Dies ist die EINZIGE Wartefunktion fuer den fehlenden Wochen-Header: die
+    // aeussere Schritt-Schleife und der Klickpfad benutzen beide dieselbe
+    // (ueber Dependency-Injection), damit die beiden nicht auseinanderlaufen
+    // koennen — genau so ist der Live-Befund entstanden.
+    const waitForViewReady = async () => {
+      const waited = await waitForWeekViewReady({
+        readWeek: () => readRenderedCalendarWeek(page),
+        readEvents: () => probeEvents(),
+        budgetMs: phase(FREEBUSY_VIEW_WAIT_BUDGET_MS),
+        pollMs: FREEBUSY_EVENT_WAIT_POLL_MS,
+        settleMs: FREEBUSY_EVENT_WAIT_SETTLE_MS,
+        targetStart: rangeStartDate,
+        sleep: (ms) => page.waitForTimeout(ms)
+      });
+      return { ...waited, events: hasEvents || (await hasEventElements()) };
+    };
+
+    // BUG 5 — Navigation in den drei belegten Wegen, in dieser Reihenfolge
+    // bewertet (siehe Bericht):
+    //  (a) Wochen-Buttons ("Go to next week …") — braucht einen GERENDERTEN
+    //      Header-Bereich. In Runde 4 existierten die Button-Indikatoren nicht
+    //      (weekNavCandidates: []), waehrend sie in Runde 3 da waren UND der
+    //      Klick dort eine datierbare Zielwoche erreicht hat. Die Navigation ist
+    //      also nicht als Defekt belegt — sie war schlicht noch nicht da. In
+    //      Zustand 1 ist sie deshalb gar nicht erst erlaubt (kein Header ->
+    //      keine Buttons -> keine Wochenrichtung bekannt).
+    //  (b) "Jump to a specific date or date range" — ein moeglicher dritter Weg,
+    //      aber ohne live verifizierten Selektor. Blindes DOM-Raten waere hier
+    //      ein Reparaturversuch ohne Beleg; deshalb NICHT implementiert.
+    //  (c) harter Reload der startdate-URL. Das ist der gewaehlte Weg fuer
+    //      Zustand 1: er ist der EINZIGE der drei, der weder einen gerenderten
+    //      Header noch eine geratene Wochenrichtung braucht, und er zielt genau
+    //      auf das belegte Symptom: die URL enthielt startdate=2026-09-28, der
+    //      Inhalt war KW 39 — der Parameter wurde also vom Client-Store
+    //      ueberstimmt. Ein harter Reload setzt ihn durch.
+    const hardReloadOptimized = async () => {
+      const url = page.url() || '';
+      if (url.includes('startdate=')) {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: phase(10000) }).catch(() => null);
+        return true;
+      }
+      return gotoCalendar(optimizedUrl);
     };
 
     // Multi-selektorischer Wochen-Button-Klick (Runde-4-Forderung C): Probiert
@@ -2894,18 +3378,46 @@ export class OwaClient {
     // Der Guard selbst steckt in weekClickDecision (geteilte Definition mit
     // der aeusseren Schritt-Schleife) und entscheidet in BEIDEN Richtungen:
     // Zielwoche erreicht -> Skip; Ansicht nicht gerendert -> KEIN Klick.
-    const clickWeekButton = (direction, prevStart) => runWeekButtonClick({
-      direction,
-      prevStart,
-      targetStart: rangeStartDate,
-      page,
-      probe: weekButtonProbe,
-      readWeek: () => readRenderedCalendarWeek(page),
-      afterClick: (prev, budgetMs) => waitRenderAfterClick(prev, phase(budgetMs)),
-      clickWaitMs: FREEBUSY_CLICK_RENDER_WAIT_MS,
-      clickCostMs: CLICK_COST_MS,
-      remainingMs: remaining
-    });
+    //
+    // BUG 5: Der Klickpfad darf den Zustand 1 nicht mehr "durchreichen" und
+    // seinen Aufrufer mit einem Abbruch belassen, ohne gewartet zu haben. Er
+    // wartet selbst — ueber DIE SELBE Wartefunktion, die auch die aeussere
+    // Schleife benutzt (waitForViewReady, Dependency-Injection). Damit kann der
+    // Aufrufer nicht versehentlich einen anderen Warteweg unterstellen, und der
+    // Test kann den Warte-Schritt am echten Pfad fahren.
+    // Bleibt die Ansicht danach ungerendert, ist die Verweigerung ehrlich UND
+    // das Wartebudget ist verbraucht: der Probe-Eintrag nennt waitedMs.
+    //
+    // viewWaitMsSpent wird VOR der clickWeekButton-Definition deklariert: die
+    // beiden vorherigen Runden hatten je eine TDZ-Stelle in diesem Block
+    // (0d47105, 8eb70cc) — ein `let` nach der schliessenden Klammer einer
+    // asynchronen Closure ist genau die Klasse Fehler, die hier zweimal
+    // passiert ist.
+    let viewWaitMsSpent = 0;
+    let lastViewWait = null;
+    const clickWeekButton = async (direction, prevStart) => {
+      const guard = await runWeekButtonClick({
+        direction,
+        prevStart,
+        targetStart: rangeStartDate,
+        page,
+        probe: weekButtonProbe,
+        readWeek: () => readRenderedCalendarWeek(page),
+        afterClick: (prev, budgetMs) => waitRenderAfterClick(prev, phase(budgetMs)),
+        clickWaitMs: FREEBUSY_CLICK_RENDER_WAIT_MS,
+        clickCostMs: CLICK_COST_MS,
+        remainingMs: remaining,
+        waitForReady: async () => {
+          if (viewWaitMsSpent >= FREEBUSY_VIEW_WAIT_BUDGET_MS) return null;
+          const before = viewWaitMsSpent;
+          const w = await waitForViewReady();
+          viewWaitMsSpent = before + Math.round(w.waitedMs || 0);
+          return w;
+        },
+        onGuardBlocked: (info) => { lastViewWait = info || null; }
+      });
+      return guard;
+    };
 
     // Wartet nach einem Button-Klick auf das Re-Render und BEWERTET die Änderung
     // (Runde-4-Forderung C): 'changed' = Header-Datum hat sich geändert (Klick
@@ -2986,8 +3498,9 @@ export class OwaClient {
     // das Budget sie noch trägt — sonst Abbruch mit dem, was da ist.
     const MAX_BUTTON_CLICKS = FREEBUSY_MAX_BUTTON_CLICKS;
     let gotoRetryDone = false;
-    let forcedNextRetryDone = false;
     let farJumpDone = false;
+    // BUG 5: 1x harter Reload der startdate-URL als Notfallweg fuer Zustand 1.
+    let reloadDone = false;
     let buttonClicks = 0;
     let abortReason = 'none';
     // Klick-Sperre pro Richtung (Iteration 7, Defekt 2): verhindert, dass bei
@@ -2997,88 +3510,62 @@ export class OwaClient {
     let weekConfirmedAfterClick = false;
 
     for (let step = 0; step < 30; step++) {
-      // Klick-Pfad NUR bei echter Abweichung (Iteration 7, Defekt 2): Ist die
-      // Zielwoche bereits gerendert und verifiziert, wird das als SKIP
-      // protokolliert — keine Button-Probe, kein Klick. Runde 6 protokollierte
-      // trotz bestätigter Zielwoche einen "Next week"-Klick.
+      // EIN Zustand, beide Aufrufer (Klickpfad und diese Schleife):
+      // weekViewState ist die Klassifikation, weekClickDecision nur ihre
+      // Abbildung auf skip/reason. Vorher hatte diese Schleife einen eigenen,
+      // schwaecheren Test (isRequestedWeek) und der Klickpfad einen zweiten mit
+      // hasEvents-Ausnahme — genau daraus entstanden die Live-Befunde.
       //
-      // Bug 2: GLEICHE Entscheidungsfunktion wie im Klickpfad
-      // (weekClickDecision). Vorher hatte die aeussere Schleife ihren eigenen,
-      // schwaecheren Test (isRequestedWeek) — die beiden konnten auseinander-
-      // laufen, und genau das war der Live-Befund.
-      //
-      // Ehrliche Abgrenzung: die Schleife arbeitet auf dem `rendered`-Snapshot,
-      // der nach jedem Klick und jedem Render-Wait neu erhoben wird; der
-      // Klickpfad liest dagegen unmittelbar VOR der Probe frisch. Der
-      // Snapshot ist damit der Vorfilter, der frische Read im Klickpfad die
-      // maechsliche Sperre. Neu und entscheidend ist hier die zweite
-      // Bedingung der geteilten Funktion: ohne datierbaren Header wird nicht
-      // nur nicht auf die Zielwoche geklickt, sondern gar nicht geklickt.
-      const outerDecision = weekClickDecision({ rendered, targetStart: rangeStartDate, hasEvents });
-      if (outerDecision.skip) {
-        weekButtonProbe.push(weekProbeGuardEntry(outerDecision));
-        if (outerDecision.reason === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
-          // Ansicht nicht gerendert: NICHT klicken. Der Klickpfad wuerde das
-          // ohnehin blockieren; hier wird es benannt, damit der Abbruchgrund
-          // ehrlich ist statt 'no-dated-header'.
-          abortReason = 'view-not-ready';
-        }
+      // BUG 5, die drei Zustaende:
+      //   1) view-not-ready  -> WARTEN (nicht klicken), Notfall-Reload, dann
+      //                         ehrlicher Abbruch mit verbrauchtem Wartebudget
+      //   2) target-week     -> fertig, KEIN Klick
+      //   3) wrong-week      -> Wochen-Klick, danach wird der Header verifiziert
+      const view = weekViewState({ rendered, targetStart: rangeStartDate });
+
+      // --- Zustand 2: Zielwoche gerendert. Fertig, kein Klick. -------------
+      if (view.state === WEEK_VIEW_STATES.targetWeek) {
+        weekButtonProbe.push(weekProbeGuardEntry(weekClickDecision({ rendered, targetStart: rangeStartDate })));
         break;
       }
       if (remaining() <= 0) { abortReason = 'budget'; break; }
 
-      if (!rendered.startDate) {
-        // Gerenderte Woche UNBEKANNT: Eskalationsleiter (nur bei ausreichendem Budget)
-        if (!gotoRetryDone && remaining() >= 15000) {
-          // 1x frisch navigieren und erneut zustandsbasiert warten
-          gotoRetryDone = true;
-          await gotoCalendar(provenUrl);
-          const retry = await waitForCalendarRendered(phase(6000));
-          rendered = retry.rendered;
-          hasEvents = hasEvents || retry.hasEvents;
+      // --- Zustand 1: Ansicht nicht bereit. WARTEN, NICHT KLICKEN. ----------
+      if (view.state === WEEK_VIEW_STATES.notReady) {
+        // BUG 5 (Live-Befund Lauf 4): hier wurde mit 'view-not-ready' abgebrochen
+        // — nach 13ms, ohne den Header je abzuwarten. Damit verweigerte das
+        // Werkzeug genau die Navigation, die zur Zielwoche gefuehrt haette.
+        // Der Wochenzustand wird jetzt WAEHREND des Wartens neu gelesen
+        // (waitForWeekViewReady, Spinner-respektierend).
+        if (viewWaitMsSpent < FREEBUSY_VIEW_WAIT_BUDGET_MS) {
+          const w = await waitForViewReady();
+          rendered = w.rendered || rendered;
+          hasEvents = w.events === true;
+          if (!w.exhausted) continue;         // Zustand frisch bewerten
+        }
+        // Das Wartebudget ist verbraucht und der Header fehlt immer noch. Der
+        // einzige verbleibende Weg, der weder Header noch Wochenrichtung
+        // braucht: harter Reload der startdate-URL (1x, budgetiert).
+        if (!reloadDone && remaining() >= FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS) {
+          reloadDone = true;
+          await hardReloadOptimized();
+          const w = await waitForViewReady();
+          rendered = w.rendered || rendered;
+          hasEvents = w.events === true;
           continue;
         }
-        if (!forcedNextRetryDone && remaining() >= CLICK_COST_MS + 1000) {
-          // Erzwungene Korrektur auch bei unbekannter Woche: 1x "Nächste Woche" +
-          // Re-Render + erneuter Erkennungsversuch, bevor abgebrochen wird.
-          // Iteration 7: Nur wenn die Woche seit dem letzten Klick ERNEUT
-          // bestätigt wurde — sonst überspringt der Klick die Zielwoche.
-          if (!canClickSameDirection({ lastClickDirection, direction: 1, weekConfirmedAfterClick })) {
-            abortReason = 'same-direction-unconfirmed';
-            break;
-          }
-          forcedNextRetryDone = true;
-          const forced = await clickWeekButton(1, rendered.startDate);
-          if (forced.guard === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
-            // Bug 2: Der erzwungene "Nächste Woche"-Klick war der Live-Befund.
-            // Er lief auf einer Ansicht ohne Wochen-Header — die Wochen- und
-            // Button-Position war unbekannt, ein Klick haette die Zielwoche
-            // ueberspringen koennen. Der Guard blockiert das jetzt; hier wird
-            // es als Abbruchgrund benannt statt als 'no-dated-header'.
-            abortReason = 'view-not-ready';
-            break;
-          }
-          if (forced.targetReached) {
-            // Zielwoche war bereits verifiziert -> uebernehmen und beenden.
-            // Kein Fehlerpfad: "kein Klick" waere hier falsch, weil der
-            // naechste GUARD sonst "week-mismatch" melden wuerde.
-            rendered = forced.week;
-            hasEvents = hasEvents || (await hasEventElements());
-            break;
-          }
-          if (forced.clicked) {
-            rendered = forced.week;
-            hasEvents = hasEvents || (await hasEventElements());
-            lastClickDirection = 1;
-            weekConfirmedAfterClick = Boolean(forced.week && forced.week.startDate);
-          }
-          continue;
-        }
-        abortReason = 'no-dated-header';
-        break; // Nichts hilft -> Guard unten liefert Fehler MIT Diagnostik
+        // Ehrlicher Abbruch: 'view-not-ready' NACH verbrauchtem Wartebudget. Der
+        // Probe-Eintrag nennt die gewartete Zeit, damit ein sofortiges und ein
+        // ausgereiftes Scheitern unterscheidbar bleiben.
+        weekButtonProbe.push(weekProbeGuardEntry(
+          weekClickDecision({ rendered, targetStart: rangeStartDate }), 'guard-nach-wartebudget', viewWaitMsSpent
+        ));
+        abortReason = 'view-not-ready';
+        break;
       }
 
-      // Gerenderte Woche BEKANNT: Delta in Wochen berechnen und per Buttons navigieren
+      // --- Zustand 3: Woche gerendert, aber falsch. Delta berechnen und per
+      // Buttons navigieren. -------------------------------------------------
       const deltaWeeks = Math.round(
         (new Date(mondayIso + 'T00:00:00') - new Date(rendered.startDate + 'T00:00:00')) / (7 * 86400000)
       );
@@ -3114,12 +3601,14 @@ export class OwaClient {
 
       const r = await clickWeekButton(direction, rendered.startDate);
       if (r.guard === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
-        // Bug 2: Der frische Header-Read im Guard fand die Ansicht gerade nicht
-        // gerendert. Klicken waere nicht vertretbar; der Grund wird benannt.
+        // BUG 5: Der frische Header-Read im Guard fand die Ansicht nicht
+        // gerendert — und der Klickpfad hat davor bereits sein Wartebudget
+        // verwendet. Das ist ZUSTAND 1, kein Abbruch: zurueck in die Schleife,
+        // die dann wartet (und notfalls die startdate-URL hart neu laedt).
         // Bewusst VOR dem !r.clicked-Zweig, sonst wuerde es als
         // 'button-ineffective'/'no-week-button' fehlattet.
-        abortReason = 'view-not-ready';
-        break;
+        rendered = r.week || rendered;
+        continue;
       }
       if (r.targetReached) {
         // Zielwoche verifiziert -> uebernehmen und die Klick-Schleife
@@ -3187,9 +3676,14 @@ export class OwaClient {
         waitedForEventsMs: 0,
         eventWaitOutcome: 'not-rendered'
       });
+      // BUG 5: der Text nennt jetzt beides, was geprueft wurde. "Keine
+      // Event-Elemente" war nach dem datumsqualifizierten Umbau nicht mehr
+      // dasselbe wie "kein Event-Knoten aus dem angefragten Zeitraum" — die
+      // zweite Aussage ist die ehrliche.
       return errorResult(
         `Kalenderansicht nicht geladen — Kalender-Tab nicht erreicht oder Woche nicht gerendert. ` +
-        `Weder ein datierter Wochen-Header noch Event-Elemente gefunden (nach Navigation, Warten und timeboxter Eskalation). ` +
+        `Weder ein datierter Wochen-Header noch ein Event-Knoten aus dem angefragten Zeitraum ` +
+        `${rangeStartDate}–${rangeEndDate} gefunden (nach Navigation, Warten und timeboxter Eskalation). ` +
         `Bitte erneut versuchen bzw. Session prüfen (outlook_login).`,
         { renderedWeek: rendered, diagnostics }
       );
@@ -3212,20 +3706,42 @@ export class OwaClient {
     // jede Widerlegung. Die Wartephase arbeitet jetzt ausschliesslich auf
     // Beobachtungen; die Beobachtung selbst ist die schnelle Probe plus der
     // Lade-Indikator-Check.
+    //
+    // BUG 4 (Live-Befund 26.09., Lauf 4): 'found' wird nur noch bei
+    // DATUMSQUALIFIZIERTEM Beleg gemeldet. Live: 18 Event-Knoten der falschen
+    // Woche (KW 39) beendeten die Wartephase nach 13ms/1 Poll mit 'found' bei
+    // 20000ms Budget. Der Beobachter zaehlt deshalb die Labels aus dem
+    // angefragten Zeitraum (mit DERSELBE Prueflogik wie die Abschluss-
+    // Extraktion) und liest zusaetzlich den gerenderten Wochen-Header. Die
+    // Range-Werte werden hier berechnet und NICHT erst weiter unten — die
+    // Wartephase braucht sie vorher (TDZ-Falle, vgl. 0d47105).
+    const rangeStartIso = String(startDt).includes('T') ? startDt : `${startDt}T00:00:00`;
+    const rangeEndIso = String(endDt).includes('T') ? endDt : `${endDt}T23:59:59`;
+    const rangeStartMs = new Date(rangeStartIso).getTime();
+    const rangeEndMs = new Date(rangeEndIso).getTime();
+
     const eventWaitBudget = eventWaitBudgetMs(remaining());
     const observeCalendarEvents = makeEventObserver((preferSelector) => collectCalendarEventLabels(page, {
       preferSelector,
       weekStartIso: rendered.startDate || mondayIso,
       fast: true
-    }));
+    }), {
+      readWeek: () => readRenderedCalendarWeek(page),
+      range: { rangeStartMs, rangeEndMs },
+      defaultYear
+    });
     const eventWait = await waitForCalendarEvents({
       observe: observeCalendarEvents,
       budgetMs: eventWaitBudget,
       pollMs: FREEBUSY_EVENT_WAIT_POLL_MS,
       settleMs: FREEBUSY_EVENT_WAIT_SETTLE_MS,
+      targetStart: rangeStartDate,
       sleep: (ms) => page.waitForTimeout(ms)
     });
-    hasEvents = eventWait.found;
+    // BUG 4: `hasEvents` bleibt die DOM-Fakt ("irgendein Event-Knoten lesbar") und
+    // steuert GUARD 2. Die datumsqualifizierte Trefferzahl steht getrennt davon in
+    // eventWait (found/dateQualified) und darf die beiden nicht vermischen.
+    hasEvents = hasEvents || eventWait.found;
 
     // Alle Event-Elemente über den GEMEINSAMEN Kollektionspfad sammeln (Runde-5-Fix):
     // derselbe Pfad wie die Diagnostik, toleranter Sichtbarkeitsfilter (offsetParent
@@ -3256,7 +3772,11 @@ export class OwaClient {
     eventWait.outcome = eventWaitReconciled.outcome;
     eventWait.abortReason = eventWaitReconciled.abortReason;
     eventWait.found = eventElementsFound > 0;
-    hasEvents = eventWait.found;
+    // BUG 4: `found` bleibt an die TATSAECHLICH gelesene Knotenzahl gekoppelt
+    // (Ehrlichkeits-Gate, unveraendert). Die Datumsqualifikation ist eine
+    // getrennte, additive Information: `dateQualified` sagt, OB der angefragte
+    // Zeitraum belegt war — unabhängig davon, ob am Ende Knoten lesbar waren.
+    hasEvents = hasEvents || eventWait.found;
 
     // Defekt 2: dataQuality nur noch als 'verified', wenn die Woche passt UND
     // echte Event-Knoten gelesen wurden. Sonst 'unverified-empty' — dann ist
@@ -3306,11 +3826,6 @@ export class OwaClient {
     // Nur Slots zurückgeben, die mit dem angefragten Range [start, end) überlappen.
     // Ganztag-Events belegen 00:00–24:00 ihres Tages. Explizit freie Slots ('free')
     // sind keine Belegung und werden ausgeschlossen.
-    const rangeStartIso = String(startDt).includes('T') ? startDt : `${startDt}T00:00:00`;
-    const rangeEndIso = String(endDt).includes('T') ? endDt : `${endDt}T23:59:59`;
-    const rangeStartMs = new Date(rangeStartIso).getTime();
-    const rangeEndMs = new Date(rangeEndIso).getTime();
-
     const { kept: busySlots, rejected: rangeRejected } = partitionSlotsByRange(dedupedSlots, rangeStartMs, rangeEndMs);
     for (const r of rangeRejected) reject(r.slot && r.slot.raw ? r.slot.raw : '', r.reason);
 
@@ -3347,7 +3862,8 @@ export class OwaClient {
     }
     if (eventWait.outcome !== 'found' && eventWait.outcome !== 'not-rendered') {
       note += ` HINWEIS: Auf echte Event-Knoten wurde ${Math.round(eventWait.waitedMs)}ms lang gepollt ` +
-        `(${eventWait.polls} Polls, davon ${eventWait.loadingPolls} mit Lade-Indikator; ` +
+        `(${eventWait.polls} Polls, davon ${eventWait.loadingPolls} mit Lade-Indikator` +
+        `${eventWait.outsideRangePolls ? `, ${eventWait.outsideRangePolls} mit Events ausserhalb des angefragten Zeitraums` : ''}; ` +
         `Budget ${eventWaitBudget}ms, Abbruchgrund ${eventWait.abortReason || eventWait.outcome}) — ohne Treffer. ` +
         `0 Slots bedeuten dann nicht sicher "leerer Kalender".`;
     }
@@ -3405,6 +3921,19 @@ export class OwaClient {
       diag.eventWaitPolls = eventWait.polls;
       diag.eventWaitBudgetMs = eventWaitBudget;
       diag.loading = eventCollection.loading === true;
+      // BUG 4/5: Die Datumsqualifikation der Wartephase und das Ergebnis des
+      // Zustand-1-Wartens sind die beiden Kennzahlen, an denen sich im naechsten
+      // Live-Lauf sofort ablesen laesst, ob der Wartepfad gearbeitet hat.
+      diag.eventWaitDateQualified = eventWait.dateQualified === true;
+      diag.eventWaitInRangeLabels = eventWait.inRangeLabels === undefined ? null : eventWait.inRangeLabels;
+      diag.eventWaitOutsideRangePolls = eventWait.outsideRangePolls || 0;
+      diag.viewWaitMsSpent = Math.round(viewWaitMsSpent);
+      // BUG 5: 'Header noch nicht gerendert' und 'Header-Auswertung fehlgeschlagen'
+      // waren in Runde 4 nicht unterscheidbar (beide: leere Kandidatenlisten).
+      if (rendered.readError) diag.headerReadError = rendered.readError;
+      if (eventWait.weekHeader && eventWait.weekHeader.readError) {
+        diag.headerReadError = eventWait.weekHeader.readError;
+      }
       if (eventCollection.sourceUsed) diag.sourceUsed = eventCollection.sourceUsed;
       if (eventCollection.sourceTried) diag.sourceTried = eventCollection.sourceTried;
       if (eventCollection.census) diag.census = eventCollection.census;
@@ -3414,7 +3943,7 @@ export class OwaClient {
       }
       const warnings = [
         slotExtractionWarning(eventElementsFound, busySlots.length),
-        eventWaitWarning({ outcome: eventWait.outcome, waitedMs: eventWait.waitedMs, budgetMs: eventWaitBudget })
+        eventWaitWarning({ outcome: eventWait.outcome, waitedMs: eventWait.waitedMs, budgetMs: eventWaitBudget, abortReason: eventWait.abortReason })
       ].filter(Boolean);
       if (warnings.length) diag.warning = warnings.join(' ');
       result.diagnostics = diag;

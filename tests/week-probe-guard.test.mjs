@@ -13,7 +13,10 @@ import {
   canClickSameDirection,
   classifyButtonFailure,
   runWeekButtonClick,
-  WEEK_CLICK_GUARD_REASONS
+  weekViewState,
+  waitForWeekViewReady,
+  WEEK_CLICK_GUARD_REASONS,
+  WEEK_VIEW_STATES
 } from '../src/owa.js';
 
 // ===========================================================================
@@ -230,23 +233,216 @@ describe('Bug 2 — Zielwochen-Guard vor dem Klick', () => {
   });
 
   test('weekClickDecision: die geteilte Definition, die beide Stellen benutzen', () => {
-    // Zielwoche drin
-    assert.equal(weekClickDecision({ rendered: TARGET_WEEK, targetStart: TARGET }).skip, true);
-    assert.equal(weekClickDecision({ rendered: TARGET_WEEK, targetStart: TARGET }).reason, WEEK_CLICK_GUARD_REASONS.targetReached);
-    // Falsche Woche, aber gerendert -> klicken
+    // --- Zustand 2: Zielwoche gerendert -> fertig, kein Klick ---------------
+    const reached = weekClickDecision({ rendered: TARGET_WEEK, targetStart: TARGET });
+    assert.equal(reached.skip, true);
+    assert.equal(reached.reason, WEEK_CLICK_GUARD_REASONS.targetReached);
+    assert.equal(reached.state, WEEK_VIEW_STATES.targetWeek);
+    assert.equal(reached.clickable, false);
+
+    // --- Zustand 3: falsche Woche, ABER gerendert -> Klick ist erlaubt ------
     const wrong = weekClickDecision({ rendered: WRONG_WEEK, targetStart: TARGET });
     assert.equal(wrong.skip, false);
     assert.equal(wrong.reason, WEEK_CLICK_GUARD_REASONS.click);
+    assert.equal(wrong.state, WEEK_VIEW_STATES.wrongWeek);
     assert.equal(wrong.clickable, true);
-    // NICHT gerendert und keine Events -> blockieren
-    const unrendered = weekClickDecision({ rendered: UNRENDERED, targetStart: TARGET, hasEvents: false });
+
+    // --- Zustand 1: kein datierbarer Header -> WARTEN, nicht klicken --------
+    const unrendered = weekClickDecision({ rendered: UNRENDERED, targetStart: TARGET });
     assert.equal(unrendered.skip, true);
     assert.equal(unrendered.reason, WEEK_CLICK_GUARD_REASONS.viewNotReady);
+    assert.equal(unrendered.state, WEEK_VIEW_STATES.notReady);
     assert.equal(unrendered.clickable, false);
-    // Nicht gerendert, ABER Events sichtbar -> die Ansicht ist nicht leer,
-    // der Header moeglicherweise nur nicht lesbar. Klick bleibt zulaessig.
-    const eventsNoHeader = weekClickDecision({ rendered: UNRENDERED, targetStart: TARGET, hasEvents: true });
-    assert.equal(eventsNoHeader.skip, false, 'sichtbare Events belegen eine gerenderte Ansicht');
+  });
+
+  test('BUG 5: die hasEvents-Ausnahme ist ENTFALLEN (Zustand 1 ist Zustand 1)', () => {
+    // 1c2825e noch: "sichtbare Events belegen eine gerenderte Ansicht" -> Klick
+    // erlaubt. Das ist der Live-Befund: die Event-Chips SASSEN im DOM (18
+    // Knoten), der Header fehlte, und die Wochenrichtung war damit unbekannt.
+    // Diese Ausnahme behauptete einen vierten Zustand, den es nicht gibt.
+    // runWeekButtonClick reichte hasEvents ohnehin NIE durch (Live: der Guard
+    // griff mit view-not-ready) — die Ausnahme war tote, irrefuehrende Logik.
+    const withEvents = weekClickDecision({ rendered: UNRENDERED, targetStart: TARGET, hasEvents: true });
+    assert.equal(withEvents.skip, true,
+      'sichtbare Events ersetzen keinen datierbaren Wochen-Header');
+    assert.equal(withEvents.reason, WEEK_CLICK_GUARD_REASONS.viewNotReady);
+    // weekViewState kennt das Argument gar nicht mehr — die Zweit-Wahrheit ist weg.
+    assert.equal(weekViewState({ rendered: UNRENDERED, targetStart: TARGET, hasEvents: true }).state,
+      WEEK_VIEW_STATES.notReady);
+  });
+
+  test('BUG 5: die drei Zustaende sind paarweise disjunkt und exhaustiv', () => {
+    const cases = [
+      [UNRENDERED, WEEK_VIEW_STATES.notReady],
+      [{ text: null, startDate: null, endDate: null }, WEEK_VIEW_STATES.notReady],
+      [{ text: 'x', startDate: '2026-09-21', endDate: null }, WEEK_VIEW_STATES.notReady],
+      [WRONG_WEEK, WEEK_VIEW_STATES.wrongWeek],
+      [TARGET_WEEK, WEEK_VIEW_STATES.targetWeek],
+      [{ text: '28.9.–4.10.', startDate: '2026-09-28', endDate: '2026-10-04' }, WEEK_VIEW_STATES.targetWeek]
+    ];
+    for (const [rendered, expected] of cases) {
+      assert.equal(weekViewState({ rendered, targetStart: TARGET }).state, expected,
+        `unerwarteter Zustand fuer ${JSON.stringify(rendered)}`);
+    }
+    // Nur 'wrong-week' ist klickbar.
+    for (const [rendered] of cases) {
+      const s = weekViewState({ rendered, targetStart: TARGET }).state;
+      assert.equal(s === WEEK_VIEW_STATES.wrongWeek, weekClickDecision({ rendered, targetStart: TARGET }).clickable);
+    }
+  });
+
+  test('BUG 5: Zustand 1 wartet, BEVOR es ueberhaupt eine Probe gibt', async () => {
+    // Der Klickpfad muss den fehlenden Header zuerst abwarten und danach neu
+    // entscheiden — genau an dieser Stelle wurde in Runde 4 nach 13ms abgebrochen.
+    // Fixture: readWeek liefert 3x nichts, dann die ZIELWOCHE.
+    const probe = [];
+    const page = fakePage(['Next week']);
+    let reads = 0;
+    const clock = { t: 0, now: () => clock.t, sleep: async (ms) => { clock.t += ms; } };
+    // readWeek liefert 3x nichts, dann die gerenderte (falsche) Woche — der
+    // Kalender "schaltet" also waehrend des Wartens um.
+    const headerSource = async () => {
+      reads++;
+      return reads <= 3 ? UNRENDERED : WRONG_WEEK;
+    };
+    const r = await runWeekButtonClick({
+      direction: 1, prevStart: '2026-09-21', targetStart: TARGET, page, probe,
+      readWeek: headerSource,
+      afterClick: async () => ({ week: TARGET_WEEK, verified: 'changed' }),
+      remainingMs: () => 30000,
+      // DIE Produktions-Wartefunktion, mit derselben Uhr und derselben Quelle
+      // wie der Guard — so wie in getFreeBusy.
+      waitForReady: () => waitForWeekViewReady({
+        readWeek: headerSource,
+        readEvents: async () => ({ loading: false }),
+        budgetMs: 4000, pollMs: 100, settleMs: 500,
+        targetStart: TARGET, now: clock.now, sleep: clock.sleep
+      })
+    });
+    // Der Wichtigste: der Header kam erst beim DRITTEN Read. Ohne das Warten
+    // waere der Guard beim ersten Read gescheitert und der Klick passierte nie.
+    assert.ok(reads >= 4, `der Header wurde mehrfach gelesen (war ${reads})`);
+    assert.ok(clock.t > 0, `es wurde fuer den Header gewartet (war ${clock.t}ms)`);
+    assert.equal(page.clicks.length, 1, 'nach dem Warten wird die Navigation ausgefuehrt');
+    assert.equal(r.clicked, true);
+    assert.equal(r.guard, WEEK_CLICK_GUARD_REASONS.click);
+    // Der Klick passiert NACH dem Warten — Reihenfolge im Protokoll belegt:
+    // der verweigernde Guard-Eintrag darf nicht auftauchen.
+    assert.ok(!probe.some((e) => e.skipped), 'es gab keine Verweigerung, sondern ein Warten');
+  });
+
+  test('BUG 5: bleibt der Header aus, wird NACH dem Wartebudget verweigert', async () => {
+    const probe = [];
+    const page = fakePage(['Next week']);
+    const clock = { t: 0, now: () => clock.t, sleep: async (ms) => { clock.t += ms; } };
+    const r = await runWeekButtonClick({
+      direction: 1, prevStart: '2026-09-21', targetStart: TARGET, page, probe,
+      readWeek: async () => UNRENDERED,
+      afterClick: async () => ({ week: TARGET_WEEK, verified: 'changed' }),
+      remainingMs: () => 30000,
+      waitForReady: async () => waitForWeekViewReady({
+        readWeek: async () => UNRENDERED,
+        readEvents: async () => ({ loading: false }),
+        // settleMs > budgetMs: damit endet das Warten am BUDGET, nicht am
+        // Ruhe-Fenster. Beide Abbrucharten werden getestet.
+        budgetMs: 1000, pollMs: 100, settleMs: 30000,
+        targetStart: TARGET, now: clock.now, sleep: clock.sleep
+      })
+    });
+    assert.equal(page.clicks.length, 0, 'KEIN Klick auf ungerenderter Ansicht');
+    assert.equal(r.guard, WEEK_CLICK_GUARD_REASONS.viewNotReady);
+    assert.equal(r.clicked, false);
+    const entry = probe.find((e) => e.skipped === 'view-not-ready');
+    assert.ok(entry, 'die Verweigerung steht im Protokoll');
+    assert.equal(entry.clicked, false);
+    // BUG 5: waitedMs unterscheidet "nach 13ms verweigert" (der Live-Befund)
+    // von "nach dem Wartebudget verweigert".
+    assert.ok(entry.waitedMs >= 900, `das Wartebudget wurde verbraucht (war ${entry.waitedMs}ms)`);
+  });
+
+  test('BUG 5: das Ruhe-Fenster beendet das Warten ebenfalls ehrlich', () => {
+    // Zweiter Abbruchweg: Header fehlt, aber die Ansicht ist SPINNER-FREI und
+    // bleibt es. Dann ist "warten" sinnlos — nach settleMs ist es belegt, dass
+    // der Header nicht mehr kommt. Auch das ist ein Abbruch mit Wartezeit.
+    const clock = { t: 0, now: () => clock.t, sleep: async (ms) => { clock.t += ms; } };
+    const r = waitForWeekViewReady({
+      readWeek: async () => UNRENDERED,
+      readEvents: async () => ({ loading: false }),
+      budgetMs: 20000, pollMs: 100, settleMs: 400,
+      targetStart: TARGET, now: clock.now, sleep: clock.sleep
+    });
+    return r.then((w) => {
+      assert.equal(w.state, WEEK_VIEW_STATES.notReady);
+      assert.equal(w.exhausted, true);
+      assert.equal(w.settled, true, 'das Ruhe-Fenster hat beendet, nicht das Budget');
+      assert.ok(w.waitedMs >= 400 && w.waitedMs < 20000);
+    });
+  });
+
+  test('BUG 5: der Spinner haelt das Warten am Leben (kein Leer-Beweis)', async () => {
+    // 2 ruhige Polls, dann Spinner, dann Header. Ohne Spinner-Beachtung wuerde
+    // das Ruhe-Fenster nach settleMs schliessen und der Weg als "Header kommt
+    // nicht" enden — obwohl die Ansicht noch laedt.
+    const clock = { t: 0, now: () => clock.t, sleep: async (ms) => { clock.t += ms; } };
+    let poll = 0;
+    const w = await waitForWeekViewReady({
+      readWeek: async () => { poll++; return poll <= 4 ? UNRENDERED : TARGET_WEEK; },
+      readEvents: async () => ({ loading: poll <= 3 }),
+      budgetMs: 5000, pollMs: 100, settleMs: 150,
+      targetStart: TARGET, now: clock.now, sleep: clock.sleep
+    });
+    assert.equal(w.state, WEEK_VIEW_STATES.targetWeek);
+    assert.equal(w.exhausted, false);
+    assert.ok(w.polls >= 5, `der Spinner hat den Poll am Leben gehalten (war ${w.polls})`);
+    assert.ok(w.loadingPolls >= 2, 'Spinner wurden gezaehlt');
+  });
+
+  test('BUG 5: der Wochenzustand wird WAEHREND des Wartens neu gelesen', async () => {
+    // "Warte bis Header da" heisst "pruefe waehrend des Wartens", nicht
+    // "einmal am Anfang schauen" — der Kalender darf zwischen den Polls
+    // umschalten.
+    const clock = { t: 0, now: () => clock.t, sleep: async (ms) => { clock.t += ms; } };
+    let reads = 0;
+    const w = await waitForWeekViewReady({
+      readWeek: async () => { reads++; return reads >= 3 ? TARGET_WEEK : UNRENDERED; },
+      readEvents: async () => ({ loading: true }),
+      budgetMs: 5000, pollMs: 100, settleMs: 1000,
+      targetStart: TARGET, now: clock.now, sleep: clock.sleep
+    });
+    assert.equal(w.state, WEEK_VIEW_STATES.targetWeek);
+    assert.equal(reads, 3, 'genau so viele Header-Reads bis zum Treffer — bei JEDEM Poll einer');
+  });
+
+  test('BUG 5: ohne Budget ist der Abbruch ehrlich (nicht "0 Polls bei 5s")', async () => {
+    const r = await waitForWeekViewReady({ readWeek: async () => UNRENDERED, budgetMs: 0, targetStart: TARGET });
+    assert.equal(r.exhausted, true);
+    assert.equal(r.polls, 0);
+    assert.equal(r.state, WEEK_VIEW_STATES.notReady);
+  });
+
+  test('BUG 5: wird die Zielwoche nie gerendert, endet das Warten ausgerechnet', async () => {
+    // Live-Runde 4: 13ms und Abbruch. Der ehrliche Abbruch braucht das Budget.
+    const clock = { t: 0, now: () => clock.t, sleep: async (ms) => { clock.t += ms; } };
+    const w = await waitForWeekViewReady({
+      readWeek: async () => UNRENDERED,
+      readEvents: async () => ({ loading: false }),
+      budgetMs: 3000, pollMs: 100, settleMs: 30000,   // settle > budget: nur das Budget beendet
+      targetStart: TARGET, now: clock.now, sleep: clock.sleep
+    });
+    assert.equal(w.exhausted, true);
+    assert.equal(w.state, WEEK_VIEW_STATES.notReady);
+    // Gleiche Semantik wie die Event-Wartephase: nie ueber das Budget hinaus,
+    // aber hoechstens einen Pollintervall zu frue (der Poll, der das Budget
+    // erreicht, schlaegt nicht mehr). Live war es 13ms — das ist der Unterschied.
+    assert.ok(clock.t >= 3000 - 100, `das Wartebudget wurde ausge schoepft (war ${clock.t}ms)`);
+    assert.ok(clock.t > 13, 'nicht die 13ms aus dem Live-Befund');
+  });
+
+  test('BUG 5: der Probe-Eintrag nennt die verbrauchte Wartezeit', () => {
+    const e = weekProbeGuardEntry(weekClickDecision({ rendered: UNRENDERED, targetStart: TARGET }), 'guard-vor-klick', 4321);
+    assert.equal(e.waitedMs, 4321);
+    const withoutWait = weekProbeGuardEntry(weekClickDecision({ rendered: UNRENDERED, targetStart: TARGET }));
+    assert.equal('waitedMs' in withoutWait, false, 'ohne Warteangabe wird auch keine erfunden');
   });
 
   test('Der Defekt als Anker: der ALTE Test (nur Zielwoche?) haette hier durchgelassen', () => {
@@ -336,25 +532,87 @@ describe('Bug 2 — Verdrahtung: getFreeBusy nutzt den getesteten Pfad', () => {
       'der Wochenzustand muss per DI aus getFreeBusy kommen');
   });
 
-  test('die Schritt-Schleife benutzt dieselbe Entscheidungsfunktion', () => {
-    const i = src.indexOf('const outerDecision = weekClickDecision(');
-    assert.ok(i > 0, 'die aeussere Schleife muss weekClickDecision benutzen');
+  test('die Schritt-Schleife benutzt dieselbe Zustandsfunktion wie der Klickpfad', () => {
+    // BUG 5: Es gibt jetzt EINE Klassifikation (weekViewState) und eine
+    // Abbildung darauf (weekClickDecision). Beide muessen aus derselben Quelle
+    // stammen, sonst laufen sie wieder auseinander.
+    assert.ok(src.includes('const view = weekViewState({ rendered, targetStart: rangeStartDate });'),
+      'die aeussere Schleife muss weekViewState benutzen');
+    assert.ok(/targetWeekNow = weekClickDecision\(\{ rendered: wk, targetStart \}\)/.test(src),
+      'der Klickpfad muss dieselbe Abbildung benutzen');
+    assert.ok(!/weekClickDecision\(\{[^}]*hasEvents/.test(src),
+      'kein hasEvents mehr in der Entscheidung - das war die tote Ausnahme aus 1c2825e');
     // Kein eigener, schwaecherer Skip mehr im Schritt-Zweig.
     assert.ok(!/if \(rendered\.startDate && isRequestedWeek\(rendered\)\) \{/.test(src),
       'der alte eigene Skip (isRequestedWeek) darf nicht wiederkehren');
   });
 
-  test('beide Aufrufer behandeln view-not-ready als eigenen Abbruchgrund', () => {
-    const n = src.split('WEEK_CLICK_GUARD_REASONS.viewNotReady').length - 1;
-    // 1x Definition + 3x Verwendung (aeussere Schleife, forced, delta-Pfad)
-    assert.ok(n >= 4, `view-not-ready muss in allen drei Zweigen benannt werden (gefunden: ${n})`);
-    assert.equal((src.match(/abortReason = 'view-not-ready'/g) || []).length, 3,
-      'drei Abbruchgruende: aeussere Schleife, forced-Pfad, Delta-Pfad');
+  test('BUG 5: Zustand 1 wird ABGEWARTET, nicht abgebrochen', () => {
+    // Der Live-Befund: `abortReason = 'view-not-ready'; break;` nach 13ms. Die
+    // Verweigerung war richtig, das ABBRECHEN war der Defekt.
+    const waitIdx = src.indexOf('const w = await waitForViewReady();');
+    assert.ok(waitIdx > 0, 'die aeussere Schleife muss waitForViewReady aufrufen');
+    const branchStart = src.lastIndexOf('if (view.state === WEEK_VIEW_STATES.notReady) {', waitIdx);
+    assert.ok(branchStart > 0, 'Zustand 1 braucht einen eigenen Zweig');
+    const branch = src.slice(branchStart, src.indexOf('const deltaWeeks', branchStart));
+    assert.ok(/if \(viewWaitMsSpent < FREEBUSY_VIEW_WAIT_BUDGET_MS\)/.test(branch),
+      'Zustand 1 muss das Wartebudget auswerten');
+    assert.ok(/if \(!w\.exhausted\) continue;/.test(branch),
+      'nach dem Warten wird der Zustand neu bewertet, nicht abgebrochen');
+    assert.ok(/guard-nach-wartebudget/.test(branch), 'der ehrliche Abbruch nennt das Wartebudget');
+    assert.ok(/abortReason = 'view-not-ready';/.test(branch), 'view-not-ready bleibt ein Abbruchgrund');
+    const iWait = branch.indexOf('await waitForViewReady();');
+    const iReload = branch.indexOf('await hardReloadOptimized();');
+    const iAbort = branch.indexOf("abortReason = 'view-not-ready';");
+    assert.ok(iWait >= 0 && iReload > iWait && iAbort > iReload,
+      `Reihenfolge wait(${iWait}) < reload(${iReload}) < abort(${iAbort})`);
+  });
+
+  test('BUG 5: Zustand 1 hat genau EINEN Notfallweg, den harten Reload', () => {
+    // Von den drei belegten Wegen ist der Reload der einzige, der weder einen
+    // gerenderten Header noch eine geratene Wochenrichtung braucht.
+    assert.ok(src.includes('const hardReloadOptimized = async () => {'), 'die Reload-Funktion existiert');
+    assert.ok(/if \(!reloadDone && remaining\(\) >= FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS\)/.test(src),
+      'der Reload ist 1x und budgetiert');
+    assert.equal((src.match(/reloadDone = true;/g) || []).length, 1, 'genau eine Ausfuehrung');
+    assert.ok(src.includes("await page.reload({ waitUntil: 'domcontentloaded'"),
+      'es ist ein HARTER Reload, der den Client-Store ueberschreibt');
+    // Der blinde "Naechste Woche"-Klick auf unbekannte Woche ist ENTFALLEN:
+    // ohne Header ist die Richtung unbekannt, er war die Wochen-Skip-Gefahr.
+    assert.ok(!/forcedNextRetryDone/.test(src), 'der erzwungene Blindklick ist entfernt');
+  });
+
+  test('BUG 5: der Klickpfad traegt dasselbe Warten wie die aeussere Schleife', () => {
+    // Beide Aufrufer teilen EINE Wartefunktion (Dependency-Injection). Sonst
+    // koennte der Klickpfad wieder "sofort verweigern", waehrend die Schleife
+    // wartet - genau die Art Divergenz, die 8ae0eec und 1c2825e produziert hat.
+    const i = src.indexOf('const clickWeekButton = async');
+    assert.ok(i > 0, 'clickWeekButton nicht gefunden');
+    const body = src.slice(i, src.indexOf('\n    };', i) + 7);
+    assert.ok(/waitForReady: async \(\) =>/.test(body), 'der Klickpfad muss dieselbe Wartefunktion bekommen');
+    assert.ok(/await waitForViewReady\(\)/.test(body), 'und zwar waitForViewReady, nicht eine eigene');
+    assert.ok(/onGuardBlocked:/.test(body), 'die Verweigerung wird nach aussen gemeldet (fuer waitedMs)');
+    assert.ok(/decision\.reason === WEEK_CLICK_GUARD_REASONS\.viewNotReady\) \{[\s\S]{0,600}await waitOnce\(\);[\s\S]{0,120}decision = await guardNow\(\);/.test(src),
+      'runWeekButtonClick muss bei view-not-ready WARTEN und danach NEU entscheiden');
+  });
+
+  test('BUG 5: "Header nicht gerendert" ist von "Auswertung fehlgeschlagen" unterscheidbar', () => {
+    // Runde 4: headerCandidates/dayHeaderCandidates/weekNavCandidates waren alle
+    // leer. Das sieht bei "nichts gerendert" und bei "evaluate geworfen"
+    // identisch aus, weil der catch dieselbe Leerform lieferte.
+    assert.ok(/collectError: String\(\(e && e\.message\) \|\| e\)/.test(src),
+      'der catch-Fallback muss den Fehler benennen statt ihn als "nichts gefunden" zu tarnen');
+    assert.ok(src.includes('collectError: collected.collectError || null'), 'die Diagnostik reicht ihn durch');
+    assert.ok(src.includes('diag.headerReadError'), 'und das Ergebnis nennt ihn');
   });
 
   test('der neue Abbruchgrund taucht nicht in der Navigation als Erfolg auf', () => {
     // view-not-ready darf nicht als 'kein Klick, alles gut' durchrutschen.
     assert.equal(WEEK_CLICK_GUARD_REASONS.viewNotReady, 'view-not-ready');
     assert.notEqual(WEEK_CLICK_GUARD_REASONS.viewNotReady, WEEK_CLICK_GUARD_REASONS.targetReached);
+    // Und er ist von den drei Zustaenden zu unterscheiden.
+    assert.equal(WEEK_VIEW_STATES.notReady, 'view-not-ready');
+    assert.notEqual(WEEK_VIEW_STATES.notReady, WEEK_VIEW_STATES.targetWeek);
+    assert.notEqual(WEEK_VIEW_STATES.notReady, WEEK_VIEW_STATES.wrongWeek);
   });
 });
