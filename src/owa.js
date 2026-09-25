@@ -709,7 +709,10 @@ export function isBelievableBusySlots(dataQuality) {
 // Live-Befund: eventWaitOutcome:'found' bei waitedForEventsMs:0 und
 // eventElementsFound:0. 'found' wird ab jetzt ausschliesslich gemeldet, wenn
 // in der ABSCHLIESSENDEN Sammlung echte Event-Knoten gelesen wurden.
-export const EVENT_WAIT_OUTCOMES = ['found', 'not-found', 'budget-exhausted', 'not-rendered'];
+// 'not-polled' (Bug 3): Budget war vorhanden, aber 0 Polls. Ein reiner
+// Logikfehler der Wartephase — der muss als eigener Ausgang sichtbar sein,
+// sonst ist er von "Kalender nachweislich leer" nicht unterscheidbar.
+export const EVENT_WAIT_OUTCOMES = ['found', 'not-found', 'budget-exhausted', 'not-rendered', 'not-polled'];
 
 export function resolveEventWaitOutcome({ polls = 0, eventElementsFound = 0, waitBudgetMs = null } = {}) {
   const n = Number(eventElementsFound);
@@ -971,9 +974,13 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
   let collectError = null;
   try {
     const res = await page.evaluate(
-      ({ pats, plan, clockStrict, weekStart, fastMode, maxElements, maxCensusNodes, maxStructureNodes }) => {
+      ({ pats, plan, clockStrict, weekStart, fastMode, maxElements, maxCensusNodes, maxStructureNodes, loadPats, loadingSelector }) => {
         const re = {};
         for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
+        // Lade-Indikator-Muster kommen als ARGUMENT ueber die evaluate-Grenze
+        // (Modul-Referenzen sind hier ein ReferenceError, siehe collectError).
+        const lre = {};
+        for (const k of Object.keys(loadPats)) lre[k] = new RegExp(loadPats[k], 'i');
         const clockOnlyRe = new RegExp(clockStrict, 'i');
         const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
         const cap = (a, n) => a.slice(0, n);
@@ -1057,6 +1064,39 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
           return null;
         };
 
+        // Lade-Indikator = EIGENE Kategorie. Ein Spinner ist kein Event und
+        // erst recht kein "nichts gefunden": er belegt, dass die Ansicht noch
+        // laedt. Live-Befund 25.09.2026: ein ms-Spinner-circle stand im
+        // Struktur-Census und wurde als Event-Kandidat gefuehrt.
+        const loadHit = (node) => {
+          if (lre.tag.test(node.tag || '')) return 'tag';
+          if (lre.role.test(node.role || '')) return 'role';
+          if (lre.cls.test(node.cls || '')) return 'cls';
+          if (lre.text.test(node.ariaLabel || '') || lre.text.test(node.title || '') || lre.text.test(node.text || '')) return 'text';
+          const dd = node.data || {};
+          const dkeys = Object.keys(dd);
+          for (let i = 0; i < dkeys.length; i++) {
+            if (lre.data.test(dkeys[i]) || lre.data.test(dd[dkeys[i]] || '')) return 'data';
+          }
+          return null;
+        };
+        const loadIndicators = [];
+        const noteLoading = (node, why) => {
+          if (loadIndicators.length < 10) {
+            loadIndicators.push({ tag: node.tag, cls: String(node.cls || '').slice(0, 80), reason: why, top: node.rect ? node.rect.top : null });
+          }
+          return 'load-indicator';
+        };
+        // Billiger Lade-Indikator-Check fuer den 'fast'-Modus (Warte-Probe):
+        // dokumentweiter Attribut-Selektor statt '*'-Durchlauf.
+        const fastLoadingProbe = () => {
+          const hits = safeQSA(loadingSelector);
+          for (let i = 0; i < hits.length && i < 5; i++) {
+            loadIndicators.push({ tag: String(hits[i].tagName || ''), cls: norm(safeAttr(hits[i], 'class')).slice(0, 80), reason: 'fast-probe', top: null });
+          }
+          return hits.length;
+        };
+
         // 1) Tages-Spalten aus den Tageskoepfen (x-Lage der Wochentage)
         const dayColumns = [];
         if (!fastMode) {
@@ -1100,7 +1140,10 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         };
 
         // 4) Struktur-Scan: Blatt-Knoten im Grid-Body (kein geratener Selektor)
+        //    Lade-Indikatoren landen in einer EIGENEN Liste und werden NIE als
+        //    Event-Kandidat gefuehrt (Bug 3, Live-Befund 25.09.2026).
         const structureNodes = [];
+        const loadingNodes = [];
         if (region) {
           let seen = 0;
           for (const el of safeQSA('*')) {
@@ -1110,6 +1153,10 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
             if (!areaOf(r)) continue;
             if (!inRegion(r)) continue;
             const d = describe(el);
+            // Lade-Indikator zuerst: er ist im Grid-Body zu erwarten, solange
+            // die Liste laedt, und darf die Event-Geometrie nicht verfaelschen.
+            const why = loadHit(d);
+            if (why) { loadingNodes.push(d); noteLoading(d, why); continue; }
             // Blatt-Knoten: keine Kind-Knoten mit eigener Flaeche
             let hasChildArea = false;
             try {
@@ -1138,6 +1185,10 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
 
         const consume = (node, source) => {
           if (!node.area) { hiddenCount++; return false; }
+          // Ein Lade-Indikator ist nie ein Event — auch nicht, wenn er ueber
+          // die Attribut-Leiter auftaucht statt ueber den Struktur-Scan.
+          const whyLoad = loadHit(node);
+          if (whyLoad) { noteLoading(node, whyLoad); return false; }
           const texts = [node.ariaLabel, node.title, node.text]
             .concat(Object.values(node.data || {}))
             .map(norm)
@@ -1204,6 +1255,10 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         const dedupe = (arr) => { const o = []; const s = new Set(); for (const l of arr) if (!s.has(l)) { s.add(l); o.push(l); } return o; };
         const dedupeReasons = (arr) => { const o = []; const s = new Set(); for (const e of arr) if (!s.has(e.label)) { s.add(e.label); o.push(e); } return o; };
         const labels = cap(dedupe(allLabels), 60);
+        // 'fast'-Modus (Warte-Probe) hat keinen Struktur-Scan -> dort zaehlt
+        // der billige Attribut-Selektor. Beide Wege liefern dasselbe Flag.
+        const fastLoading = fastMode ? fastLoadingProbe() : 0;
+        const loadingIndicatorsOut = cap(dedupeReasons(loadIndicators.map((l) => ({ label: String(l.cls || l.tag || '').slice(0, 80), reason: 'load-indicator' }))), 10);
         return {
           labels,
           eventElementsFound: labels.length,
@@ -1216,19 +1271,24 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
           candidates: cap(candidates, 20),
           // Signatur ohne Datum: sichtbar, aber kein verwertbares Label.
           dateMissingLabels: cap(dateMissing, 20),
+          // Lade-Indikator vorhanden? -> die Ansicht ist NOCH NICHT FERTIG.
+          // Das ist die Kategorie, die den Warte-Loop am Leben haelt.
+          loading: loadIndicators.length > 0 || fastLoading > 0,
+          loadingIndicators: loadingIndicatorsOut,
           // Rohe Struktur-Knoten fuer die Node-seitige Geometrie-Ableitung
           // (grosszuegiges Limit: das ist der eigentliche Datentraeger).
           // SCAN_MAX_STRUCTURE_NODES wird ueber maxStructureNodes gereicht —
           // ein nackter Modul-Identifier waere im Browser ein ReferenceError.
           structureNodes: fastMode ? [] : cap(structureNodes, maxStructureNodes),
           census: fastMode
-            ? { skipped: 'fast-mode' }
+            ? { skipped: 'fast-mode', loadingNodes: fastLoading }
             : {
               scannedCount,
               truncated,
               dayColumns: cap(dayColumns, 10),
               clockRuler: cap(clockRuler, 16),
               structureNodes: structureNodes.length,
+              loadingNodes: loadingNodes.length,
               scanned: cap(structureNodes, maxCensusNodes)
             }
         };
@@ -1243,7 +1303,11 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         maxCensusNodes: CENSUS_MAX_NODES,
         // Eigenes Limit: maxCensusNodes ist CENSUS_MAX_NODES (14, reine
         // Antwortgroesse) und NICHT das Scan-Limit fuer die Rohknoten (200).
-        maxStructureNodes: SCAN_MAX_STRUCTURE_NODES
+        maxStructureNodes: SCAN_MAX_STRUCTURE_NODES,
+        // Lade-Indikator-Muster + Selektor als Argument (Single Source of
+        // Truth ist LOAD_INDICATOR_PATTERNS weiter oben im Modul).
+        loadPats: LOAD_INDICATOR_PATTERNS,
+        loadingSelector: LOAD_INDICATOR_SELECTOR
       }
     );
     // GEOMETRIE-Pfad (Node-seitig, gleiche Prueflogik wie der Rest):
@@ -1307,8 +1371,8 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
     return {
       labels: [], eventElementsFound: 0, selectorUsed: 'error', sourceUsed: null,
       sourceTried: [], hiddenCount: 0, headerLikeLabels: [], nonEventLabels: [],
-      candidates: [], collectError,
-      census: { scannedCount: 0, truncated: false, dayColumns: [], clockRuler: [], structureNodes: 0, scanned: [] }
+      candidates: [], collectError, loading: false, loadingIndicators: [],
+      census: { scannedCount: 0, truncated: false, dayColumns: [], clockRuler: [], structureNodes: 0, loadingNodes: 0, scanned: [] }
     };
   }
 }
@@ -1459,6 +1523,69 @@ export const FREEBUSY_EVENT_WAIT_MAX_MS = 20000;
 export const FREEBUSY_EVENT_WAIT_RESERVE_MS = 5000;
 // Poll-Intervall der Event-Wartephase.
 export const FREEBUSY_EVENT_WAIT_POLL_MS = 500;
+// Ruhe-Fenster, über das "kein Event UND kein Lade-Indikator" als BELEGT leer
+// gelten muss, bevor der Poll vorzeitig enden darf. Ein einzelner spinner-freier
+// Blick ist KEIN Leer-Beweis: direkt nach Navigation/Klick ist das Grid kurz
+// leer, BEVOR es befüllt wird (Live-Befund 25.09.2026). Ohne dieses Fenster
+// würde der Poll nach ~1 Poll mit "not-found" enden — genau der Defekt, den
+// die stale Vorabmeldung verdeckt hat.
+export const FREEBUSY_EVENT_WAIT_SETTLE_MS = 1000;
+
+// ---------------------------------------------------------------------------
+// Lade-Indikatoren (Spinner) — EIGENE Kategorie, kein Event-Kandidat
+// ---------------------------------------------------------------------------
+// Live-Befund 25.09.2026 (Smoke-Test Runde 3, echte OWA): Der Struktur-Census
+// enthielt einen "ms-Spinner-circle" (y≈487) und führte ihn als möglichen
+// Event-Knoten. Ein Spinner ist aber das Gegenteil eines Events: er BEWEIST,
+// dass die Kalenderliste NOCH AM LADEN ist. Als Event-Kandidat durchgerutscht
+// war er wertlos; die Wartephasepollte daraufhin nie.
+//
+// Die Erkennungsmuster liegen hier als Single Source of Truth. Der Browser-
+// Callback in collectCalendarEventLabels KANN Modul-Identifikatoren nicht
+// referenzieren (ReferenceError ueber die evaluate-Grenze, siehe collectError),
+// deshalb werden die Muster als Argument durchgereicht und dort neu kompiliert —
+// Muster und Selektor kommen aber beide von hier.
+export const LOAD_INDICATOR_PATTERNS = {
+  cls: String.raw`ms-?spinner|ms-?progressindicator|ms-?loading|progressring|\bspinner\b`,
+  tag: String.raw`^ms-(spinner|progressindicator|loading|progressring)$`,
+  role: String.raw`^progressbar$`,
+  text: String.raw`wird geladen|loading\.\.\.|lade(anzeige|spin)|^\s*laden\s*$`,
+  data: String.raw`spinner|loading`
+};
+
+// Billiger, dokumentweiter Lade-Indikator-Selektor fuer den 'fast'-Modus der
+// Warte-Probe. Bewusstattributbasiert und ohne '*'-Durchlauf: die Warte-Probe
+// laeuft alle 500ms und darf das Poll-Budget nicht auffressen.
+export const LOAD_INDICATOR_SELECTOR = [
+  '[class*="ms-Spinner" i]',
+  '[class*="ms-ProgressIndicator" i]',
+  '[class*="ms-Loading" i]',
+  '[role="progressbar"]',
+  '[aria-busy="true"]',
+  'ms-Spinner',
+  'ms-ProgressIndicator'
+].join(', ');
+
+// Ist dieser Grid-/Strukturknoten ein Lade-Indikator? Reine Funktion, damit die
+// Kategorie auch ohne Browser testbar ist (Regressionstest der Spinner-Trennung).
+export function isLoadIndicatorNode(node) {
+  if (!node) return false;
+  const test = (src, pat) => {
+    if (!src) return false;
+    try { return new RegExp(pat, 'i').test(String(src)); } catch (e) { return false; }
+  };
+  if (test(node.tag, LOAD_INDICATOR_PATTERNS.tag)) return true;
+  if (test(node.role, LOAD_INDICATOR_PATTERNS.role)) return true;
+  if (test(node.cls, LOAD_INDICATOR_PATTERNS.cls)) return true;
+  if (test(node.ariaLabel, LOAD_INDICATOR_PATTERNS.text)) return true;
+  if (test(node.title, LOAD_INDICATOR_PATTERNS.text)) return true;
+  if (test(node.text, LOAD_INDICATOR_PATTERNS.text)) return true;
+  const data = node.data || {};
+  for (const k of Object.keys(data)) {
+    if (test(k, LOAD_INDICATOR_PATTERNS.data) || test(data[k], LOAD_INDICATOR_PATTERNS.data)) return true;
+  }
+  return false;
+}
 
 // Die möglichen Ausgänge der Event-Wartephase (Diagnose-Feld eventWaitOutcome)
 // sind bei resolveEventWaitOptionen definiert — dort Single Source of Truth.
@@ -1492,6 +1619,184 @@ export async function pollUntilEventGrid({ hasEvents, budgetMs, pollMs = FREEBUS
     await sleep(pollMs);
   }
   return { found: false, outcome: 'budget-exhausted', waitedMs: waited(), polls };
+}
+
+// ---------------------------------------------------------------------------
+// Bug 3 — der Warte-Loop pollt nicht (Root Cause, Live-Befund 25.09.2026)
+// ---------------------------------------------------------------------------
+// Live-Kennzahlen des Smoke-Tests Runde 3 (echte OWA, KW 40):
+//     waitedForEventsMs: 0   eventWaitPolls: 0   eventWaitBudgetMs: 20000
+//     eventWaitOutcome: 'not-found'   Abbruch nach ~4s
+// 20000ms Budget, NULL Polls, NULL Milli Sekunden gewartet.
+//
+// Ursache (an der Quelle belegt, nicht vermutet): pollUntilEventGrid war die
+// EINZIGE Pollschleife — sie wurde aber per `if (hasEvents) { polls: 0,
+// waitedMs: 0 }` uebersprungen. hasEvents stammt aus der schnellen Vorab-Probe
+// und war STALE: der Vorab-Probe-Selektor fand etwas, die abschliessende
+// vollstaendige Sammlung fand 0 Knoten. Der Kommentar "eine stale Vorabmeldung
+// darf nichts mehr entscheiden" beschrieb genau das Gegenteil der Wirklichkeit:
+// die Vorabmeldung entschied, OB ueberhaupt gepollt wird — und verhinderte
+// damit jede Moeglichkeit, die stale Vorabmeldung zu widerlegen.
+//
+// Zweiter, davon unabhaengiger Defekt: resolveEventWaitOutcome({polls,
+// eventElementsFound, waitBudgetMs}) hat polls und waitBudgetMs destrukturiert
+// und NIE benutzt. Ein erschoeptes Budget war damit von "0 Polls bei
+// vorhandenem Budget" nicht unterscheidbar — beide ergaben 'not-found'.
+//
+// Die Reparatur: die Wartephase besitzt die Entscheidung selbst und arbeitet
+// ausschliesslich auf BEOBACHTUNGEN (Event-Zahl + Lade-Indikator), nicht auf
+// einer booleschen Vorabmeldung. Es gibt keine Stale-Boolean-Shortcut-Stelle
+// mehr, die den Poll ueberspringen koennte.
+//
+// Beobachtungsprotokoll je Poll: { eventElementsFound, loading }
+//   eventElementsFound > 0        -> 'found', sofort belegt fertig
+//   loading === true               -> Spinner: NOCH NICHT FERTIG, weiter pollen
+//   0 Events, kein Spinner         -> Ruhe-Fenster sammeln; erst nach
+//                                     settleMs ununterbrochen ruhig ->
+//                                     'not-found' mit abortReason
+//                                     'rendered-empty-proven' (BELEGT leer)
+//   Budget erschoepft               -> 'budget-exhausted' mit abortReason
+//                                     'wait-budget-exhausted' (Budget
+//                                     tatsaechlich ausge schoepft)
+export const EVENT_WAIT_ABORT_REASONS = {
+  renderedEmpty: 'rendered-empty-proven',
+  budgetExhausted: 'wait-budget-exhausted',
+  notPolled: 'wait-not-polled',
+  budgetUnavailable: 'wait-budget-unavailable'
+};
+
+export async function waitForCalendarEvents({
+  observe,
+  budgetMs,
+  pollMs = FREEBUSY_EVENT_WAIT_POLL_MS,
+  settleMs = FREEBUSY_EVENT_WAIT_SETTLE_MS,
+  now = () => Date.now(),
+  sleep
+} = {}) {
+  const startedAt = now();
+  const waited = () => now() - startedAt;
+  const result = (extra) => ({
+    found: false,
+    outcome: 'not-found',
+    waitedMs: waited(),
+    polls: 0,
+    loadingPolls: 0,
+    loading: false,
+    abortReason: null,
+    ...extra
+  });
+  if (typeof observe !== 'function' || !budgetMs || budgetMs <= 0) {
+    // Kein Budget -> ehrlich benennen statt "0 Polls bei 20s Budget" zu melden.
+    return result({ outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.budgetUnavailable });
+  }
+  const doSleep = typeof sleep === 'function' ? sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  let polls = 0;
+  let loadingPolls = 0;
+  let quietSince = null;   // Beginn des ununterbrochenen Ruhe-Fensters
+  let lastLoading = false;
+  while (waited() < budgetMs) {
+    polls++;
+    // eslint-disable-next-line no-await-in-loop
+    const o = (await observe()) || {};
+    const found = Number(o.eventElementsFound) > 0;
+    lastLoading = o.loading === true;
+    if (found) {
+      return { found: true, outcome: 'found', waitedMs: waited(), polls, loadingPolls, loading: lastLoading, abortReason: null };
+    }
+    if (lastLoading) {
+      // BEWEIS FUER "NOCH NICHT FERTIG": der Spinner haelt den Poll am Leben.
+      loadingPolls++;
+      quietSince = null;
+    } else {
+      if (quietSince === null) quietSince = now();
+      const quietMs = waited() - (quietSince - startedAt);
+      if (quietMs >= (settleMs || 0)) {
+        return {
+          found: false, outcome: 'not-found', waitedMs: waited(), polls, loadingPolls,
+          loading: false, abortReason: EVENT_WAIT_ABORT_REASONS.renderedEmpty
+        };
+      }
+    }
+    if (waited() + pollMs >= budgetMs) break;
+    // eslint-disable-next-line no-await-in-loop
+    await doSleep(pollMs);
+  }
+  return {
+    found: false, outcome: 'budget-exhausted', waitedMs: waited(), polls, loadingPolls,
+    loading: lastLoading, abortReason: EVENT_WAIT_ABORT_REASONS.budgetExhausted
+  };
+}
+
+// Klassifiziert EINE Beobachtung der Wartephase in eine von vier Kategorien.
+// Reine Funktion (testbar) und die einzige Stelle, die "noch nicht fertig"
+// von "nachweislich leer" trennt — genau die Unterscheidung, die im Live-Befund
+// gefehlt hat, weil der Spinner als Event-Kandidat durchrutschte.
+export function loadIndicatorReason({ eventElementsFound = 0, loading = false } = {}) {
+  const n = Number(eventElementsFound) || 0;
+  if (n > 0) return { category: 'events', loading: Boolean(loading), eventElementsFound: n };
+  if (loading) return { category: 'still-loading', loading: true, eventElementsFound: 0 };
+  return { category: 'empty-candidate', loading: false, eventElementsFound: 0 };
+}
+
+// Baut die Beobachtungsfunktion der Wartephase. Bewusst als exportierte
+// Fabrik und NICHT als Inline-Closure in getFreeBusy: der Regressionstest
+// (Bug 3) muss den ECHEN Draht fahren — echter Beobachter -> echter Kollektor
+// -> echte Warteschleife. Eine im Test nachgebaute Beobachtung koennte
+// driften und wuerde den Defekt genau nicht fangen (genau dieser Fehler ist
+// bei Bug 2 passiert).
+//
+// `collect(preferSelector)` liefert das Ergebnis von collectCalendarEventLabels
+// im 'fast'-Modus. Die zuletzt erfolgreiche Quelle wird als preferSelector
+// weitergereicht (dieselbe Leiter, dieselbe Reihenfolge).
+export function makeEventObserver(collect) {
+  if (typeof collect !== 'function') throw new TypeError('makeEventObserver: collect muss eine Funktion sein');
+  let lastSelector = null;
+  const observeCalendarEvents = async () => {
+    // eslint-disable-next-line no-await-in-loop
+    const r = await collect(lastSelector) || {};
+    const n = Number(r.eventElementsFound) || 0;
+    if (n > 0 && r.selectorUsed) lastSelector = r.selectorUsed;
+    return { eventElementsFound: n, loading: r.loading === true };
+  };
+  // Der zuletzt erfolgreiche Selektor wird auch fuer die abschliessende
+  // vollstaendige Sammlung gebraucht (dieselbe Leiter, erstes probieren).
+  observeCalendarEvents.lastSelector = () => lastSelector;
+  return observeCalendarEvents;
+}
+
+// Abgleich des Warte-Ergebnisses mit der ABSCHLIESSENDEN Sammlung. Das ist die
+// einzige Stelle, die den gemeldeten Ausgang festlegt — und sie kann
+// 'not-polled' melden, also einen Logikfehler sichtbar machen, den die alte
+// resolveEventWaitOutcome per destrukturierter, ungenutzter Argumente
+// unsichtbar gemacht hat.
+export function reconcileEventWait({ wait = null, eventElementsFound = 0, waitBudgetMs = 0 } = {}) {
+  const n = Number(eventElementsFound);
+  if (Number.isFinite(n) && n > 0) return { outcome: 'found', abortReason: null };
+  const polls = wait ? Number(wait.polls) : NaN;
+  if (Number(waitBudgetMs) > 0 && (!Number.isFinite(polls) || polls === 0)) {
+    // Budget war da, aber es wurde nicht gepollt -> das ist ein Defekt, kein
+    // DOM-Zustand. Muss benannt werden, statt als 'not-found' durchzurutschen.
+    return { outcome: 'not-polled', abortReason: EVENT_WAIT_ABORT_REASONS.notPolled };
+  }
+  const w = wait || {};
+  if (w.abortReason === EVENT_WAIT_ABORT_REASONS.renderedEmpty) {
+    return { outcome: 'not-found', abortReason: EVENT_WAIT_ABORT_REASONS.renderedEmpty };
+  }
+  if (w.abortReason === EVENT_WAIT_ABORT_REASONS.budgetUnavailable) {
+    return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.budgetUnavailable };
+  }
+  return { outcome: 'budget-exhausted', abortReason: EVENT_WAIT_ABORT_REASONS.budgetExhausted };
+}
+
+// EIN ehrlicher Abbruchgrund fuer die Diagnostik: der Navigations-Abbruch
+// schlaegt die Wartephase, aber wenn die Navigation sauber war und die
+// Wartephase gescheitert ist, muss deren Grund sichtbar werden — sonst endet
+// der Call nach 4s still mit abortReason 'none'.
+export function effectiveAbortReason({ navReason = 'none', eventWaitReason = null, eventElementsFound = 0 } = {}) {
+  const nav = navReason && navReason !== 'none' ? navReason : null;
+  const wait = Number(eventElementsFound) > 0 ? null : (eventWaitReason || null);
+  if (nav && wait && nav !== wait) return `${nav}+${wait}`;
+  return nav || wait || 'none';
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,6 +1861,11 @@ export function eventWaitWarning({ outcome, waitedMs = 0, budgetMs = null } = {}
   }
   if (outcome === 'not-rendered') {
     return 'Event-Grid wurde nicht gerendert — weder datierter Wochen-Header noch echtes Event-Label gefunden.';
+  }
+  if (outcome === 'not-polled') {
+    return `Wartephase mit ${budgetMs === null ? 'n/a' : budgetMs}ms Budget gestartet, aber OHNE Polls ` +
+      `beendet (0 Polls, ${Math.round(waitedMs)}ms). Das ist ein Logikfehler der Wartephase, ` +
+      `KEIN DOM-Zustand — der Kalender wurde hier gar nicht abgewartet.`;
   }
   return null;
 }
@@ -1638,7 +1948,7 @@ export function classifyButtonFailure({ foundAny = false, clickedAny = false } =
 // (Runde-4-Forderung B): Der frühe Snapshot (direkt nach Navigation erhoben)
 // bleibt immer erhalten, auch wenn das Budget für eine frische Erhebung nicht
 // mehr reicht. Klick-Protokoll, Abbruchgrund und Budget-Report kommen hinzu.
-export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null, waitedForEventsMs = null, eventWaitOutcome = null } = {}) {
+export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null, waitedForEventsMs = null, eventWaitOutcome = null, eventWaitAbortReason = null, eventWaitLoadingPolls = null, loadingIndicators = null } = {}) {
   const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], weekNavCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
   const out = {
     ...base,
@@ -1659,6 +1969,9 @@ export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekBu
   // unterscheidbar bleibt.
   if (waitedForEventsMs !== null) out.waitedForEventsMs = waitedForEventsMs;
   if (eventWaitOutcome !== null) out.eventWaitOutcome = eventWaitOutcome;
+  if (eventWaitAbortReason !== null) out.eventWaitAbortReason = eventWaitAbortReason;
+  if (eventWaitLoadingPolls !== null) out.eventWaitLoadingPolls = eventWaitLoadingPolls;
+  if (loadingIndicators !== null) out.loadingIndicators = loadingIndicators;
   return out;
 }
 
@@ -2362,6 +2675,11 @@ export class OwaClient {
     // OWA-Seite hunderte ms und wuerde das Poll-Budget auffressen). Die
     // vollstaendige Sammlung inkl. Struktur-Scan laeuft genau einmal danach
     // und entscheidet ueber den Ausgang.
+    //
+    // Bug 3: Diese Vorab-Probe entscheidet NICHT mehr darueber, ob die
+    // Event-Wartephase gepollt wird. Genau das war die Root Cause
+    // (eventWaitPolls 0 bei 20s Budget). Ihre Rueckgabe steuert nur noch
+    // GUARD 2; die Wartephase hat einen eigenen Beobachter (makeEventObserver).
     let lastEventSelector = null;
     const hasEventElements = async () => {
       const r = await collectCalendarEventLabels(page, { preferSelector: lastEventSelector, weekStartIso: mondayIso, fast: true });
@@ -2734,27 +3052,32 @@ export class OwaClient {
     // dataQuality wird ehrlich (siehe resolveDataQuality weiter unten).
     const weekVerified = Boolean(rendered.startDate && rendered.endDate);
 
-    // ECHTE Event-Wartephase (Defekt 1+3): Nach bestaetigter Wochen-
-    // Verifikation wird GEZIELT auf echte Event-Knoten gepollt (nicht auf
-    // irgendein [aria-label] mit Uhrzeit). Budgetgebunden:
+    // ECHTE Event-Wartephase (Bug 3, Live-Befund 25.09.2026): Nach bestaetigter
+    // Wochen-Verifikation wird GEZIELT auf echte Event-Knoten gepollt. Budget:
     // min(20s, Restzeit - 5s Reserve) — die Reserve traegt Extraktion +
     // Diagnostik, damit der Call nie ins MCP-Client-Timeout laeuft.
+    //
+    // Die Vorab-Meldung hasEvents wird hier BEWUSST NICHT mehr als Abkuerzung
+    // benutzt. Live-Befund: waitedForEventsMs 0 / eventWaitPolls 0 bei einem
+    // Budget von 20000ms. Ursache war genau diese Abkuerzung — die stale
+    // Vorab-Probe entschied, OB ueberhaupt gepollt wird, und verhinderte damit
+    // jede Widerlegung. Die Wartephase arbeitet jetzt ausschliesslich auf
+    // Beobachtungen; die Beobachtung selbst ist die schnelle Probe plus der
+    // Lade-Indikator-Check.
     const eventWaitBudget = eventWaitBudgetMs(remaining());
-    let eventWait = { found: false, outcome: 'not-found', waitedMs: 0, polls: 0 };
-    if (hasEvents) {
-      // Die schnelle Probe hat bereits Event-Knoten gesehen: nicht pollen.
-      // Der endgueltige Ausgang wird trotzdem unten aus der VOLLSTAENDIGEN
-      // Sammlung abgeleitet — eine stale Vorabmeldung darf nichts mehr entscheiden.
-      eventWait = { found: true, outcome: 'pending', waitedMs: 0, polls: 0 };
-    } else {
-      eventWait = await pollUntilEventGrid({
-        hasEvents: hasEventElements,
-        budgetMs: eventWaitBudget,
-        pollMs: FREEBUSY_EVENT_WAIT_POLL_MS,
-        sleep: (ms) => page.waitForTimeout(ms)
-      });
-      hasEvents = eventWait.found;
-    }
+    const observeCalendarEvents = makeEventObserver((preferSelector) => collectCalendarEventLabels(page, {
+      preferSelector,
+      weekStartIso: rendered.startDate || mondayIso,
+      fast: true
+    }));
+    const eventWait = await waitForCalendarEvents({
+      observe: observeCalendarEvents,
+      budgetMs: eventWaitBudget,
+      pollMs: FREEBUSY_EVENT_WAIT_POLL_MS,
+      settleMs: FREEBUSY_EVENT_WAIT_SETTLE_MS,
+      sleep: (ms) => page.waitForTimeout(ms)
+    });
+    hasEvents = eventWait.found;
 
     // Alle Event-Elemente über den GEMEINSAMEN Kollektionspfad sammeln (Runde-5-Fix):
     // derselbe Pfad wie die Diagnostik, toleranter Sichtbarkeitsfilter (offsetParent
@@ -2765,22 +3088,25 @@ export class OwaClient {
     // nicht die Vorab-Probe — entscheidet ueber eventElementsFound, dataQuality
     // und eventWaitOutcome.
     const eventCollection = await collectCalendarEventLabels(page, {
-      preferSelector: lastEventSelector,
+      preferSelector: observeCalendarEvents.lastSelector(),
       weekStartIso: rendered.startDate || mondayIso
     });
     const rawLabels = eventCollection.labels;
     const eventElementsFound = eventCollection.eventElementsFound;
     const selectorUsed = eventCollection.selectorUsed;
 
-    // Defekt 3: Der Ausgang der Wartephase wird an die TATSAECHLICH in der
+    // Defekt 3 / Bug 3: Der Ausgang der Wartephase wird an die TATSAECHLICH in
     // Abschluss-Sammlung beobachtete Event-Elementzahl gekoppelt. 'found' ist
-    // damit unmöglich, wenn 0 Knoten gelesen wurden (der Smoke-Test meldete
-    // "found" bei waitedForEventsMs:0 UND eventElementsFound:0).
-    eventWait.outcome = resolveEventWaitOutcome({
-      polls: eventWait.polls,
+    // damit unmoeglich, wenn 0 Knoten gelesen wurden. Und jetzt zum ersten Mal
+    // auch umgekehrt: ein nicht gelaufener Poll trotz Budget ('not-polled') ist
+    // ein Logikfehler und wird als solcher gemeldet statt als 'not-found'.
+    const eventWaitReconciled = reconcileEventWait({
+      wait: eventWait,
       eventElementsFound,
       waitBudgetMs: eventWaitBudget
     });
+    eventWait.outcome = eventWaitReconciled.outcome;
+    eventWait.abortReason = eventWaitReconciled.abortReason;
     eventWait.found = eventElementsFound > 0;
     hasEvents = eventWait.found;
 
@@ -2860,12 +3186,22 @@ export class OwaClient {
         `busySlots=[] bedeutet hier KEINEN leeren Kalender, sondern ein nicht auslesbares Grid — ` +
         `NICHT als "frei" verwenden.`;
     }
-    if (dataQuality === 'verified' && abortReason !== 'none') {
-      note += ` HINWEIS: Navigation vorzeitig beendet (${abortReason}); die angezeigte Woche wurde verifiziert.`;
+    // EIN ehrlicher Abbruchgrund: Navigations-Abbruch ODER Warte-Abbruch. Vorher
+    // endete der Call nach ~4s still mit abortReason 'none', obwohl die
+    // Wartephase mit 20s Budget nicht gelaufen war (Live-Befund 25.09.2026).
+    const reportedAbortReason = effectiveAbortReason({
+      navReason: abortReason,
+      eventWaitReason: eventWait.abortReason,
+      eventElementsFound
+    });
+    if (dataQuality === 'verified' && reportedAbortReason !== 'none') {
+      note += ` HINWEIS: Navigation vorzeitig beendet (${reportedAbortReason}); die angezeigte Woche wurde verifiziert.`;
     }
-    if (eventWait.outcome === 'not-found' || eventWait.outcome === 'budget-exhausted') {
+    if (eventWait.outcome !== 'found' && eventWait.outcome !== 'not-rendered') {
       note += ` HINWEIS: Auf echte Event-Knoten wurde ${Math.round(eventWait.waitedMs)}ms lang gepollt ` +
-        `(${eventWait.polls} Polls, Budget ${eventWaitBudget}ms) — ohne Treffer. 0 Slots bedeuten dann nicht sicher "leerer Kalender".`;
+        `(${eventWait.polls} Polls, davon ${eventWait.loadingPolls} mit Lade-Indikator; ` +
+        `Budget ${eventWaitBudget}ms, Abbruchgrund ${eventWait.abortReason || eventWait.outcome}) — ohne Treffer. ` +
+        `0 Slots bedeuten dann nicht sicher "leerer Kalender".`;
     }
     if (rendered.endDate && rangeEndDate > rendered.endDate) {
       note += ` HINWEIS: Der angefragte Range endet (${rangeEndDate}) nach der gerenderten Woche (${rendered.endDate}) — spätere Tage sind nicht enthalten.`;
@@ -2904,19 +3240,23 @@ export class OwaClient {
         fresh: await freshDiag(),
         early: earlyDiagnostics,
         weekButtonProbe,
-        abortReason,
+        abortReason: reportedAbortReason,
         budget: freeBusyBudgetReport(),
         eventElementsFound,
         selectorUsed,
         rawEventLabels: rawLabels.slice(0, 20),
         rejectionReasons: rejectionReasons.slice(0, 40),
         waitedForEventsMs: Math.round(eventWait.waitedMs),
-        eventWaitOutcome: eventWait.outcome
+        eventWaitOutcome: eventWait.outcome,
+        eventWaitAbortReason: eventWait.abortReason,
+        eventWaitLoadingPolls: eventWait.loadingPolls,
+        loadingIndicators: eventCollection.loadingIndicators
       });
       diag.weekVerified = weekVerified;
       diag.dataQuality = dataQuality;
       diag.eventWaitPolls = eventWait.polls;
       diag.eventWaitBudgetMs = eventWaitBudget;
+      diag.loading = eventCollection.loading === true;
       if (eventCollection.sourceUsed) diag.sourceUsed = eventCollection.sourceUsed;
       if (eventCollection.sourceTried) diag.sourceTried = eventCollection.sourceTried;
       if (eventCollection.census) diag.census = eventCollection.census;

@@ -1429,8 +1429,9 @@ describe('pollUntilEventGrid - Wartephase pollt bis echte Events da sind (Defekt
 
   test('Ausgaenge sind genau die dokumentierten Werte', () => {
     // Defekt 3: 'not-found' kam hinzu — 'found' ist nur noch bei tatsaechlich
-    // gelesenen Event-Knoten erlaubt.
-    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'not-found', 'budget-exhausted', 'not-rendered']);
+    // gelesenen Event-Knoten erlaubt. Bug 3: 'not-polled' kam hinzu — Budget
+    // vorhanden, aber 0 Polls ist ein Logikfehler und kein DOM-Zustand.
+    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'not-found', 'budget-exhausted', 'not-rendered', 'not-polled']);
   });
 });
 
@@ -1927,7 +1928,14 @@ describe('resolveEventWaitOutcome - Ausgang an die BEOBACHTUNG koppeln (Defekt 3
   });
 
   test('Ausgaenge sind genau die dokumentierten Werte', () => {
-    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'not-found', 'budget-exhausted', 'not-rendered']);
+    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'not-found', 'budget-exhausted', 'not-rendered', 'not-polled']);
+  });
+
+  test('die Warte-Warnung benennt not-polled als Logikfehler, nicht als leeres Grid', () => {
+    const w = eventWaitWarning({ outcome: 'not-polled', waitedMs: 0, budgetMs: 20000 });
+    assert.ok(w, 'not-polled braucht eine eigene Warnung');
+    assert.ok(/Logikfehler/.test(w), `Warnung benennt die Fehlerklasse: ${w}`);
+    assert.ok(!/leeren Kalender/.test(w), 'darf nicht als leerer Kalender erscheinen');
   });
 
   test('die Warte-Warnung erklaert not-found genauso deutlich wie budget-exhausted', () => {
@@ -2066,7 +2074,7 @@ describe('collectCalendarEventLabels - Quellen-Leiter + Struktur-Census (Defekt 
     await withFakeDocument(gridDoc(), async () => {
       const res = await collectCalendarEventLabels(fakePage, { weekStartIso: '2026-09-28', fast: true });
       assert.equal(res.eventElementsFound, 0, 'im fast-Mode wird die Geometrie nicht ausgewertet');
-      assert.deepEqual(res.census, { skipped: 'fast-mode' });
+      assert.deepEqual(res.census, { skipped: 'fast-mode', loadingNodes: 0 });
       assert.equal(res.structureNodes.length, 0);
     });
   });
