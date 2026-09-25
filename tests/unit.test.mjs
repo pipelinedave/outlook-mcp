@@ -1679,6 +1679,18 @@ describe('mapYToClockTime - Chip y-Position -> Startzeit (Defekt 1, Geometrie)',
     assert.equal(mapYToClockTime(ruler, 100), null);
   });
 
+  test('unterhalb des letzten Rasterpunkts -> linear fortgeschrieben (Stundenhöhe belegt)', () => {
+    // Raster endet 17:00 (top 740). Ein Chip auf top 860 liegt 2h weiter unten.
+    assert.equal(mapYToClockTime(ruler, 860), '19:00');
+    // 30 Minuten Toleranz: knapp unterhalb -> noch keine Verschiebung
+    assert.equal(mapYToClockTime(ruler, 760), '17:00');
+  });
+
+  test('ohne belegte Stundenhöhe wird unterhalb NICHT geraten', () => {
+    const oneEntry = [{ time: '08:00', top: 200 }];
+    assert.equal(mapYToClockTime(oneEntry, 500), null);
+  });
+
   test('leeres/ungueltiges Raster -> null statt Rateversuch', () => {
     assert.equal(mapYToClockTime([], 300), null);
     assert.equal(mapYToClockTime(null, 300), null);
@@ -1785,13 +1797,14 @@ describe('deriveEventLabelFromNode - Label aus einem beliebigen Grid-Knoten', ()
 
   test('5) NUR Titel im Text -> Zeit+Datum werden aus der Geometrie abgeleitet', () => {
     // Chip ohne JEDE Beschriftung ausser dem Titel — der Defekt-1-Fall.
-    // 150px Hoehe bei 60px/Stunde = 2,5h ab 13:00 -> 15:30.
+    // Raster 8-13 Uhr (60px/Stunde ab top 200), Chip top 620 -> 15:00
+    // (Fortschreibung ueber das Rasterende hinaus), Hoehe 150px -> 2,5h.
     const r = deriveEventLabelFromNode(node({ text: 'Block' }), { pats, ...geo });
     assert.equal(r.reason, null);
     assert.equal(r.source, 'text');
     assert.equal(r.timeSource, 'geometry');
-    // Spalte 250px -> Index 1 = Dienstag 29.09.; top 620px -> 13:00
-    assert.equal(r.label, 'Block, 13:00 to 15:30, Tuesday, September 29, 2026');
+    // Spalte 250px -> Index 1 = Dienstag 29.09.
+    assert.equal(r.label, 'Block, 15:00 to 17:30, Tuesday, September 29, 2026');
   });
 
   test('5b) Toolbar-Text AUSSERHALB des Grids wird NIE zum Event', () => {
@@ -1984,5 +1997,72 @@ describe('collectCalendarEventLabels - Quellen-Leiter + Struktur-Census (Defekt 
     assert.equal(res.eventElementsFound, 0);
     assert.equal(res.labels.length, 0);
     assert.equal(res.collectError, 'Execution context was destroyed');
+  });
+
+  // -------------------------------------------------------------------
+  // Der Geometrie-Weg muss auch WIRKLICH durch den Kollektor laufen —
+  // eine nur unit-getestete Hilfsfunktion waere toter Code.
+  // -------------------------------------------------------------------
+  // Fake-DOM einer OWA-Wochenansicht: 3 Tageskoepfe, Stundenraster 8-18 Uhr
+  // (60px je Stunde, Oberkante 200) und ein Chip "Block" ohne JEDE Beschriftung
+  // ausser Titel — genau der Fall, an dem [aria-label] scheitert.
+  const gridDoc = () => {
+    const col = (left) => ({ tagName: 'TH', getAttribute: (n) => (n === 'role' ? 'columnheader' : null), getBoundingClientRect: () => ({ left, top: 120, width: 100, height: 30, x: left, y: 120 }), innerText: '', attributes: [] });
+    const hour = (top) => ({ tagName: 'DIV', getAttribute: () => null, getBoundingClientRect: () => ({ left: 10, top, width: 40, height: 20, x: 10, y: top }), innerText: `${String((top - 200) / 60 + 8).padStart(2, '0')}:00`, attributes: [] });
+    const chip = () => ({ tagName: 'DIV', className: 'ms-Cal-event', getAttribute: () => null, getBoundingClientRect: () => ({ left: 250, top: 560, width: 90, height: 180, x: 250, y: 560 }), innerText: 'Block', offsetParent: null, children: [], attributes: [] });
+    const els = [col(100), col(200), col(300)].concat([200, 260, 320, 380, 440, 500, 560, 620, 680, 740, 800].map(hour), [chip()]);
+    return {
+      querySelectorAll: (sel) => {
+        if (sel === '[role="columnheader"], [role="grid"] th, th') return [col(100), col(200), col(300)];
+        if (sel === '*') return els;
+        return [];
+      },
+      querySelector: () => null,
+      body: null
+    };
+  };
+
+  test('Geometrie-Weg laeuft durch den Kollektor: Chip ohne aria-label wird zum Label', async () => {
+    await withFakeDocument(gridDoc(), async () => {
+      const res = await collectCalendarEventLabels(fakePage, { weekStartIso: '2026-09-28' });
+      assert.equal(res.eventElementsFound, 1, `erwartet 1 Event, Labels: ${JSON.stringify(res.labels)}`);
+      assert.equal(res.sourceUsed, 'text+geometry');
+      // Spalte 250px -> Index 1 = Dienstag; top 560px -> 14:00; Hoehe 180px -> 3h
+      assert.equal(res.labels[0], 'Block, 14:00 to 17:00, Tuesday, September 29, 2026');
+      // und der echte Parser kann es lesen
+      const slot = parseEventLabel(res.labels[0], 2026);
+      assert.equal(slot.date, '2026-09-29');
+      assert.equal(slot.start, '14:00');
+      assert.equal(slot.end, '17:00');
+      assert.equal(slot.title, 'Block');
+    });
+  });
+
+  test('Geometrie braucht Tageskoepfe+WOCHENSTART: ohne weekStartIso wird nichts geraten', async () => {
+    await withFakeDocument(gridDoc(), async () => {
+      const res = await collectCalendarEventLabels(fakePage); // KEIN weekStartIso
+      assert.equal(res.eventElementsFound, 0);
+      assert.equal(res.labels.length, 0);
+    });
+  });
+
+  test('fast-Mode ueberspringt den Struktur-Scan (Poll-Budget) und liefert trotzdem Attribute', async () => {
+    await withFakeDocument(gridDoc(), async () => {
+      const res = await collectCalendarEventLabels(fakePage, { weekStartIso: '2026-09-28', fast: true });
+      assert.equal(res.eventElementsFound, 0, 'im fast-Mode wird die Geometrie nicht ausgewertet');
+      assert.deepEqual(res.census, { skipped: 'fast-mode' });
+      assert.equal(res.structureNodes.length, 0);
+    });
+  });
+
+  test('Census liefert Tages-Spalten und Zeitraster (Beweis fuer die Geometrie)', async () => {
+    await withFakeDocument(gridDoc(), async () => {
+      const res = await collectCalendarEventLabels(fakePage, { weekStartIso: '2026-09-28' });
+      assert.equal(res.census.dayColumns.length, 3);
+      assert.ok(res.census.clockRuler.length >= 3, `Raster: ${JSON.stringify(res.census.clockRuler)}`);
+      assert.ok(res.census.structureNodes >= 1);
+      assert.ok(res.census.scanned.length >= 1);
+      assert.ok('tag' in res.census.scanned[0] && 'rect' in res.census.scanned[0]);
+    });
   });
 });

@@ -449,20 +449,42 @@ export function mapXToDayColumn(columns = [], x) {
 }
 
 // Ordnet eine y-Position dem untersten Zeitraster-Eintrag oberhalb zu -> Startzeit.
-export function mapYToClockTime(ruler = [], y, { tolerancePx = 24 } = {}) {
+// Liegt der Chip UNTERHALB des letzten Rasterpunkts (Rastersonde endet z.B. um
+// 18 Uhr, das Event laeuft bis 20), wird linear fortgeschrieben — aber nur, wenn
+// die Stundenhöhe belegt ist. Ohne Beleg: null, NIE geraten.
+export function mapYToClockTime(ruler = [], y, { tolerancePx = 24, hourPx = 0 } = {}) {
   if (!Array.isArray(ruler) || !ruler.length) return null;
   const ys = Number(y);
   if (!Number.isFinite(ys)) return null;
   let best = null;
+  let last = null;
   for (const entry of ruler) {
     if (!entry) continue;
     const time = normalizeClockTime(entry.time || entry.label || entry.text);
     const top = Number(entry.top);
     if (!time || !Number.isFinite(top)) continue;
+    if (!last || top > last.top) last = { time, top };
     if (top > ys + tolerancePx) continue; // Rasterpunkt liegt UNTER dem Chip-Anfang
     if (best === null || top > best.top) best = { time, top };
   }
-  return best ? best.time : null;
+  if (best) {
+    // Chip startet DEUTLICH unterhalb der letzten Rasterlinie: nur mit belegter
+    // Stundenhöhe fortschreiben, sonst ablehnen (lieber keine Zeit als eine
+    // falsche — genau das war die "header-misclassified"-Falle in Runde 4/6).
+    if (last && ys > best.top + tolerancePx) {
+      const px = Number(hourPx) > 0 ? Number(hourPx) : estimateHourPx(ruler);
+      if (px <= 0) return null;
+      const steps = Math.round((ys - best.top) / px);
+      return steps > 0 ? addMinutes(best.time, steps * 60) : best.time;
+    }
+    return best.time;
+  }
+  const px = Number(hourPx) > 0 ? Number(hourPx) : estimateHourPx(ruler);
+  if (px > 0 && last && ys > last.top + tolerancePx) {
+    const steps = Math.round((ys - last.top) / px);
+    if (steps > 0) return addMinutes(last.time, steps * 60);
+  }
+  return null;
 }
 
 // Stundenhöhe in px aus dem Zeitraster (Median der Abstände, gegen Rauschen
@@ -603,7 +625,7 @@ function geometryLabel(node, { columns = [], ruler = [], weekStartIso = null } =
   base.setUTCDate(base.getUTCDate() + colIndex);
   const dateIso = toIsoDate(base);
   const hourPx = estimateHourPx(ruler);
-  const start = mapYToClockTime(ruler, rect.top);
+  const start = mapYToClockTime(ruler, rect.top, { hourPx });
   if (!start) return null;
   let end = null;
   if (hourPx > 0 && Number(rect.height) > 0) {
@@ -908,11 +930,11 @@ const SCAN_MAX_ELEMENTS = 6000;
 // Sucht die Kandidaten-Knoten und liefert Label-Liste + Diagnostik.
 // `weekStartIso` (Montag der gerenderten Woche) ermoeglicht die Datums-
 // ableitung aus der Spaltenposition.
-export async function collectCalendarEventLabels(page, { preferSelector = null, weekStartIso = null } = {}) {
+export async function collectCalendarEventLabels(page, { preferSelector = null, weekStartIso = null, fast = false } = {}) {
   let collectError = null;
   try {
     const res = await page.evaluate(
-      ({ pats, plan, clockStrict, weekStart }) => {
+      ({ pats, plan, clockStrict, weekStart, fastMode }) => {
         const re = {};
         for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
         const clockOnlyRe = new RegExp(clockStrict, 'i');
@@ -979,17 +1001,19 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
 
         // 1) Tages-Spalten aus den Tageskoepfen (x-Lage der Wochentage)
         const dayColumns = [];
+        if (!fastMode) {
         for (const el of safeQSA('[role="columnheader"], [role="grid"] th, th')) {
           const r = rectOf(el);
           if (areaOf(r)) dayColumns.push({ left: r.left, width: r.width, bottom: r.top + r.height, text: norm(safeAttr(el, 'aria-label') || (el.textContent || '')).slice(0, 40) });
         }
         dayColumns.sort((a, b) => a.left - b.left);
+        }
 
         // 2) Zeitraster: Elemente, deren Text NUR eine Uhrzeit ist
         const clockRuler = [];
         let scannedCount = 0;
         let truncated = false;
-        for (const el of safeQSA('*')) {
+        for (const el of (fastMode ? [] : safeQSA('*'))) {
           if (scannedCount >= 6000) { truncated = true; break; }
           scannedCount++;
           const r = rectOf(el);
@@ -1080,7 +1104,11 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
 
         for (const step of plan) {
           let nodes = [];
-          if (step.selector) {
+          if (fastMode) {
+            // Nur dokumentweite Attribut-Selektoren — kein '*'-Durchlauf.
+            if (!step.selector) { sourceTried.push({ source: step.source, selector: '(struktur)', nodes: 0, matched: 0, skipped: 'fast-mode' }); continue; }
+            for (const el of safeQSA(step.selector)) nodes.push(describe(el));
+          } else if (step.selector) {
             for (const el of safeQSA(step.selector)) nodes.push(describe(el));
           } else if (step.source === 'text') {
             nodes = structureNodes;
@@ -1111,18 +1139,59 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
           headerLikeLabels: cap(dedupe(headerLike), 20),
           nonEventLabels: cap(dedupeReasons(nonEventLabels), 20),
           candidates: cap(candidates, 20),
-          census: {
-            scannedCount,
-            truncated,
-            dayColumns: cap(dayColumns, 10),
-            clockRuler: cap(clockRuler, 16),
-            structureNodes: structureNodes.length,
-            scanned: cap(structureNodes, CENSUS_MAX_NODES)
-          }
+          // Rohe Struktur-Knoten fuer die Node-seitige Geometrie-Ableitung
+          // (grosszuegiges Limit: das ist der eigentliche Datentraeger).
+          structureNodes: fastMode ? [] : cap(structureNodes, 200),
+          census: fastMode
+            ? { skipped: 'fast-mode' }
+            : {
+              scannedCount,
+              truncated,
+              dayColumns: cap(dayColumns, 10),
+              clockRuler: cap(clockRuler, 16),
+              structureNodes: structureNodes.length,
+              scanned: cap(structureNodes, CENSUS_MAX_NODES)
+            }
         };
       },
-      { pats: EVENT_LABEL_PATTERNS, plan: eventSourcePlan(preferSelector), clockStrict: CLOCK_LABEL_PATTERN, weekStart: weekStartIso }
+      { pats: EVENT_LABEL_PATTERNS, plan: eventSourcePlan(preferSelector), clockStrict: CLOCK_LABEL_PATTERN, weekStart: weekStartIso, fastMode: fast === true }
     );
+    // GEOMETRIE-Pfad (Node-seitig, gleiche Prueflogik wie der Rest):
+    // Struktur-Knoten aus dem Grid-Body werden ueber deriveEventLabelFromNode
+    // bewertet — das ist der Weg, der OHNE aria-label/Title/data-* auskommt
+    // (Wochentag aus der Spalten-x, Zeit aus dem Raster-y).
+    const structureNodes = Array.isArray(res.structureNodes) ? res.structureNodes : [];
+    const columns = (res.census && res.census.dayColumns) || [];
+    const ruler = (res.census && res.census.clockRuler) || [];
+    const geoLabels = [];
+    const geoRejections = [];
+    for (const n of structureNodes) {
+      const d = deriveEventLabelFromNode(n, {
+        pats: EVENT_LABEL_PATTERNS,
+        columns,
+        ruler,
+        weekStartIso
+      });
+      if (d.label) geoLabels.push(d.label);
+      else if (d.reason && d.reason !== 'no-event-signature') {
+        geoRejections.push({ label: (n.ariaLabel || n.title || n.text || '').slice(0, 120), reason: d.reason, tag: n.tag, cls: n.cls });
+      }
+    }
+    if (geoLabels.length > 0) {
+      res.labels = res.labels.concat(geoLabels);
+      // Dedupe + ehrliche Zaehlung nach der Zusammenfuehrung
+      const seen = new Set();
+      res.labels = res.labels.filter((l) => (seen.has(l) ? false : (seen.add(l), true))).slice(0, 60);
+      res.eventElementsFound = res.labels.length;
+      if (!res.sourceUsed) res.sourceUsed = 'text+geometry';
+    }
+    if (geoRejections.length) {
+      const known = new Set(res.nonEventLabels.map((e) => e.label));
+      for (const g of geoRejections) {
+        if (!known.has(g.label)) { known.add(g.label); res.nonEventLabels.push(g); }
+      }
+      res.nonEventLabels = res.nonEventLabels.slice(0, 20);
+    }
     return { collectError: null, ...res };
   } catch (e) {
     collectError = String((e && e.message) || e).slice(0, 160);
@@ -2153,45 +2222,24 @@ export class OwaClient {
       return waitOnCalendarUrl(phase(4000));
     };
 
-    // Event-Grid-Fertig-Beweis (Iteration 7, Defekt 1 — HAUPTURSACHE): NICHT
-    // "irgendein [aria-label] mit einer Uhrzeit". Runde 6 bekam vom Zeit-Indikator
-    // "calendar view, current time: Fri 22:31" die Antwort JA (22:31 matchte
-    // /\d{1,2}:\d{2}/), brach nach ~4s ab und lieferte 0 Slots. Verlangt wird jetzt
-    // ein echtes Zeitfenster ("HH:MM to/bis/- HH:MM") oder Ganztag; Uhrzeit- und
-    // Navigations-Indikatoren sowie Work-Location sind explizit ausgeschlossen.
-    // Selektor-Memory: der zuletzt erfolgreiche Selektor wird zuerst probiert.
+    // Event-Grid-Fertig-Beweis (Defekt 1+3): Es gibt ab jetzt NUR NOCH EINE
+    // Event-Sammlung — collectCalendarEventLabels. Vorher existierten ZWEI
+    // unabhaengige Implementierungen (probeEventGrid hier inline, der
+    // Kollektor in collectCalendarEventLabels). Genau daraus entstand der
+    // Widerspruch des Smoke-Tests: die Warte-Heuristik meldete "found",
+    // waehrend die Extraktion 0 Elemente fand — beide konnten gleichzeitig
+    // "wahr" sein, weil sie unterschiedliche Selektoren kannten.
+    //
+    // Die Warte-Probe laeuft im 'fast'-Modus: nur die dokumentweiten
+    // Attribut-Selektoren, KEIN '*'-Durchlauf (der kostet auf einer echten
+    // OWA-Seite hunderte ms und wuerde das Poll-Budget auffressen). Die
+    // vollstaendige Sammlung inkl. Struktur-Scan laeuft genau einmal danach
+    // und entscheidet ueber den Ausgang.
     let lastEventSelector = null;
-    const probeEventGrid = async () => page.evaluate(({ pats, prefer }) => {
-      const re = {};
-      for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
-      const isGridEvent = (label) => {
-        if (re.nonEvent.test(label)) return false;
-        if (re.gridBlocker.test(label)) return false;
-        return re.timeRange.test(label) || re.allDay.test(label);
-      };
-      const order = [];
-      if (prefer) order.push(prefer);
-      order.push('[role="button"][aria-label]', '[aria-label]');
-      const seen = [];
-      for (const sel of order) {
-        if (seen.includes(sel)) continue;
-        seen.push(sel);
-        let els = null;
-        try { els = document.querySelectorAll(sel); } catch (e) { els = null; }
-        if (!els) continue;
-        for (let i = 0; i < els.length; i++) {
-          if (isGridEvent(els[i].getAttribute('aria-label') || '')) {
-            return { found: true, selectorUsed: sel };
-          }
-        }
-      }
-      return { found: false, selectorUsed: null };
-    }, { pats: EVENT_LABEL_PATTERNS, prefer: lastEventSelector }).catch(() => ({ found: false, selectorUsed: null }));
-
     const hasEventElements = async () => {
-      const r = await probeEventGrid();
-      if (r.found && r.selectorUsed) lastEventSelector = r.selectorUsed;
-      return r.found;
+      const r = await collectCalendarEventLabels(page, { preferSelector: lastEventSelector, weekStartIso: mondayIso, fast: true });
+      if (r.eventElementsFound > 0 && r.selectorUsed) lastEventSelector = r.selectorUsed;
+      return r.eventElementsFound > 0;
     };
 
     // Zustandswarten statt starrem Timeout: auf gerenderten Wochen-/Tages-Header
@@ -2502,20 +2550,24 @@ export class OwaClient {
       );
     }
 
-    // dataQuality: 'verified' = Wochen-Header gelesen und passt zum Range;
-    // 'unverified' = Header nicht lesbar (Slots werden trotzdem geliefert, mit Warnung).
-    const dataQuality = (rendered.startDate && rendered.endDate) ? 'verified' : 'unverified';
+    // Wochen-Nachweis (unabhaengig von den Events). Der Header-/Header-Datum-
+    // Pfad funktioniert und bleibt unveraendert — nur die BEDEUTUNG von
+    // dataQuality wird ehrlich (siehe resolveDataQuality weiter unten).
+    const weekVerified = Boolean(rendered.startDate && rendered.endDate);
 
-    // ECHTE Event-Wartephase (Iteration 7, Defekt 1 — HAUPTURSACHE der 0 Slots):
-    // Nach bestätigter Wochen-Verifikation nicht mehr nur 2,5s Gnadenfrist, sondern
-    // GEZIELT auf echte Event-Labels pollen. Runde 6 brach nach ~4s ab, weil der
-    // Uhrzeit-Indikator als Event galt; das Grid rendert erst nach ~17s.
-    // Budgetgebunden: min(20s, Restzeit - 5s Reserve) — die Reserve trägt Extraktion
-    // + Diagnostik, damit der Call nie ins MCP-Client-Timeout läuft. Bei
-    // Budgeterschöpfung geht es mit aktuellem Stand + Warnung weiter (kein Fehler).
-    let eventWaitBudget = eventWaitBudgetMs(remaining());
-    let eventWait = { found: Boolean(hasEvents), outcome: hasEvents ? 'found' : 'budget-exhausted', waitedMs: 0, polls: 0 };
-    if (!hasEvents) {
+    // ECHTE Event-Wartephase (Defekt 1+3): Nach bestaetigter Wochen-
+    // Verifikation wird GEZIELT auf echte Event-Knoten gepollt (nicht auf
+    // irgendein [aria-label] mit Uhrzeit). Budgetgebunden:
+    // min(20s, Restzeit - 5s Reserve) — die Reserve traegt Extraktion +
+    // Diagnostik, damit der Call nie ins MCP-Client-Timeout laeuft.
+    const eventWaitBudget = eventWaitBudgetMs(remaining());
+    let eventWait = { found: false, outcome: 'not-found', waitedMs: 0, polls: 0 };
+    if (hasEvents) {
+      // Die schnelle Probe hat bereits Event-Knoten gesehen: nicht pollen.
+      // Der endgueltige Ausgang wird trotzdem unten aus der VOLLSTAENDIGEN
+      // Sammlung abgeleitet — eine stale Vorabmeldung darf nichts mehr entscheiden.
+      eventWait = { found: true, outcome: 'pending', waitedMs: 0, polls: 0 };
+    } else {
       eventWait = await pollUntilEventGrid({
         hasEvents: hasEventElements,
         budgetMs: eventWaitBudget,
@@ -2529,7 +2581,31 @@ export class OwaClient {
     // derselbe Pfad wie die Diagnostik, toleranter Sichtbarkeitsfilter (offsetParent
     // ist KEIN Hard-K.O. für Events), inkl. Roh-Diagnostik für den 0-Slot-Fall.
     // Iteration 7: der zuletzt erfolgreiche Selektor wird ZUERST probiert.
-    const eventCollection = await collectCalendarEventLabels(page, { preferSelector: lastEventSelector });
+    // ABSCHLIESSENDE Sammlung: voller Pfad inkl. Struktur-Scan (Text + Geometrie).
+    // Der zuletzt erfolgreiche Selektor wird ZUERST probiert. Diese Sammlung —
+    // nicht die Vorab-Probe — entscheidet ueber eventElementsFound, dataQuality
+    // und eventWaitOutcome.
+    const eventCollection = await collectCalendarEventLabels(page, {
+      preferSelector: lastEventSelector,
+      weekStartIso: rendered.startDate || mondayIso
+    });
+    // Defekt 3: Der Ausgang der Wartephase wird an die TATSAECHLICH in der
+    // Abschluss-Sammlung beobachtete Event-Elementzahl gekoppelt. 'found' ist
+    // damit unmöglich, wenn 0 Knoten gelesen wurden (der Smoke-Test meldete
+    // "found" bei waitedForEventsMs:0 UND eventElementsFound:0).
+    eventWait.outcome = resolveEventWaitOutcome({
+      polls: eventWait.polls,
+      eventElementsFound,
+      waitBudgetMs: eventWaitBudget
+    });
+    eventWait.found = eventElementsFound > 0;
+    hasEvents = eventWait.found;
+
+    // Defekt 2: dataQuality nur noch als 'verified', wenn die Woche passt UND
+    // echte Event-Knoten gelesen wurden. Sonst 'unverified-empty' — dann ist
+    // busySlots:[] AUSDRUECKLICH kein "Kalender ist frei".
+    const dataQuality = resolveDataQuality({ weekVerified, eventElementsFound });
+
     const rawLabels = eventCollection.labels;
     const eventElementsFound = eventCollection.eventElementsFound;
     const selectorUsed = eventCollection.selectorUsed;
@@ -2595,6 +2671,12 @@ export class OwaClient {
       '(Datum/Zeit strukturiert geparst, Work-Location-Pseudo-Slots entfernt, Zeit-Duplikate zusammengeführt, ' +
       'per Wortliste klassifiziert, auf den angefragten Zeitraum gefiltert). ' +
       'Navigation: startdate-Param ist Primärsignal — bestätigt der sichtbare Wochen-Header (Range oder ' +
+    if (dataQuality === 'unverified-empty') {
+      note += ` WARNUNG: Woche ${rendered.startDate || '?'} ist verifiziert, aber im DOM wurden ` +
+        `0 Event-Knoten gelesen (Quellen: ${(eventCollection.sourceTried || []).map((s) => s.source).join(', ') || 'keine'}). ` +
+        `busySlots=[] bedeutet hier KEINEN leeren Kalender, sondern ein nicht auslesbares Grid — ` +
+        `NICHT als "frei" verwenden.`;
+    }
       'Prev/Next-Ableitung) die Zielwoche, sind KEINE Button-Klicks nötig; Buttons nur bei Abweichung.';
     if (dataQuality === 'unverified') {
       note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
@@ -2602,9 +2684,9 @@ export class OwaClient {
     if (dataQuality === 'verified' && abortReason !== 'none') {
       note += ` HINWEIS: Navigation vorzeitig beendet (${abortReason}); die angezeigte Woche wurde verifiziert.`;
     }
-    if (eventWait.outcome === 'budget-exhausted') {
-      note += ` HINWEIS: Auf echte Event-Labels wurde ${Math.round(eventWait.waitedMs)}ms lang gepollt ` +
-        `(Budget ${eventWaitBudget}ms) — ohne Treffer. 0 Slots bedeuten dann nicht sicher "leerer Kalender".`;
+    if (eventWait.outcome === 'not-found' || eventWait.outcome === 'budget-exhausted') {
+      note += ` HINWEIS: Auf echte Event-Knoten wurde ${Math.round(eventWait.waitedMs)}ms lang gepollt ` +
+        `(${eventWait.polls} Polls, Budget ${eventWaitBudget}ms) — ohne Treffer. 0 Slots bedeuten dann nicht sicher "leerer Kalender".`;
     }
     if (rendered.endDate && rangeEndDate > rendered.endDate) {
       note += ` HINWEIS: Der angefragte Range endet (${rangeEndDate}) nach der gerenderten Woche (${rendered.endDate}) — spätere Tage sind nicht enthalten.`;
@@ -2616,7 +2698,13 @@ export class OwaClient {
       end: endDt,
       calendar: 'Firmenkalender (Outlook Web)',
       renderedWeek: {
+      // Wochen-Nachweis getrennt von der Event-Belastbarkeit (Defekt 2): die
+      // Wochen-Verifikation funktioniert und bleibt so sichtbar.
+      weekVerified,
         text: rendered.text,
+      // Maschinenlesbare Ehrlichkeit: nur bei dataQuality==='verified' sind
+      // busySlots eine belastbare Aussage ueber Belegung.
+      busySlotsReliable: isBelievableBusySlots(dataQuality),
         startDate: rendered.startDate,
         endDate: rendered.endDate
       },
@@ -2625,14 +2713,14 @@ export class OwaClient {
       count: busySlots.length,
       note
     };
-    // Reiche Diagnostik mitliefern (Runde-3/4/5-Forderung):
-    //  - bei unverifizierten Daten (Wochen-Header nicht lesbar), UND
-    //  - bei 0 Slots trotz verifizierter Woche (Runde-5-Kernlücke): nur so ist ein
-    //    echter Free-Tag von einem Extraktions-Miss unterscheidbar.
+    // Reiche Diagnostik mitliefern — bei allem, was NICHT belastbar ist:
+    //  - dataQuality != 'verified' (Woche oder Events unlesbar),
+    //  - 0 Slots trotz gelesener Events (Extraktions-Miss),
+    //  - 0 Event-Knoten (Grid nicht auslesbar).
     // Enthält URL (inkl. früher Snapshot), Header-/Tageskopf-Kandidaten, ARIA-Sample,
-    // Klick-Protokoll, Abbruchgrund, Budget-Report sowie die Slot-Extraktions-Diagnostik
-    // (eventElementsFound/selectorUsed/rawEventLabels/rejectionReasons).
-    if (dataQuality === 'unverified' || busySlots.length === 0 || eventWait.outcome === 'budget-exhausted') {
+    // Klick-Protokoll, Abbruchgrund, Budget-Report, die Quellen-Leiter
+    // (sourceTried/sourceUsed) und den Struktur-Census der echten Grid-DOM.
+    if (!result.busySlotsReliable || busySlots.length === 0 || eventWait.outcome !== 'found') {
       const diag = assembleFreeBusyDiagnostics({
         fresh: await freshDiag(),
         early: earlyDiagnostics,
@@ -2642,6 +2730,14 @@ export class OwaClient {
         eventElementsFound,
         selectorUsed,
         rawEventLabels: rawLabels.slice(0, 20),
+      diag.weekVerified = weekVerified;
+      diag.dataQuality = dataQuality;
+      diag.eventWaitPolls = eventWait.polls;
+      diag.eventWaitBudgetMs = eventWaitBudget;
+      if (eventCollection.sourceUsed) diag.sourceUsed = eventCollection.sourceUsed;
+      if (eventCollection.sourceTried) diag.sourceTried = eventCollection.sourceTried;
+      if (eventCollection.census) diag.census = eventCollection.census;
+      if (eventCollection.collectError) diag.collectError = eventCollection.collectError;
         rejectionReasons: rejectionReasons.slice(0, 40),
         waitedForEventsMs: Math.round(eventWait.waitedMs),
         eventWaitOutcome: eventWait.outcome
