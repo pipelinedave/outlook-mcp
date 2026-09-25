@@ -1832,6 +1832,164 @@ export function renderedWeekContains(rendered, dateIso) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Bug 2 — der Zielwochen-Guard ist ein stiller No-op (Live-Befund 25.09.2026)
+// ---------------------------------------------------------------------------
+// Live-Trace:
+//   0. aria-label-de  found:false  clicked:false
+//   1. aria-label-en  found:true   clicked:true  verified:'unverified'
+//   2. skipped:'target-week-verified'  renderedWeek:'2026-09-28'  clicked:false
+// `note:'guard-vor-klick'` erscheint NIRGENDS.
+//
+// Ursache, aus dem Trace abgeleitet (kein Raten): evaluateClickVerification
+// liefert 'unverified' genau dann, wenn prevStart ODER newStart fehlt. Eintrag 2
+// stammt aus dem Zweig `rendered = forced.week` und zeigt einen DATIERBAREN
+// Header ('2026-09-28', Skip verlangt startDate+endDate). Also war newStart
+// gesetzt — und damit zwingend prevStart === null. Beweis:
+//   node proof.mjs
+//
+// Bei prevStart === null war beim Klick KEIN Wochen-Header gerendert. Der alte
+// Guard fragte ausschliesslich "ist die Zielwoche schon da?" und
+// renderedWeekContains({startDate:null,...}) ist zwangslaeufig false. Der Guard
+// war also ein No-op GENAU in dem Fall, fuer den er gebaut wurde, und er
+// failte OPEN und still: kein Probe-Eintrag, kein note, kein Abbruchgrund.
+// Geklickt wurde damit auf einer noch ladenden Ansicht — das ist exakt die
+// Wochen-Skip-Gefahr (KW 39 -> KW 41), die 8ae0eec verhindern sollte.
+//
+// Der Guard bekommt deshalb eine zweite, notwendige Bedingung: die Ansicht
+// muss ueberhaupt gerendert sein. Ohne datierbaren Header ist die Wochen- und
+// damit auch die Button-Position unbekannt — ein Klick darauf ist nicht
+// vertretbar, egal welches Week-Button-Element man trifft.
+export const WEEK_CLICK_GUARD_REASONS = {
+  targetReached: 'target-week-reached',
+  viewNotReady: 'view-not-ready',
+  click: 'click'
+};
+
+// EIN Entscheidungs-Funktion, benutzt von der aeusseren Schritt-Schleife UND
+// vom Klickpfad. Beide Stellen konnten vorher auseinanderlaufen — genau das war
+// der Live-Befund. Reine Funktion, damit der Draht testbar ist.
+export function weekClickDecision({ rendered, targetStart, hasEvents = false } = {}) {
+  if (renderedWeekContains(rendered, targetStart)) {
+    return { skip: true, reason: WEEK_CLICK_GUARD_REASONS.targetReached, rendered: rendered || null, clickable: false };
+  }
+  // Ansicht nicht gerendert? Dann ist die Wochen-/Button-Position unbekannt.
+  const headerRendered = Boolean(rendered && rendered.startDate && rendered.endDate);
+  if (!headerRendered && !hasEvents) {
+    return { skip: true, reason: WEEK_CLICK_GUARD_REASONS.viewNotReady, rendered: rendered || null, clickable: false };
+  }
+  return { skip: false, reason: WEEK_CLICK_GUARD_REASONS.click, rendered: rendered || null, clickable: true };
+}
+
+// Protokolleintrag fuer eine Guard-Entscheidung. BEIDE Ausgaenge werden
+// protokolliert — ein Guard, der nichts aufschreibt, ist nicht von einem
+// Guard, der nicht existiert, unterscheidbar. Genau daran ist der Live-Befund
+// gescheitert: `note:'guard-vor-klick'` hätte sofort verraten, dass der Guard
+// nicht griff.
+export function weekProbeGuardEntry(decision, note = 'guard-vor-klick') {
+  const renderedStart = decision && decision.rendered ? decision.rendered.startDate : null;
+  if (decision && decision.reason === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
+    return {
+      skipped: 'view-not-ready',
+      renderedWeek: renderedStart || null,
+      clicked: false,
+      guard: WEEK_CLICK_GUARD_REASONS.viewNotReady,
+      note
+    };
+  }
+  return { ...weekProbeSkipEntry(renderedStart, note), guard: WEEK_CLICK_GUARD_REASONS.targetReached };
+}
+
+// ---------------------------------------------------------------------------
+// Der ECHTE Klickpfad — exportiert und per Dependency-Injection testbar
+// ---------------------------------------------------------------------------
+// Bis 0d47105 lag dieser Code als Closure in getFreeBusy. Der Test
+// (tests/week-probe-guard.test.mjs) baute die Schleife NACH — er rief nie
+// diesen Code. Genau darum war der Guard "durch Code-Review belegt, nicht
+// durch einen Test" und der Live-Befund kam trotzdem durch.
+//
+// Diese Funktion IST der Produktionspfad; getFreeBusy ruft sie mit denselben
+// Abhaengigkeiten auf. Der Test fährt damit den Weg Guard -> Probe -> Klick
+// wirklich, statt ihn zu imitieren.
+export async function runWeekButtonClick({
+  direction = 1,
+  prevStart = null,
+  targetStart = null,
+  page = null,
+  probe = [],
+  candidates = null,
+  readWeek = null,
+  hasEvents = false,
+  afterClick = null,
+  clickWaitMs = FREEBUSY_CLICK_RENDER_WAIT_MS,
+  clickCostMs = FREEBUSY_CLICK_RENDER_WAIT_MS,
+  remainingMs = () => Infinity
+} = {}) {
+  const list = Array.isArray(candidates) && candidates.length ? candidates : weekButtonCandidates(direction);
+  const notReached = (reason, rendered) => ({
+    clicked: false, week: rendered || null, verified: 'guard-blocked', foundAny: false, clickedAny: false,
+    targetReached: reason === WEEK_CLICK_GUARD_REASONS.targetReached,
+    guard: reason
+  });
+
+  // Der Header-Read ist memoisiert: nur der erste Kandidat kostet einen Read.
+  // Nach jedem Klick wird er verworfen, weil erst der Klick die Woche aendern kann.
+  let targetWeekChecked = false;
+  let targetWeekNow = null;
+  const guardNow = async () => {
+    if (!targetWeekChecked) {
+      targetWeekChecked = true;
+      let wk = null;
+      try { wk = await readWeek(); } catch (e) { wk = null; }
+      targetWeekNow = weekClickDecision({ rendered: wk, targetStart, hasEvents });
+    }
+    return targetWeekNow;
+  };
+  let foundAny = false;
+  let clickedAny = false;
+
+  for (const cand of list) {
+    // GUARD VOR DER PROBE — fuer JEDE Entscheidung wird protokolliert.
+    const decision = await guardNow();
+    if (decision.skip) {
+      probe.push(weekProbeGuardEntry(decision));
+      return notReached(decision.reason, decision.rendered);
+    }
+    if (remainingMs() < clickCostMs) {
+      probe.push({ selector: cand.selector, kind: cand.kind, found: null, clicked: false, note: 'Budget aufgebraucht' });
+      break;
+    }
+    const loc = page.locator(cand.selector).first();
+    let found = false;
+    try {
+      await loc.waitFor({ state: 'visible', timeout: Math.min(1000, Math.max(100, remainingMs())) });
+      found = true;
+    } catch (e) { found = false; }
+    if (!found) {
+      probe.push({ selector: cand.selector, kind: cand.kind, found: false, clicked: false });
+      continue;
+    }
+    foundAny = true;
+    try {
+      await loc.click({ timeout: Math.min(2000, Math.max(100, remainingMs())) });
+    } catch (e) {
+      probe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: false, clickError: String((e && e.message) || e).slice(0, 120) });
+      continue;
+    }
+    clickedAny = true;
+    // Ab hier kann sich die gerenderte Woche geaendert haben — der
+    // memoierte Guard-Zustand ist damit veraltet.
+    targetWeekChecked = false;
+    targetWeekNow = null;
+    // eslint-disable-next-line no-await-in-loop
+    const r = await afterClick(prevStart, clickWaitMs);
+    probe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified });
+    if (shouldTryNextCandidate(r.verified)) continue; // wirkungslos -> naechster Kandidat
+    return { clicked: true, week: r.week, verified: r.verified, foundAny, clickedAny, targetReached: false, guard: WEEK_CLICK_GUARD_REASONS.click };
+  }
+  return { clicked: false, week: null, verified: 'not-found', foundAny, clickedAny, targetReached: false, guard: null };
+}
+
 // Darf in dieselbe Richtung erneut geklickt werden?
 //  - noch nie geklickt                    -> ja
 //  - Gegenrichtung (direction != last)    -> ja; das ist der RÜCKWEG, der
@@ -2726,75 +2884,28 @@ export class OwaClient {
     // geändert hat — nur bei nachweislich wirkungslosem Klick ('unchanged') wird
     // der nächste Kandidat versucht; bei 'unverified' nie (Doppel-Klick-Gefahr,
     // falls der erste Klick doch gewirkt hat).
-    const clickWeekButton = async (direction, prevStart) => {
-      let foundAny = false;
-      let clickedAny = false;
-      // Live-Befund 25.09.2026 (Z~2400): Der Guard "Zielwoche verifiziert ->
-      // kein Klick" stand nur AUSSERHALB dieser Schleife, in der
-      // Schritt-Schleife. Live-Trace:
-      //   1. aria-label-de  found:false
-      //   2. aria-label-en  found:true clicked:true verified:'unverified'
-      //   3. skipped:'target-week-verified'
-      // Der aeussere Guard griff also erst, NACHDEM Kandidat 2 bereits
-      // geklickt hatte — bei Schritt 3 war der verifizierte Zustand noch gar
-      // nicht in `rendered`. Der Guard gehoert VOR die Probe, in DIESER
-      // Schleife. Der Header-Read ist memoisiert (nur der erste Kandidat
-      // kostet einen Read) und wird nach jedem Klick verworfen, weil erst
-      // der Klick die Woche veraendern kann.
-      let targetWeekChecked = false;
-      let targetWeekNow = null;
-      const targetWeekReached = async () => {
-        if (!targetWeekChecked) {
-          targetWeekChecked = true;
-          let wk = null;
-          try { wk = await readRenderedCalendarWeek(page); } catch (e) { wk = null; }
-          targetWeekNow = renderedWeekContains(wk, rangeStartDate) ? wk : null;
-        }
-        return targetWeekNow;
-      };
-      for (const cand of weekButtonCandidates(direction)) {
-        // GUARD VOR DER PROBE: verifizierte Zielwoche -> kein Klick, Skip, Abbruch.
-        const reached = await targetWeekReached();
-        if (reached) {
-          weekButtonProbe.push(weekProbeSkipEntry(reached.startDate, 'guard-vor-klick'));
-          return {
-            clicked: false, week: reached, verified: 'target-week-reached',
-            targetReached: true, foundAny, clickedAny
-          };
-        }
-        if (remaining() < CLICK_COST_MS) {
-          weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: null, clicked: false, note: 'Budget aufgebraucht' });
-          break;
-        }
-        const loc = page.locator(cand.selector).first();
-        let found = false;
-        try {
-          await loc.waitFor({ state: 'visible', timeout: Math.min(1000, Math.max(100, remaining())) });
-          found = true;
-        } catch (e) { found = false; }
-        if (!found) {
-          weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: false, clicked: false });
-          continue;
-        }
-        foundAny = true;
-        try {
-          await loc.click({ timeout: Math.min(2000, Math.max(100, remaining())) });
-        } catch (e) {
-          weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: false, clickError: String((e && e.message) || e).slice(0, 120) });
-          continue;
-        }
-        clickedAny = true;
-        // Ab hier kann sich die gerenderte Woche geaendert haben — der
-        // memoierte Guard-Zustand ist damit veraltet.
-        targetWeekChecked = false;
-        targetWeekNow = null;
-        const r = await waitRenderAfterClick(prevStart, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
-        weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified });
-        if (shouldTryNextCandidate(r.verified)) continue; // wirkungslos -> nächster Kandidat
-        return { clicked: true, week: r.week, verified: r.verified, foundAny, clickedAny };
-      }
-      return { clicked: false, week: null, verified: 'not-found', foundAny, clickedAny };
-    };
+    //
+    // Bug 2 (Live-Befund 25.09.2026): Der Code liegt jetzt in der exportierten
+    // Funktion runWeekButtonClick — NICHT als Closure. Der alte Test hat die
+    // Schleife nachgebaut und diese Funktion nie aufgerufen; deshalb war der
+    // Guard "nur durch Code-Review belegt" und das `note:'guard-vor-klick'`
+    // konnte im Live-Lauf fehlen, ohne dass ein Test rot wurde. Diese Funktion
+    // IST der Produktionspfad, damit der Test den echten Draht faehrt.
+    // Der Guard selbst steckt in weekClickDecision (geteilte Definition mit
+    // der aeusseren Schritt-Schleife) und entscheidet in BEIDEN Richtungen:
+    // Zielwoche erreicht -> Skip; Ansicht nicht gerendert -> KEIN Klick.
+    const clickWeekButton = (direction, prevStart) => runWeekButtonClick({
+      direction,
+      prevStart,
+      targetStart: rangeStartDate,
+      page,
+      probe: weekButtonProbe,
+      readWeek: () => readRenderedCalendarWeek(page),
+      afterClick: (prev, budgetMs) => waitRenderAfterClick(prev, phase(budgetMs)),
+      clickWaitMs: FREEBUSY_CLICK_RENDER_WAIT_MS,
+      clickCostMs: CLICK_COST_MS,
+      remainingMs: remaining
+    });
 
     // Wartet nach einem Button-Klick auf das Re-Render und BEWERTET die Änderung
     // (Runde-4-Forderung C): 'changed' = Header-Datum hat sich geändert (Klick
@@ -2890,8 +3001,28 @@ export class OwaClient {
       // Zielwoche bereits gerendert und verifiziert, wird das als SKIP
       // protokolliert — keine Button-Probe, kein Klick. Runde 6 protokollierte
       // trotz bestätigter Zielwoche einen "Next week"-Klick.
-      if (rendered.startDate && isRequestedWeek(rendered)) {
-        weekButtonProbe.push(weekProbeSkipEntry(rendered.startDate));
+      //
+      // Bug 2: GLEICHE Entscheidungsfunktion wie im Klickpfad
+      // (weekClickDecision). Vorher hatte die aeussere Schleife ihren eigenen,
+      // schwaecheren Test (isRequestedWeek) — die beiden konnten auseinander-
+      // laufen, und genau das war der Live-Befund.
+      //
+      // Ehrliche Abgrenzung: die Schleife arbeitet auf dem `rendered`-Snapshot,
+      // der nach jedem Klick und jedem Render-Wait neu erhoben wird; der
+      // Klickpfad liest dagegen unmittelbar VOR der Probe frisch. Der
+      // Snapshot ist damit der Vorfilter, der frische Read im Klickpfad die
+      // maechsliche Sperre. Neu und entscheidend ist hier die zweite
+      // Bedingung der geteilten Funktion: ohne datierbaren Header wird nicht
+      // nur nicht auf die Zielwoche geklickt, sondern gar nicht geklickt.
+      const outerDecision = weekClickDecision({ rendered, targetStart: rangeStartDate, hasEvents });
+      if (outerDecision.skip) {
+        weekButtonProbe.push(weekProbeGuardEntry(outerDecision));
+        if (outerDecision.reason === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
+          // Ansicht nicht gerendert: NICHT klicken. Der Klickpfad wuerde das
+          // ohnehin blockieren; hier wird es benannt, damit der Abbruchgrund
+          // ehrlich ist statt 'no-dated-header'.
+          abortReason = 'view-not-ready';
+        }
         break;
       }
       if (remaining() <= 0) { abortReason = 'budget'; break; }
@@ -2918,6 +3049,15 @@ export class OwaClient {
           }
           forcedNextRetryDone = true;
           const forced = await clickWeekButton(1, rendered.startDate);
+          if (forced.guard === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
+            // Bug 2: Der erzwungene "Nächste Woche"-Klick war der Live-Befund.
+            // Er lief auf einer Ansicht ohne Wochen-Header — die Wochen- und
+            // Button-Position war unbekannt, ein Klick haette die Zielwoche
+            // ueberspringen koennen. Der Guard blockiert das jetzt; hier wird
+            // es als Abbruchgrund benannt statt als 'no-dated-header'.
+            abortReason = 'view-not-ready';
+            break;
+          }
           if (forced.targetReached) {
             // Zielwoche war bereits verifiziert -> uebernehmen und beenden.
             // Kein Fehlerpfad: "kein Klick" waere hier falsch, weil der
@@ -2973,6 +3113,14 @@ export class OwaClient {
       }
 
       const r = await clickWeekButton(direction, rendered.startDate);
+      if (r.guard === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
+        // Bug 2: Der frische Header-Read im Guard fand die Ansicht gerade nicht
+        // gerendert. Klicken waere nicht vertretbar; der Grund wird benannt.
+        // Bewusst VOR dem !r.clicked-Zweig, sonst wuerde es als
+        // 'button-ineffective'/'no-week-button' fehlattet.
+        abortReason = 'view-not-ready';
+        break;
+      }
       if (r.targetReached) {
         // Zielwoche verifiziert -> uebernehmen und die Klick-Schleife
         // verlassen. Bewusst VOR dem !r.clicked-Zweig: ein Skipped-Klick ist

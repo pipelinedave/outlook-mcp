@@ -1,5 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   waitForCalendarEvents,
   reconcileEventWait,
@@ -385,6 +387,63 @@ describe('Bug 3 — der Warte-Loop pollt (Live: polls 0 bei Budget 20000)', () =
 });
 
 // ===========================================================================
+// Verdrahtungs-Waechter
+// ---------------------------------------------------------------------------
+// Eigene Klasse, mit einem Mutationsnachweis entwickelt: eine erste Fassung
+// dieser Tests bestand NUR aus waitForCalendarEvents + Kollektor und wurde
+// GRUEN, obwohl in getFreeBusy der stale-Boolean-Kurzschluss wiederhergestellt
+// war — also genau der Live-Bug. Die Funktionen koennen also voellig korrekt
+// sein und der Draht trotzdem falsch. Deshalb wird die Verdrahtung in
+// getFreeBusy hier mitgeprueft.
+// ===========================================================================
+describe('Bug 3 — Verdrahtung: getFreeBusy pollt bedingungslos', () => {
+  const src = readFileSync(fileURLToPath(new URL('../src/owa.js', import.meta.url)), 'utf8');
+  // Der Block von der Budget-Berechnung bis zur Abschluss-Sammlung.
+  const i = src.indexOf('const eventWaitBudget = eventWaitBudgetMs(remaining());');
+  assert.ok(i > 0, 'eventWaitBudget nicht gefunden');
+  const block = src.slice(i, src.indexOf('const rawLabels = eventCollection.labels;', i));
+
+  test('die Wartephase wird BEDINGUNGSLOS gestartet, nicht hinter hasEvents', () => {
+    assert.ok(/const eventWait = await waitForCalendarEvents\(\{/.test(block),
+      'der Aufruf darf nicht in einem if(haEvents) versteckt sein');
+    assert.ok(!/if \(hasEvents\)\s*\{[\s\S]{0,200}waitForCalendarEvents/.test(block),
+      'KEIN if(hasEvents)-Kurzschluss um die Wartephase — das war die Root Cause');
+    assert.ok(!/outcome: 'pending'/.test(block),
+      "das 'pending'-Shortcut-Objekt (polls:0, waitedMs:0) darf nicht zurueckkehren");
+  });
+
+  test('der Beobachter kommt aus makeEventObserver, nicht aus der boolean-Vorabprobe', () => {
+    assert.ok(/makeEventObserver\(\(preferSelector\) => collectCalendarEventLabels\(page/.test(block),
+      'der Beobachter muss der exportierte Produktions-Beobachter sein');
+    assert.ok(/preferSelector: observeCalendarEvents\.lastSelector\(\)/.test(src),
+      'die Abschluss-Sammlung nutzt den Selector-Memory des Beobachters');
+  });
+
+  test('die Vorab-Probe hatEventElements steuert NUR noch GUARD 2', () => {
+    // Die Vorab-Probe darf existieren (GUARD 2 braucht sie), aber sie darf die
+    // Wartephase nicht mehr steuern.
+    assert.ok(/hasEvents = hasEvents \|\| \(await hasEventElements\(\)\)/.test(src),
+      'GUARD-2-Aktualisierung bleibt erhalten');
+    const guard = src.slice(src.indexOf('if (!rendered.startDate && !hasEvents) {'), src.indexOf('const eventWaitBudget'));
+    assert.ok(!/waitForCalendarEvents/.test(guard), 'die Vorab-Probe fuehrt nicht zur Wartephase');
+  });
+
+  test('resolveEventWaitOutcome wird in der Verdrahtung nicht mehr benutzt', () => {
+    // Die alte Funktion hat polls und waitBudgetMs destrukturiert und nie
+    // benutzt. Sie darf nicht mehr die Entscheidung treffen.
+    const j = src.indexOf('const eventWaitReconciled = reconcileEventWait({');
+    assert.ok(j > 0, 'reconcileEventWait muss die Entscheidung treffen');
+    assert.ok(!/resolveEventWaitOutcome\(\{/.test(src.slice(src.indexOf('const weekVerified'), src.indexOf('// Defekt 2: dataQuality'))),
+      'resolveEventWaitOutcome darf die Wartephase nicht mehr entscheiden');
+  });
+
+  test('der ehrliche Abbruchgrund wird auch berichtet, wenn die Navigation sauber war', () => {
+    assert.ok(/const reportedAbortReason = effectiveAbortReason\(\{/.test(src));
+    assert.ok(/abortReason: reportedAbortReason/.test(src), 'die Diagnostik muss ihn melden');
+    assert.ok(/eventWaitAbortReason: eventWait\.abortReason/.test(src), 'und separat als Warte-Grund');
+  });
+});
+
 describe('Bug 3 — ehrlicher Abbruchgrund statt stillem Ende', () => {
 
   test('reconcileEventWait: 0 Events + Budget + 0 Polls -> not-polled (Logikfehler)', () => {
