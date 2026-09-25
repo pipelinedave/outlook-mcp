@@ -1251,7 +1251,9 @@ describe('collectCalendarEventLabels - gemeinsamer Kollektionspfad & Sichtbarkei
     const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage, { preferSelector: '[role="button"][aria-label]' }));
     assert.equal(res.eventElementsFound, 1);
     assert.equal(res.selectorUsed, '[aria-label]');
-    assert.deepEqual(calls.slice(0, 2), ['[role="button"][aria-label]', '[aria-label]']);
+    // Versuchsreihenfolge der LEITER (der Census-Vorlauf davor ist kein
+    // Quellen-Versuch): gemerkter Selektor vor dem breiten Fallback.
+    assert.deepEqual(res.sourceTried.slice(0, 2).map((s) => s.selector), ['[role="button"][aria-label]', '[aria-label]']);
   });
 });
 
@@ -1426,7 +1428,9 @@ describe('pollUntilEventGrid - Wartephase pollt bis echte Events da sind (Defekt
   });
 
   test('Ausgaenge sind genau die dokumentierten Werte', () => {
-    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'budget-exhausted', 'not-rendered']);
+    // Defekt 3: 'not-found' kam hinzu — 'found' ist nur noch bei tatsaechlich
+    // gelesenen Event-Knoten erlaubt.
+    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'not-found', 'budget-exhausted', 'not-rendered']);
   });
 });
 
@@ -1746,7 +1750,7 @@ describe('deriveEventLabelFromNode - Label aus einem beliebigen Grid-Knoten', ()
   const geo = { columns, ruler, weekStartIso: '2026-09-28' };
   const node = (over = {}) => ({
     tag: 'DIV', role: null, cls: 'ms-Cal-event',
-    ariaLabel: '', title: '', text: '', data: null,
+    ariaLabel: '', title: '', text: '', data: null, inGrid: true,
     rect: { left: 250, top: 620, width: 90, height: 150, x: 250, y: 620 },
     area: true, offsetParentNull: true, ...over
   });
@@ -1781,12 +1785,21 @@ describe('deriveEventLabelFromNode - Label aus einem beliebigen Grid-Knoten', ()
 
   test('5) NUR Titel im Text -> Zeit+Datum werden aus der Geometrie abgeleitet', () => {
     // Chip ohne JEDE Beschriftung ausser dem Titel — der Defekt-1-Fall.
+    // 150px Hoehe bei 60px/Stunde = 2,5h ab 13:00 -> 15:30.
     const r = deriveEventLabelFromNode(node({ text: 'Block' }), { pats, ...geo });
     assert.equal(r.reason, null);
     assert.equal(r.source, 'text');
     assert.equal(r.timeSource, 'geometry');
     // Spalte 250px -> Index 1 = Dienstag 29.09.; top 620px -> 13:00
-    assert.equal(r.label, 'Block, 13:00 to 15:00, Tuesday, September 29, 2026');
+    assert.equal(r.label, 'Block, 13:00 to 15:30, Tuesday, September 29, 2026');
+  });
+
+  test('5b) Toolbar-Text AUSSERHALB des Grids wird NIE zum Event', () => {
+    // "Work week" ist der Ansichtswechsler, KEIN Termin. Ohne inGrid-Guard
+    // wuerde die Geometrie daraus einen Phantom-Slot bauen.
+    const r = deriveEventLabelFromNode(node({ text: 'Work week', inGrid: false }), { pats, ...geo });
+    assert.equal(r.label, null);
+    assert.equal(r.reason, 'no-event-signature');
   });
 
   test('6) OHNE Geometrie wird NICHT geraten -> reason no-time-source', () => {
@@ -1807,7 +1820,7 @@ describe('deriveEventLabelFromNode - Label aus einem beliebigen Grid-Knoten', ()
   });
 
   test('9) reines Rauschen wird verworfen', () => {
-    assert.equal(deriveEventLabelFromNode(node({ text: 'Work week' }), { pats, ...geo }).reason, 'no-event-signature');
+    assert.equal(deriveEventLabelFromNode(node({ text: 'Work week', inGrid: false }), { pats, ...geo }).reason, 'no-event-signature');
     assert.equal(deriveEventLabelFromNode(node({}), { pats, ...geo }).reason, 'no-event-signature');
   });
 
@@ -1891,7 +1904,9 @@ describe('resolveEventWaitOutcome - Ausgang an die BEOBACHTUNG koppeln (Defekt 3
   test('die Warte-Warnung erklaert not-found genauso deutlich wie budget-exhausted', () => {
     const w = eventWaitWarning({ outcome: 'not-found', waitedMs: 20000, budgetMs: 20000 });
     assert.ok(w);
-    assert.ok(/leerer Kalender/.test(w), w);
+    assert.ok(/20000ms/.test(w), w);
+    assert.ok(/leeren Kalender/.test(w), w);
+    assert.ok(/census/.test(w), w);
   });
 });
 

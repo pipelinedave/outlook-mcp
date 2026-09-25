@@ -344,6 +344,322 @@ export function isVisibleCalendarElement({ offsetParent = null, position = 'stat
   return Boolean(rect && rect.width > 0 && rect.height > 0);
 }
 
+// ===========================================================================
+// Defekt 1 — Event-QUELLEN-Leiter + Geometrie-Ableitung
+// ===========================================================================
+// MESSBEFUND (Live-Smoke-Test KW 40, 25.09.2026, Commit 0c4cfee): Nach
+// vollstaendigem Rendern (bis 20s Poll) lieferten `[role="button"][aria-label"]`
+// und `[aria-label]` ZUSAMMEN 12 Labels, davon 11x header-artig und 1x
+// Uhrzeit-Indikator. ariaButtonCount=9 = ausschliesslich Chrome-Navigation
+// (App launcher, Mail, Calendar, People, Newsletters, Org Explorer, OneDrive,
+// Copilot, Wochen-Header). eventElementsFound: 0.
+//
+// SCHLUSSFOLGERUNG: In diesem Tenant tragen die Event-Chips der Wochenansicht
+// nachweislich KEIN aria-label mit Event-Signatur. Eine weitere geratene
+// CSS-Klasse waere erneut eine Hypothese, die der naechste Smoke-Test erst
+// wieder widerlegen kann. Stattdessen:
+//   1) eine LEITER unabhaengiger Quellen (aria-label -> title -> data-* ->
+//      sichtbarer Text), jede Stufe wird protokolliert,
+//   2) GEOMETRIE als letzter Weg: Wochentag aus der Spalten-x-Position
+//      (Tageskoepfe), Startzeit aus dem Zeitraster-y, Ende aus der Hoehe —
+//      damit braucht es KEIN geratenes Attribut, nur echte Flaeche (rect>0),
+//   3) ein STRUKTUR-CENSUS, der auch im 0-Treffer-Fall die Tatsache ueber
+//      die echte DOM-Struktur liefert (tag/role/class/data-attrs/rect/Text).
+//
+// GRUNDREGEL: Es wird NIE eine Zeit oder ein Datum geraten. Fehlt ein
+// Beleg, ist das Ergebnis eine Ablehnung mit Grund, kein Phantom-Slot.
+
+// Quellen-Leiter. selector === null -> kein CSS-Selektor, sondern ein
+// Struktur-Scan der Blatt-Elemente im Kalenderbereich (scope: 'surface').
+export const CALENDAR_EVENT_SOURCES = [
+  { id: 'aria-role-button', selector: '[role="button"][aria-label]', scope: 'document', source: 'aria-label' },
+  { id: 'aria-any', selector: '[aria-label]', scope: 'document', source: 'aria-label' },
+  { id: 'title', selector: null, scope: 'surface', source: 'title' },
+  { id: 'data-attr', selector: null, scope: 'surface', source: 'data-attr' },
+  { id: 'text', selector: null, scope: 'surface', source: 'text' }
+];
+
+// Reihenfolge der Leiter inkl. Selektor-Memory: der zuletzt erfolgreiche
+// Selektor wird zuerst probiert (spart bei bekannterstruktur 4 Scans).
+export function eventSourcePlan(preferSelector = null) {
+  const steps = CALENDAR_EVENT_SOURCES.slice();
+  if (preferSelector && !steps.some((s) => s.selector === preferSelector)) {
+    steps.unshift({ id: 'remembered', selector: preferSelector, scope: 'document', source: 'aria-label' });
+  }
+  return steps;
+}
+
+// --- Geometrie -------------------------------------------------------------
+
+// Ein Raster-/Stundenlabel ist ein Text, der NUR aus einer Uhrzeit besteht
+// ("08:00", "8 AM"). "calendar view, current time: Fri 22:31" ist das nicht —
+// genau dieser Knoten war der Runde-6-Fehltreffer, weshalb die Pruefung
+// bewusst auf den GESAMTEN Text streng ist (Anker ^...$).
+export const CLOCK_LABEL_PATTERN = String.raw`^\d{1,2}(?::\d{2})?\s*(?:am|pm)?$`;
+
+export function isClockLabelOnly(text) {
+  if (!text) return false;
+  return new RegExp(CLOCK_LABEL_PATTERN, 'i').test(String(text).replace(/\s+/g, ' ').trim());
+}
+
+// Normalisiert eine Raster-/Zeitangabe auf HH:MM. MEHRDEUTIGE Angaben (nackte
+// "8" = 08:00 oder 20:00) werden NULL — eine geratene Zeit waere eine
+// Falschaussage in den Belegungsdaten.
+export function normalizeClockTime(text) {
+  if (text === null || text === undefined) return null;
+  const s = String(text).replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const m = s.match(/(?:^|\D)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s|$|\D)/i);
+  if (!m) return null;
+  const hasMeridiem = Boolean(m[3]);
+  if (!m[2] && !hasMeridiem) return null; // nackte Stunde: mehrdeutig -> ablehnen
+  let h = parseInt(m[1], 10);
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  const pm = m[3] && m[3].toLowerCase() === 'pm';
+  const am = m[3] && m[3].toLowerCase() === 'am';
+  if (am && h === 12) h = 0;
+  if (pm && h !== 12) h += 12;
+  if (h > 23 || min > 59) return null;
+  return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+
+// Ordnet eine x-Position einer Wochentags-Spalte zu (Index, -1 = keine).
+// OWA rendert den Tageskopf oft schmaler als die Spalte, deshalb gilt die
+// naechste Spalte, solange der Abstand die halbe mediane Spaltenbreite
+// nicht ueberschreitet. Alles andere wird abgelehnt statt geraten.
+export function mapXToDayColumn(columns = [], x) {
+  if (!Array.isArray(columns) || columns.length < 2) return -1;
+  const xs = Number(x);
+  if (!Number.isFinite(xs)) return -1;
+  const usable = columns
+    .map((c) => c && { left: Number(c.left), width: Number(c.width), center: Number(c.left) + Number(c.width) / 2 })
+    .filter((c) => Number.isFinite(c.left) && Number.isFinite(c.width) && c.width > 0);
+  if (usable.length < 2) return -1;
+  const hit = usable.findIndex((c) => xs >= c.left && xs <= c.left + c.width);
+  if (hit >= 0) return hit;
+  const widths = usable.map((c) => c.width).sort((a, b) => a - b);
+  const maxDist = widths[Math.floor(widths.length / 2)] / 2;
+  let best = -1;
+  let bestDist = Infinity;
+  usable.forEach((c, i) => {
+    const dist = Math.abs(xs - c.center);
+    if (dist < bestDist) { bestDist = dist; best = i; }
+  });
+  return bestDist <= maxDist ? best : -1;
+}
+
+// Ordnet eine y-Position dem untersten Zeitraster-Eintrag oberhalb zu -> Startzeit.
+export function mapYToClockTime(ruler = [], y, { tolerancePx = 24 } = {}) {
+  if (!Array.isArray(ruler) || !ruler.length) return null;
+  const ys = Number(y);
+  if (!Number.isFinite(ys)) return null;
+  let best = null;
+  for (const entry of ruler) {
+    if (!entry) continue;
+    const time = normalizeClockTime(entry.time || entry.label || entry.text);
+    const top = Number(entry.top);
+    if (!time || !Number.isFinite(top)) continue;
+    if (top > ys + tolerancePx) continue; // Rasterpunkt liegt UNTER dem Chip-Anfang
+    if (best === null || top > best.top) best = { time, top };
+  }
+  return best ? best.time : null;
+}
+
+// Stundenhöhe in px aus dem Zeitraster (Median der Abstände, gegen Rauschen
+// robust). Weniger als 2 Rasterpunkte -> 0, damit KEINE Endzeit erfunden wird.
+export function estimateHourPx(ruler = []) {
+  if (!Array.isArray(ruler) || ruler.length < 2) return 0;
+  const tops = ruler.map((r) => r && Number(r.top)).filter((t) => Number.isFinite(t)).sort((a, b) => a - b);
+  if (tops.length < 2) return 0;
+  const diffs = [];
+  for (let i = 1; i < tops.length; i++) {
+    const d = tops[i] - tops[i - 1];
+    if (d > 0) diffs.push(d);
+  }
+  if (!diffs.length) return 0;
+  diffs.sort((a, b) => a - b);
+  return diffs[Math.floor(diffs.length / 2)];
+}
+
+// "Monday, September 28, 2026" — Format, das parseEventLabel sicher liest.
+function formatEventDatePhrase(dateIso) {
+  const m = String(dateIso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10) - 1;
+  const day = parseInt(m[3], 10);
+  if (month < 0 || month > 11 || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, month, day));
+  const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+    'August', 'September', 'October', 'November', 'December'];
+  return `${weekdays[d.getUTCDay()]}, ${months[d.getUTCMonth()]} ${day}, ${year}`;
+}
+
+// Baut ein parsebares Label aus Geometrie-Angaben. Ohne Titel ODER ohne Datum
+// ODER (für zeitbasierte Events) ohne Startzeit -> null. Kein Phantom-Label.
+export function buildGeometryEventLabel({ title, start, end, dateIso, allDay = false } = {}) {
+  const t = String(title || '').replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+  const when = formatEventDatePhrase(dateIso);
+  if (!when) return null;
+  if (allDay) return `${t}, all day event, ${when}`;
+  const s = normalizeClockTime(start);
+  if (!s) return null;
+  const e = normalizeClockTime(end);
+  return e ? `${t}, ${s} to ${e}, ${when}` : `${t}, ${s}, ${when}`;
+}
+
+// --- Ableitung aus einem Grid-Knoten --------------------------------------
+
+const NON_EVENT_REASONS = { clock: 'clock-indicator', work: 'work-location' };
+
+// Wertet EINEN Grid-Knoten aus. Quellen werden in dieser Reihenfolge geprueft:
+// aria-label -> title -> data-* -> sichtbarer Text; danach (nur wenn der Knoten
+// selbst keine belastbare Zeit traegt) die Geometrie.
+// Rueckgabe: { label, reason, source, timeSource }
+export function deriveEventLabelFromNode(node, { pats = EVENT_LABEL_PATTERNS, columns = [], ruler = [], weekStartIso = null } = {}) {
+  const re = {};
+  for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
+  const area = node && (node.area === true || (node.rect && node.rect.width > 0 && node.rect.height > 0));
+  if (!node || !area) return { label: null, reason: 'no-area', source: null, timeSource: null };
+
+  const rect = node.rect || {};
+  const hasSignature = (s) => Boolean(s) && (re.timeRange.test(s) || re.allDay.test(s));
+  const hasDate = (s) => Boolean(s) && re.dateish.test(s);
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+
+  // Ablehnungsgruende VOR der Event-Erkennung (Uhr-Indikator, Arbeitsort)
+  const blockers = [];
+  const consider = (s) => { const t = norm(s); if (t && t.length <= 300) blockers.push(t); };
+  consider(node.ariaLabel);
+  consider(node.title);
+  consider(node.text);
+  for (const b of blockers) {
+    if (re.gridBlocker.test(b)) return { label: null, reason: NON_EVENT_REASONS.clock, source: null, timeSource: null };
+    if (re.nonEvent.test(b)) return { label: null, reason: NON_EVENT_REASONS.work, source: null, timeSource: null };
+  }
+
+  // 1) Attribut-/Text-Quellen mit vollstaendigem Label
+  const sources = [];
+  const aria = norm(node.ariaLabel);
+  if (aria) sources.push({ source: 'aria-label', value: aria });
+  const title = norm(node.title);
+  if (title) sources.push({ source: 'title', value: title });
+  if (node.data && typeof node.data === 'object') {
+    for (const [k, v] of Object.entries(node.data)) {
+      const val = norm(v);
+      if (val) sources.push({ source: 'data-attr', value: val, attr: k });
+    }
+  }
+  const text = norm(node.text);
+  if (text) sources.push({ source: 'text', value: text });
+  for (const s of sources) {
+    if (!hasSignature(s.value)) continue;
+    if (hasDate(s.value)) return { label: s.value, reason: null, source: s.source, timeSource: 'label' };
+    // Zeit ohne Datum: Datum aus der Spaltenposition ergaenzen, wenn belegt
+    const geo = geometryLabel(node, { columns, ruler, weekStartIso, re });
+    if (geo) return { label: geo, reason: null, source: s.source, timeSource: 'label+geometry-date' };
+    return { label: null, reason: 'no-date', source: s.source, timeSource: null };
+  }
+
+  // 2) Nur Text: Zeit+Datum aus der Geometrie ableiten
+  if (text) {
+    const geo = geometryLabel(node, { columns, ruler, weekStartIso, re });
+    if (geo) return { label: geo, reason: null, source: 'text', timeSource: 'geometry' };
+    if (hasSignature(text)) return { label: null, reason: 'no-date', source: 'text', timeSource: null };
+    // Signatur vorhanden, aber keine Zeit/Datum ableitbar -> eigener Grund
+    if (text.length > 1) {
+      const isTimeOnly = re.timeRange.test(text) || re.allDay.test(text);
+      if (isTimeOnly) return { label: null, reason: 'no-date', source: 'text', timeSource: null };
+      if (ruler && ruler.length >= 2 && weekStartIso && columns && columns.length >= 2 && node.inGrid === true) {
+        return { label: null, reason: 'geometry-incomplete', source: 'text', timeSource: null };
+      }
+      // Chip-artiger Knoten ohne ableitbare Zeit vs. reiner Chrome-Text:
+      // die Unterscheidung macht die Diagnostik ueberhaupt erst lesbar.
+      return {
+        label: null,
+        reason: node.inGrid === true ? 'no-time-source' : 'no-event-signature',
+        source: 'text',
+        timeSource: null
+      };
+    }
+  }
+
+  return { label: null, reason: 'no-event-signature', source: null, timeSource: null };
+}
+
+// Geometrie-Weg: Tag aus der Spalten-x-Position, Zeit aus dem Raster-y,
+// Ende aus der Chip-Hoehe. Jeder Teil muss belegt sein, sonst null.
+// Voraussetzung: der Knoten liegt nachweislich im Grid-Body (inGrid) —
+// sonst wuerde Toolbar-Text ("Work week") zu einem erfundenen Slot.
+function geometryLabel(node, { columns = [], ruler = [], weekStartIso = null } = {}) {
+  if (node.inGrid !== true) return null;
+  const rect = node.rect || {};
+  const colIndex = mapXToDayColumn(columns, Number.isFinite(rect.left) ? rect.left : rect.x);
+  if (colIndex < 0 || !weekStartIso) return null;
+  const base = new Date(`${String(weekStartIso).slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(base.getTime())) return null;
+  base.setUTCDate(base.getUTCDate() + colIndex);
+  const dateIso = toIsoDate(base);
+  const hourPx = estimateHourPx(ruler);
+  const start = mapYToClockTime(ruler, rect.top);
+  if (!start) return null;
+  let end = null;
+  if (hourPx > 0 && Number(rect.height) > 0) {
+    const mins = Math.round((Number(rect.height) / hourPx) * 60 / 15) * 15;
+    end = addMinutes(start, Math.max(15, Math.min(720, mins)));
+  }
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const title = [norm(node.ariaLabel), norm(node.title), norm(node.text)].find((t) => t && !/\d{1,2}:\d{2}/.test(t)) || '';
+  return buildGeometryEventLabel({ title, start, end, dateIso });
+}
+
+function addMinutes(hhmm, minutes) {
+  const m = String(hhmm).match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  let total = parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + minutes;
+  total = Math.min(total, 24 * 60 - 1);
+  return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+}
+
+// ===========================================================================
+// Defekt 2 — ehrliche Verifikationsangabe
+// ===========================================================================
+// Live-Befund: dataQuality:'verified' bei eventElementsFound:0 war eine
+// Falschaussage — busySlots:[] wurde dadurch als "Kalender ist frei"
+// gelesen. 'verified' ist ab jetzt NUR gesetzt, wenn die Woche passt UND
+// echte Event-Knoten gelesen wurden. Der Wochen-Nachweis selbst bleibt
+// ueber das separate Feld weekVerified erhalten (er funktioniert und MUSS
+// erhalten bleiben).
+export const DATA_QUALITY_VALUES = ['verified', 'unverified-empty', 'unverified'];
+
+export function resolveDataQuality({ weekVerified = false, eventElementsFound = 0 } = {}) {
+  if (!weekVerified) return 'unverified';
+  const n = Number(eventElementsFound);
+  return n > 0 ? 'verified' : 'unverified-empty';
+}
+
+// Belastbar ist dataQuality NUR bei 'verified' — Aufrufer sollen das nicht
+// selbst nachrechnen muessen.
+export function isBelievableBusySlots(dataQuality) {
+  return dataQuality === 'verified';
+}
+
+// ===========================================================================
+// Defekt 3 — Warte-Ausgang an die Beobachtung koppeln
+// ===========================================================================
+// Live-Befund: eventWaitOutcome:'found' bei waitedForEventsMs:0 und
+// eventElementsFound:0. 'found' wird ab jetzt ausschliesslich gemeldet, wenn
+// in der ABSCHLIESSENDEN Sammlung echte Event-Knoten gelesen wurden.
+export const EVENT_WAIT_OUTCOMES = ['found', 'not-found', 'budget-exhausted', 'not-rendered'];
+
+export function resolveEventWaitOutcome({ polls = 0, eventElementsFound = 0, waitBudgetMs = null } = {}) {
+  const n = Number(eventElementsFound);
+  if (Number.isFinite(n) && n > 0) return 'found';
+  return 'not-found';
+}
+
 // Parst die Wochennummer aus einem Prev/Next-Button-Label ("… (Week 39)" / "(KW 39)").
 export function parseWeekNumberFromNav(text) {
   if (!text) return null;
@@ -558,120 +874,265 @@ export async function collectCalendarCandidates(page) {
 // diagnostisch erfasst. Der strenge Sichtbarkeitsfilter bleibt den Header-
 // Kandidaten in collectCalendarCandidates vorbehalten.
 // ---------------------------------------------------------------------------
-export async function collectCalendarEventLabels(page, { preferSelector = null } = {}) {
-  return page.evaluate(({ pats, prefer }) => {
-    const re = {};
-    for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
-    const cap = (arr, n) => arr.slice(0, n);
-    // STRENGER Event-Beweis (Iteration 7, Runde-6-Fehltreffer): echtes
-    // Zeitfenster ODER Ganztag. Der alte lose Test /\d{1,2}:\d{2}/ wertete den
-    // Zeit-Indikator "calendar view, current time: Fri 22:31" als Event und
-    // erzeugte dadurch eventElementsFound: 1 bei einer real leeren Grid-Zeit.
-    const isGridEvent = (label) => {
-      if (re.nonEvent.test(label)) return false;
-      if (re.gridBlocker.test(label)) return false;
-      return re.timeRange.test(label) || re.allDay.test(label);
-    };
-    // Warum ein Label KEIN Event ist — für rejectionReasons (statt 12x
-    // 'header-misclassified' im 0-Slot-Fall).
-    const nonEventReason = (label) => {
-      if (re.gridBlocker.test(label)) return 'clock-indicator';
-      if (re.nonEvent.test(label)) return 'work-location';
-      return null;
-    };
+// Gemeinsamer Event-Kollektionspfad (Defekt 1, Live-Befund KW 40 vom 25.09.)
+// ---------------------------------------------------------------------------
+// Historie der Root Causes an dieser Stelle:
+//  Runde 5: Die Extraktion nutzte einen EIGENEN, vom Diagnostik-Pfad
+//           abweichenden Inline-Collector -> 0 Slots trotz vorhandener Events.
+//  Runde 7: Der SEL'EKTOR selbst war blind. `[role="button"][aria-label]"` und
+//           `[aria-label]` lieferten zusammen nur 12 Labels (11x header-artig,
+//           1x Uhrzeit-Indikator) und KEINEN einzigen Event-Chip.
+//
+// Deshalb jetzt EINE Sammlung mit drei Bestandteilen:
+//  1) QUELLEN-LEITER: aria-label -> title -> data-* -> sichtbarer Text.
+//     Jede Stufe wird protokolliert (sourceTried), die erste mit Treffern
+//     gewinnt. Damit haengt die Extraktion nicht an einem geratenen Attribut.
+//  2) GEOMETRIE: Tages-Spalten (Tageskoepfe) + Zeitraster (Stundenzeilen) +
+//     Grid-Body-Region. Nur Knoten INNERHALB der Region werden als
+//     Event-Chip-Kandidaten behandelt — dadurch kann Toolbar-Text
+//     ("Work week") nie zu einem Phantom-Slot werden.
+//  3) STRUKTUR-CENSUS: wird IMMER geliefert, auch bei 0 Treffern. Er
+//     enthaelt dayColumns/clockRuler/Blatt-Knoten (tag/role/class/data-attrs/
+//     rect/Text) — das ist die Bodenwahrheit ueber die echte OWA-Struktur.
+//
+// Sichtbarkeit: In virtualisierten Grids ist offsetParent === null normal,
+// Sichtbarkeit ist aber ueber die boundingRect-Flaeche belegbar. offsetParent
+// ist daher KEIN Hard-K.O. fuer Events; der strenge Sichtbarkeitsfilter
+// bleibt den Header-Kandidaten in collectCalendarDiagnostics vorbehalten.
+// ---------------------------------------------------------------------------
 
-    const collect = (selector) => {
-      const events = [];
-      const headerLike = [];
-      const nonEventLabels = [];
-      const candidates = [];
-      let hiddenCount = 0;
-      for (const el of document.querySelectorAll(selector)) {
-        const label = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-        if (!label || label.length > 300) continue;
-        const rejectReason = nonEventReason(label);
-        if (rejectReason) { nonEventLabels.push({ label, reason: rejectReason }); continue; }
-        let rect = null;
-        let offsetParentNull = false;
-        try { rect = el.getBoundingClientRect(); } catch (e) { rect = null; }
-        try { offsetParentNull = el.offsetParent === null; } catch (e) { offsetParentNull = false; }
-        const visible = Boolean(rect && rect.width > 0 && rect.height > 0);
-        if (!visible) hiddenCount++;
-        if (isGridEvent(label)) {
-          events.push(label);
-          if (candidates.length < 30) candidates.push({ label: label.slice(0, 160), visible, offsetParentNull });
-        } else if (re.dateish.test(label) && label.length <= 160) {
-          headerLike.push(label);
-        }
-      }
-      return { events, headerLike, nonEventLabels, candidates, hiddenCount };
-    };
+// Kandidaten-/Census-Grenzen: haalten den Scan und die MCP-Antwort klein.
+const CENSUS_MAX_NODES = 14;
+const SCAN_MAX_ELEMENTS = 6000;
 
-    const dedupe = (arr) => {
-      const out = [];
-      const seen = new Set();
-      for (const l of arr) { if (!seen.has(l)) { seen.add(l); out.push(l); } }
-      return out;
-    };
-    // nonEventLabels sind OBJEKTE — Dedupe ueber das Label, nicht ueber Identitaet
-    // (collect erzeugt pro Selektor neue Objekte, sonst steht dasselbe Label
-    // mehrfach in rejectionReasons).
-    const dedupeNonEvent = (arr) => {
-      const out = [];
-      const seen = new Set();
-      for (const e of arr) {
-        if (seen.has(e.label)) continue;
-        seen.add(e.label);
-        out.push(e);
-      }
-      return out;
-    };
-    const order = [];
-    if (prefer) order.push(prefer);
-    order.push('[role="button"][aria-label]', '[aria-label]');
-    const tried = [];
-    // Header-/Ablehnungs-Labels werden über ALLE Versuche hinweg gesammelt (der
-    // breite Fallback-Scan liefert sie nicht zwingend auch) — sonst ginge die
-    // Diagnostik im 0-Event-Fall verloren.
-    const allHeaderLike = [];
-    const allNonEvent = [];
-    let hiddenCount = 0;
-    for (const sel of order) {
-      if (tried.includes(sel)) continue;
-      tried.push(sel);
-      const res = collect(sel);
-      allHeaderLike.push(...res.headerLike);
-      allNonEvent.push(...res.nonEventLabels);
-      hiddenCount += res.hiddenCount;
-      if (res.events.length > 0) {
-        return {
-          labels: cap(dedupe(res.events), 60),
-          eventElementsFound: dedupe(res.events).length,
-          selectorUsed: sel,
-          hiddenCount,
-          headerLikeLabels: cap(dedupe(allHeaderLike), 20),
-          nonEventLabels: cap(dedupeNonEvent(allNonEvent), 20),
-          candidates: cap(res.candidates, 20)
+// Sucht die Kandidaten-Knoten und liefert Label-Liste + Diagnostik.
+// `weekStartIso` (Montag der gerenderten Woche) ermoeglicht die Datums-
+// ableitung aus der Spaltenposition.
+export async function collectCalendarEventLabels(page, { preferSelector = null, weekStartIso = null } = {}) {
+  let collectError = null;
+  try {
+    const res = await page.evaluate(
+      ({ pats, plan, clockStrict, weekStart }) => {
+        const re = {};
+        for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
+        const clockOnlyRe = new RegExp(clockStrict, 'i');
+        const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+        const cap = (a, n) => a.slice(0, n);
+        const safeQSA = (sel) => { try { return document.querySelectorAll(sel); } catch (e) { return []; } };
+        const safeAttr = (el, name) => { try { return el.getAttribute ? el.getAttribute(name) : null; } catch (e) { return null; } };
+        const rectOf = (el) => {
+          try {
+            const r = el.getBoundingClientRect();
+            if (!r) return null;
+            return { x: r.x, y: r.y, left: r.left, top: r.top, width: r.width, height: r.height };
+          } catch (e) { return null; }
         };
-      }
-    }
+        const areaOf = (r) => Boolean(r && r.width > 0 && r.height > 0);
+        // Volle Knoten-Beschreibung (teuer -> erst nach der Flaechen-/Regions-
+        // Filterung aufrufen).
+        const describe = (el) => {
+          const rect = rectOf(el);
+          let offsetParentNull = false;
+          try { offsetParentNull = el.offsetParent === null; } catch (e) { offsetParentNull = false; }
+          const data = {};
+          try {
+            const attrs = el.attributes;
+            if (attrs) {
+              for (let i = 0; i < attrs.length && Object.keys(data).length < 8; i++) {
+                const a = attrs[i];
+                if (a && a.name && a.name.indexOf('data-') === 0) data[a.name] = String(a.value || '').slice(0, 160);
+              }
+            }
+          } catch (e) { /* data-* ist optional */ }
+          let cls = '';
+          try { cls = String((el.className && el.className.baseVal) || el.className || ''); } catch (e) { cls = ''; }
+          let tag = '';
+          try { tag = String(el.tagName || ''); } catch (e) { tag = ''; }
+          let text = '';
+          try { text = el.innerText || el.textContent || ''; } catch (e) { text = ''; }
+          return {
+            tag,
+            role: safeAttr(el, 'role') || null,
+            cls: norm(cls).slice(0, 120),
+            ariaLabel: norm(safeAttr(el, 'aria-label')).slice(0, 300),
+            title: norm(safeAttr(el, 'title')).slice(0, 300),
+            text: norm(text).slice(0, 300),
+            data: Object.keys(data).length ? data : null,
+            rect,
+            area: areaOf(rect),
+            offsetParentNull
+          };
+        };
 
-    // Kein Selektor lieferte Events: das Ergebnis trägt headerLike/nonEventLabels
-    // für die Diagnostik, selectorUsed markiert den breitesten Versuch.
-    const last = tried[tried.length - 1];
+        const isEventSignature = (t) => {
+          if (!t) return false;
+          if (re.nonEvent.test(t)) return false;
+          if (re.gridBlocker.test(t)) return false;
+          return re.timeRange.test(t) || re.allDay.test(t);
+        };
+        const reasonOf = (t) => {
+          if (re.gridBlocker.test(t)) return 'clock-indicator';
+          if (re.nonEvent.test(t)) return 'work-location';
+          if (re.dateish.test(t) && t.length <= 160) return 'header-misclassified';
+          return null;
+        };
+
+        // 1) Tages-Spalten aus den Tageskoepfen (x-Lage der Wochentage)
+        const dayColumns = [];
+        for (const el of safeQSA('[role="columnheader"], [role="grid"] th, th')) {
+          const r = rectOf(el);
+          if (areaOf(r)) dayColumns.push({ left: r.left, width: r.width, bottom: r.top + r.height, text: norm(safeAttr(el, 'aria-label') || (el.textContent || '')).slice(0, 40) });
+        }
+        dayColumns.sort((a, b) => a.left - b.left);
+
+        // 2) Zeitraster: Elemente, deren Text NUR eine Uhrzeit ist
+        const clockRuler = [];
+        let scannedCount = 0;
+        let truncated = false;
+        for (const el of safeQSA('*')) {
+          if (scannedCount >= 6000) { truncated = true; break; }
+          scannedCount++;
+          const r = rectOf(el);
+          if (!areaOf(r)) continue;
+          if (r.width > 120) continue; // Stundenzeilen sind schmale Labels
+          const t = norm(safeAttr(el, 'aria-label') || safeAttr(el, 'title') || (el.innerText || el.textContent || ''));
+          if (!t || !clockOnlyRe.test(t)) continue;
+          clockRuler.push({ time: t, top: r.top });
+        }
+        clockRuler.sort((a, b) => a.top - b.top);
+
+        // 3) Grid-Body-Region: unterhalb der Tageskoepfe, rechts des Rasters.
+        //    Ohne sie wird die Geometrie-Ableitung NICHT angewendet (nie raten).
+        let region = null;
+        if (dayColumns.length >= 2) {
+          const first = dayColumns[0];
+          const last = dayColumns[dayColumns.length - 1];
+          const headerBottom = Math.max.apply(null, dayColumns.map((c) => c.bottom));
+          region = { left: first.left, right: last.left + last.width, top: headerBottom };
+        }
+        const inRegion = (r) => {
+          if (!region || !r) return false;
+          if (r.left < region.left - 8 || r.left > region.right + 8) return false;
+          if (r.top < region.top - 8) return false;
+          return true;
+        };
+
+        // 4) Struktur-Scan: Blatt-Knoten im Grid-Body (kein geratener Selektor)
+        const structureNodes = [];
+        if (region) {
+          let seen = 0;
+          for (const el of safeQSA('*')) {
+            if (seen >= 6000) { truncated = true; break; }
+            seen++;
+            const r = rectOf(el);
+            if (!areaOf(r)) continue;
+            if (!inRegion(r)) continue;
+            const d = describe(el);
+            // Blatt-Knoten: keine Kind-Knoten mit eigener Flaeche
+            let hasChildArea = false;
+            try {
+              const kids = el.children || [];
+              for (let i = 0; i < kids.length; i++) {
+                const kr = rectOf(kids[i]);
+                if (areaOf(kr)) { hasChildArea = true; break; }
+              }
+            } catch (e) { hasChildArea = false; }
+            if (hasChildArea) continue;
+            d.inGrid = true;
+            structureNodes.push(d);
+          }
+        }
+
+        const headerLike = [];
+        const nonEventLabels = [];
+        const candidates = [];
+        const allLabels = [];
+        const sourceTried = [];
+        let hiddenCount = 0;
+        let sourceUsed = null;
+        let selectorUsed = null;
+
+        const consume = (node, source) => {
+          if (!node.area) { hiddenCount++; return false; }
+          const texts = [node.ariaLabel, node.title, node.text]
+            .concat(Object.values(node.data || {}))
+            .map(norm)
+            .filter((t) => t && t.length <= 300);
+          let hit = false;
+          for (const t of texts) {
+            if (isEventSignature(t)) { allLabels.push(t); hit = true; }
+            else {
+              const r = reasonOf(t);
+              if (r === 'header-misclassified') headerLike.push(t);
+              else if (r) nonEventLabels.push({ label: t, reason: r });
+            }
+          }
+          if (texts.length && candidates.length < 30) {
+            candidates.push({
+              label: (texts[0] || '').slice(0, 160),
+              source, tag: node.tag, role: node.role, cls: node.cls,
+              data: node.data, inGrid: node.inGrid === true,
+              visible: node.area, offsetParentNull: node.offsetParentNull
+            });
+          }
+          return hit;
+        };
+
+        for (const step of plan) {
+          let nodes = [];
+          if (step.selector) {
+            for (const el of safeQSA(step.selector)) nodes.push(describe(el));
+          } else if (step.source === 'text') {
+            nodes = structureNodes;
+          } else {
+            // title/data-attr: alle Knoten MIT Flaeche im Dokument (bewusst
+            // breit — diese Attribute sind billig zu lesen und eindeutig).
+            for (const el of safeQSA('*')) {
+              const r = rectOf(el);
+              if (areaOf(r)) nodes.push(describe(el));
+            }
+          }
+          let matched = 0;
+          for (const n of nodes) if (consume(n, step.source)) matched++;
+          sourceTried.push({ source: step.source, selector: step.selector || '(struktur)', nodes: nodes.length, matched });
+          if (matched > 0 && !sourceUsed) { sourceUsed = step.source; selectorUsed = step.selector || `(struktur:${step.source})`; break; }
+        }
+
+        const dedupe = (arr) => { const o = []; const s = new Set(); for (const l of arr) if (!s.has(l)) { s.add(l); o.push(l); } return o; };
+        const dedupeReasons = (arr) => { const o = []; const s = new Set(); for (const e of arr) if (!s.has(e.label)) { s.add(e.label); o.push(e); } return o; };
+        const labels = cap(dedupe(allLabels), 60);
+        return {
+          labels,
+          eventElementsFound: labels.length,
+          selectorUsed: selectorUsed || '(keine-quelle-mit-treffer)',
+          sourceUsed,
+          sourceTried,
+          hiddenCount,
+          headerLikeLabels: cap(dedupe(headerLike), 20),
+          nonEventLabels: cap(dedupeReasons(nonEventLabels), 20),
+          candidates: cap(candidates, 20),
+          census: {
+            scannedCount,
+            truncated,
+            dayColumns: cap(dayColumns, 10),
+            clockRuler: cap(clockRuler, 16),
+            structureNodes: structureNodes.length,
+            scanned: cap(structureNodes, CENSUS_MAX_NODES)
+          }
+        };
+      },
+      { pats: EVENT_LABEL_PATTERNS, plan: eventSourcePlan(preferSelector), clockStrict: CLOCK_LABEL_PATTERN, weekStart: weekStartIso }
+    );
+    return { collectError: null, ...res };
+  } catch (e) {
+    collectError = String((e && e.message) || e).slice(0, 160);
     return {
-      labels: [],
-      eventElementsFound: 0,
-      selectorUsed: last,
-      hiddenCount,
-      headerLikeLabels: cap(dedupe(allHeaderLike), 20),
-      nonEventLabels: cap(dedupeNonEvent(allNonEvent), 20),
-      candidates: []
+      labels: [], eventElementsFound: 0, selectorUsed: 'error', sourceUsed: null,
+      sourceTried: [], hiddenCount: 0, headerLikeLabels: [], nonEventLabels: [],
+      candidates: [], collectError,
+      census: { scannedCount: 0, truncated: false, dayColumns: [], clockRuler: [], structureNodes: 0, scanned: [] }
     };
-  }, { pats: EVENT_LABEL_PATTERNS, prefer: preferSelector }).catch(() => ({
-    labels: [], eventElementsFound: 0, selectorUsed: 'error', hiddenCount: 0,
-    headerLikeLabels: [], nonEventLabels: [], candidates: []
-  }));
+  }
 }
 
 // Löst aus den gesammelten Kandidaten-Texten die gerenderte Kalenderwoche auf.
@@ -821,8 +1282,8 @@ export const FREEBUSY_EVENT_WAIT_RESERVE_MS = 5000;
 // Poll-Intervall der Event-Wartephase.
 export const FREEBUSY_EVENT_WAIT_POLL_MS = 500;
 
-// Mögliche Ausgänge der Event-Wartephase (Diagnose-Feld eventWaitOutcome).
-export const EVENT_WAIT_OUTCOMES = ['found', 'budget-exhausted', 'not-rendered'];
+// Die möglichen Ausgänge der Event-Wartephase (Diagnose-Feld eventWaitOutcome)
+// sind bei resolveEventWaitOptionen definiert — dort Single Source of Truth.
 
 // Wartebudget = min(Cap, Restzeit - Reserve), nie negativ. Runde-6-Kennzahlen als
 // Beispiel: remainingMs 40859 -> 20000 (Cap greift), remainingMs 6000 -> 1000,
@@ -886,6 +1347,12 @@ export function canClickSameDirection({ lastClickDirection = null, direction = 0
 // Hinweis, wenn die Event-Wartephase ohne echte Events endete. Reine Funktion.
 export function eventWaitWarning({ outcome, waitedMs = 0, budgetMs = null } = {}) {
   if (outcome === 'found') return null;
+  if (outcome === 'not-found') {
+    return `Nach ${Math.round(waitedMs)}ms Wartephase (Budget ${budgetMs === null ? 'n/a' : budgetMs}ms) ` +
+      `wurden KEINE Event-Knoten im DOM gelesen. ` +
+      `0 Busy-Slots bedeuten damit KEINEN leeren Kalender, sondern ein nicht auslesbares Grid ` +
+      `(siehe diagnostics.census/sourceTried).`;
+  }
   if (outcome === 'budget-exhausted') {
     return `Event-Wartephase nach ${Math.round(waitedMs)}ms ohne echtes Event-Label beendet ` +
       `(Budget ${budgetMs === null ? 'n/a' : budgetMs}ms, Reserve für Extraktion abgezogen). ` +
