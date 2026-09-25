@@ -2753,14 +2753,14 @@ export class OwaClient {
     );
 
     // Hinweise zusammenbauen (Verifikationsstatus + Range-Abdeckung)
-      'Prev/Next-Ableitung) die Zielwoche, sind KEINE Button-Klicks nötig; Buttons nur bei Abweichung.';
-    if (dataQuality === 'unverified') {
-      note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
-    }
     let note = 'Busy-Slots aus ARIA-Labels der Kalender-Event-Elemente der Wochenansicht extrahiert ' +
       '(Datum/Zeit strukturiert geparst, Work-Location-Pseudo-Slots entfernt, Zeit-Duplikate zusammengeführt, ' +
       'per Wortliste klassifiziert, auf den angefragten Zeitraum gefiltert). ' +
       'Navigation: startdate-Param ist Primärsignal — bestätigt der sichtbare Wochen-Header (Range oder ' +
+      'Prev/Next-Ableitung) die Zielwoche, sind KEINE Button-Klicks nötig; Buttons nur bei Abweichung.';
+    if (dataQuality === 'unverified') {
+      note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
+    }
     if (dataQuality === 'unverified-empty') {
       note += ` WARNUNG: Woche ${rendered.startDate || '?'} ist verifiziert, aber im DOM wurden ` +
         `0 Event-Knoten gelesen (Quellen: ${(eventCollection.sourceTried || []).map((s) => s.source).join(', ') || 'keine'}). ` +
@@ -2780,14 +2780,14 @@ export class OwaClient {
 
     const result = {
       status: 'ok',
-        text: rendered.text,
-        startDate: rendered.startDate,
-        endDate: rendered.endDate
-      },
       start: startDt,
       end: endDt,
       calendar: 'Firmenkalender (Outlook Web)',
       renderedWeek: {
+        text: rendered.text,
+        startDate: rendered.startDate,
+        endDate: rendered.endDate
+      },
       // Wochen-Nachweis getrennt von der Event-Belastbarkeit (Defekt 2): die
       // Wochen-Verifikation funktioniert und bleibt so sichtbar.
       weekVerified,
@@ -2812,14 +2812,14 @@ export class OwaClient {
         early: earlyDiagnostics,
         weekButtonProbe,
         abortReason,
-        rejectionReasons: rejectionReasons.slice(0, 40),
-        waitedForEventsMs: Math.round(eventWait.waitedMs),
-        eventWaitOutcome: eventWait.outcome
-      });
         budget: freeBusyBudgetReport(),
         eventElementsFound,
         selectorUsed,
         rawEventLabels: rawLabels.slice(0, 20),
+        rejectionReasons: rejectionReasons.slice(0, 40),
+        waitedForEventsMs: Math.round(eventWait.waitedMs),
+        eventWaitOutcome: eventWait.outcome
+      });
       diag.weekVerified = weekVerified;
       diag.dataQuality = dataQuality;
       diag.eventWaitPolls = eventWait.polls;
