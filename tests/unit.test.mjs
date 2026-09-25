@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, formatCalendarDiagnostics } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -231,6 +231,16 @@ describe('parseWeekHeaderText - Wochen-Header der Kalenderansicht', () => {
     const out = parseWeekHeaderText('28. September – 2. Oktober', new Date(2026, 8, 24));
     assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-02' });
   });
+
+  test('Numerischer Wochen-Header ("28.9. – 4.10.2026") wird geparst (Runde-2-Lücke)', () => {
+    const out = parseWeekHeaderText('28.9. – 4.10.2026', new Date(2026, 8, 24));
+    assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-04' });
+  });
+
+  test('Numerischer Wochen-Header ohne Jahr ("28.9. - 4.10.") nutzt das aktuelle Jahr', () => {
+    const out = parseWeekHeaderText('28.9. - 4.10.', new Date(2026, 8, 24));
+    assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-04' });
+  });
 });
 
 describe('parseEventLabel - strukturierte Busy-Slots aus ARIA-Labels', () => {
@@ -413,6 +423,220 @@ describe('parseMailRowTimestamp - Datum aus Nachrichtenlisten-Zeilen', () => {
   test('Text ohne Datum liefert null', () => {
     assert.equal(parseMailRowTimestamp('Nur ein Betreff ohne Datum', now), null);
     assert.equal(parseMailRowTimestamp('', now), null);
+  });
+});
+
+describe('parseNumericDayHeaderText - numerische Tages-Spaltenköpfe (Runde-2-Lücke)', () => {
+  const now = new Date(2026, 8, 24);
+
+  test('DE-Kurzformat "Montag, 28.9." -> 2026-09-28', () => {
+    assert.equal(parseNumericDayHeaderText('Montag, 28.9.', now), '2026-09-28');
+  });
+
+  test('Ohne Wochentag "28.9." -> 2026-09-28', () => {
+    assert.equal(parseNumericDayHeaderText('28.9.', now), '2026-09-28');
+  });
+
+  test('Mit Jahr "28.9.2026" -> 2026-09-28', () => {
+    assert.equal(parseNumericDayHeaderText('28.9.2026', now), '2026-09-28');
+  });
+
+  test('Wochentag-Kürzel "Di 29.9." -> 2026-09-29', () => {
+    assert.equal(parseNumericDayHeaderText('Di 29.9.', now), '2026-09-29');
+  });
+
+  test('Umschalter-Text ohne Datum -> null', () => {
+    assert.equal(parseNumericDayHeaderText('Work week', now), null);
+    assert.equal(parseNumericDayHeaderText('Arbeitswoche', now), null);
+  });
+
+  test('Uhrzeit ist kein Datum -> null', () => {
+    assert.equal(parseNumericDayHeaderText('14:00', now), null);
+  });
+
+  test('Ungültiges Datum (32.13.) -> null', () => {
+    assert.equal(parseNumericDayHeaderText('32.13.', now), null);
+  });
+
+  test('Leerer/undefinierter Text -> null', () => {
+    assert.equal(parseNumericDayHeaderText('', now), null);
+    assert.equal(parseNumericDayHeaderText(null, now), null);
+  });
+});
+
+describe('resolveRenderedWeekFromCandidates - Wochen-Erkennung aus Kandidaten', () => {
+  const now = new Date(2026, 8, 24);
+
+  test('Live-Fail Runde 2: Nur Umschalter-Texte ("Work week") -> renderedWeek komplett null', () => {
+    // Der Umschalter darf NIE als renderedWeek.text mit null-Daten durchkommen.
+    const out = resolveRenderedWeekFromCandidates(
+      { headerTexts: ['Work week', 'Posteingang'], dayHeaderTexts: [] }, now
+    );
+    assert.equal(out.startDate, null);
+    assert.equal(out.endDate, null);
+    assert.equal(out.text, null);
+  });
+
+  test('Wochen-Range-Header mit Monatsnamen wird erkannt', () => {
+    const out = resolveRenderedWeekFromCandidates(
+      { headerTexts: ['Work week', '28. September – 4. Oktober 2026'], dayHeaderTexts: [] }, now
+    );
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+  });
+
+  test('Tages-Spaltenkopf mit Monatsname ("Montag, 28. September") leitet die Woche ab', () => {
+    const out = resolveRenderedWeekFromCandidates(
+      { headerTexts: ['Work week'], dayHeaderTexts: ['Montag, 28. September'] }, now
+    );
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+  });
+
+  test('Numerischer Tages-Spaltenkopf ("Montag 28.9.") leitet die Woche ab (Runde-2-Lücke)', () => {
+    const out = resolveRenderedWeekFromCandidates(
+      { headerTexts: ['Work week'], dayHeaderTexts: ['Montag 28.9.'] }, now
+    );
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+  });
+
+  test('Body-Text-Heuristik-Zeile ("Montag, 28. September") wird als Tageskopf-Kandidat gewertet', () => {
+    const out = resolveRenderedWeekFromCandidates(
+      { headerTexts: [], dayHeaderTexts: ['Montag, 28. September'] }, now
+    );
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+  });
+
+  test('Numerischer Range im Tageskopf-Kandidaten ("28.9. – 4.10.2026") wird erkannt', () => {
+    const out = resolveRenderedWeekFromCandidates(
+      { headerTexts: [], dayHeaderTexts: ['28.9. – 4.10.2026'] }, now
+    );
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+  });
+
+  test('Leere Kandidaten -> unknown (alles null)', () => {
+    const out = resolveRenderedWeekFromCandidates({ headerTexts: [], dayHeaderTexts: [] }, now);
+    assert.equal(out.startDate, null);
+    assert.equal(out.endDate, null);
+    assert.equal(out.text, null);
+  });
+
+  test('Fehlendes Kandidaten-Objekt -> unknown (defensiver Default)', () => {
+    const out = resolveRenderedWeekFromCandidates(undefined, now);
+    assert.equal(out.startDate, null);
+    assert.equal(out.text, null);
+  });
+});
+
+describe('isWorkLocationPseudoSlot - Work-Location/Pseudo-Slot-Filter (Beauty-Fix Runde 2)', () => {
+  test('"(ohne Titel)"-Schnipsel werden ausgeschlossen', () => {
+    assert.equal(isWorkLocationPseudoSlot('(ohne Titel)'), true);
+    assert.equal(isWorkLocationPseudoSlot('(No title)'), true);
+    assert.equal(isWorkLocationPseudoSlot('Ohne Titel'), true);
+    assert.equal(isWorkLocationPseudoSlot(''), true);
+    assert.equal(isWorkLocationPseudoSlot(null), true);
+    assert.equal(isWorkLocationPseudoSlot(undefined), true);
+  });
+
+  test('Arbeitsort-/Working-Location-Begriffe werden ausgeschlossen', () => {
+    assert.equal(isWorkLocationPseudoSlot('Arbeitsort: Homeoffice'), true);
+    assert.equal(isWorkLocationPseudoSlot('Working location: Office'), true);
+    assert.equal(isWorkLocationPseudoSlot('Homeoffice'), true);
+    assert.equal(isWorkLocationPseudoSlot('Home Office'), true);
+    assert.equal(isWorkLocationPseudoSlot('Büro'), true);
+  });
+
+  test('URL-Schnipsel als Titel werden ausgeschlossen', () => {
+    assert.equal(isWorkLocationPseudoSlot('https://teams.microsoft.com/l/meetup-join/xyz'), true);
+    assert.equal(isWorkLocationPseudoSlot('http://example.com'), true);
+  });
+
+  test('Echte Termine bleiben erhalten', () => {
+    assert.equal(isWorkLocationPseudoSlot('Team Meeting'), false);
+    assert.equal(isWorkLocationPseudoSlot('FIT-Connect'), false);
+    assert.equal(isWorkLocationPseudoSlot('Urlaub'), false);
+    assert.equal(isWorkLocationPseudoSlot('Besprechung Bürogebäude 4. OG'), false);
+  });
+});
+
+describe('dedupeBusySlots - Zeit-Duplikate zusammenführen (Beauty-Fix Runde 2)', () => {
+  const mk = (date, start, end, title, allDay = false) => ({ date, start, end, title, allDay, raw: '' });
+
+  test('Identisches Datum+Zeit+Titel nur 1x', () => {
+    const out = dedupeBusySlots([
+      mk('2026-09-25', '09:00', '10:00', 'Sync'),
+      mk('2026-09-25', '09:00', '10:00', 'Sync')
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].title, 'Sync');
+  });
+
+  test('Überlappende Duplikate gleicher Zeit werden zusammengeführt (echter Titel gewinnt)', () => {
+    const out = dedupeBusySlots([
+      mk('2026-09-25', '09:00', '09:30', '(ohne Titel)'),
+      mk('2026-09-25', '09:00', '09:30', 'FIT-Connect')
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].title, 'FIT-Connect');
+  });
+
+  test('Verschiedene Zeiten bleiben erhalten', () => {
+    const out = dedupeBusySlots([
+      mk('2026-09-25', '09:00', '10:00', 'A'),
+      mk('2026-09-25', '14:00', '15:00', 'B'),
+      mk('2026-09-28', '09:00', '10:00', 'A')
+    ]);
+    assert.equal(out.length, 3);
+  });
+
+  test('Ganztag-Slots am gleichen Tag werden zusammengeführt', () => {
+    const out = dedupeBusySlots([
+      mk('2026-09-28', null, null, 'Urlaub', true),
+      mk('2026-09-28', null, null, 'Urlaub', true)
+    ]);
+    assert.equal(out.length, 1);
+  });
+
+  test('Leere/defekte Slots werden ignoriert', () => {
+    const out = dedupeBusySlots([null, mk('2026-09-25', '09:00', '10:00', 'A'), {}]);
+    assert.equal(out.length, 1);
+  });
+});
+
+describe('formatCalendarDiagnostics - Diagnostik-Formatierung für Guards (Runde-3-Forderung)', () => {
+  test('Enthält URL, Kandidaten, ARIA-Anzahl und Sample', () => {
+    const out = formatCalendarDiagnostics({
+      url: 'https://outlook.cloud.microsoft/calendar/view/week?startdate=2026-09-28',
+      headerCandidates: ['Work week'],
+      dayHeaderCandidates: ['Montag 28.9.'],
+      ariaButtonCount: 42,
+      ariaLabelSample: ['Team Meeting, 14:00 bis 15:00, Montag, 28. September']
+    });
+    assert.ok(out.includes('outlook.cloud.microsoft'));
+    assert.ok(out.includes('Work week'));
+    assert.ok(out.includes('Montag 28.9.'));
+    assert.ok(out.includes('42'));
+    assert.ok(out.includes('Team Meeting'));
+  });
+
+  test('Leere Kandidatenlisten werden als "(keine)" ausgewiesen', () => {
+    const out = formatCalendarDiagnostics({
+      url: 'https://outlook.office.com/calendar',
+      headerCandidates: [],
+      dayHeaderCandidates: [],
+      ariaButtonCount: 0,
+      ariaLabelSample: []
+    });
+    assert.ok(out.includes('(keine)'));
+    assert.ok(out.includes('ARIA-Buttons gesamt: 0'));
+  });
+
+  test('Ohne Diagnostik -> Platzhalter', () => {
+    assert.equal(formatCalendarDiagnostics(null), '(keine Diagnostik verfügbar)');
+    assert.equal(formatCalendarDiagnostics(undefined), '(keine Diagnostik verfügbar)');
   });
 });
 
