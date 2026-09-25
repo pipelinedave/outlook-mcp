@@ -1789,8 +1789,19 @@ export function formatCalendarDiagnostics(diag) {
 export const FREEBUSY_TOTAL_BUDGET_MS = 45000;
 
 // Rationierung der Button-Klicks gegen das Budget (Runde-4-Forderung A):
-// max. 6 Klicks mit je max. 4s Re-Render-Wartezeit.
-export const FREEBUSY_MAX_BUTTON_CLICKS = 6;
+// je max. 4s Re-Render-Wartezeit pro Klick.
+//
+// FIX 3 (Live-Lauf 5, 26.09.2026): 6 -> 2. Belege aus Lauf 5 Aufruf 1:
+//   6 Klicks in der Folge prev/next/prev/next, dann abortReason 'max-clicks',
+//   budget.usedMs 8706 — bei einer View, die die GANZE ZEIT korrekt auf KW 39
+//   stand. Die Klicks haben die Woche nicht der Zielwoche naehergebracht, sie
+//   haben sie nur hin und her gezogen.
+//
+// Fuer die Kalenderwochen-Navigation genuegen ZWO Klicks (eine Woche vor und
+// eine Woche zurueck). Ist mehr noetig, gibt es den ehrlichen Abbruchgrund
+// 'too-far' — die startdate-URL wird als EIN Versuch versucht (und in Lauf 5
+// hat sie die View nicht bewegt), aber nicht als Beleg gewertet.
+export const FREEBUSY_MAX_BUTTON_CLICKS = 2;
 export const FREEBUSY_CLICK_RENDER_WAIT_MS = 4000;
 
 // Früher Kontroll-Return: Liegt nach Navigation + Render-Warten kein datierter
@@ -1988,8 +1999,7 @@ export const EVENT_WAIT_ABORT_REASONS = {
   renderedEmpty: 'rendered-empty-proven',
   budgetExhausted: 'wait-budget-exhausted',
   notPolled: 'wait-not-polled',
-  budgetUnavailable: 'wait-budget-unavailable',
-  // BUG 4: Events sichtbar, aber keins aus dem angefragten Zeitraum. Das ist
+  budgetUnavailable: 'wait-budget-unavailable',  // BUG 4: Events sichtbar, aber keins aus dem angefragten Zeitraum. Das ist
   // KEIN Leer-Beweis (der Leer-Beweis bleibt 'rendered-empty-proven') und auch
   // kein Treffer — die Ansicht zeigt dann etwas anderes als die Zielwoche.
   eventsOutsideRange: 'events-outside-requested-range',
@@ -2048,6 +2058,14 @@ export function countLabelsInRange(labels = [], { rangeStartMs = null, rangeEndM
 // Klassifiziert EINE Beobachtung der Wartephase. Reine Funktion, EIN Aufrufort.
 // `weekHeader` ist das Ergebnis des Wochen-Reads, `inRangeLabels` die Zahl der
 // Labels aus dem angefragten Zeitraum.
+//
+// FIX 2 (Live-Lauf 5): 'found' ist BEREICHS-qualifiziert, nicht nur
+// DATUMS-qualifiziert. Live: eventWaitDateQualified:true bei
+// eventWaitInRangeLabels:0 -> found nach 41ms von 20000ms Budget. Ein
+// datierter Header der FALSCHEN Woche ist ein GEGENBELEG ("die Ansicht zeigt
+// nachweislich eine andere Woche"), kein Beleg. Er bekommt deshalb einen
+// eigenen, benannten Zustand (header-outside-requested-range) und loest
+// weder 'found' noch den Leer-Beweis aus.
 export function eventWaitObservationState({
   eventElementsFound = 0,
   loading = false,
@@ -2059,14 +2077,6 @@ export function eventWaitObservationState({
   const n = Number(eventElementsFound) || 0;
   const inRange = Number(inRangeLabels) || 0;
   // Ohne Zielzeitraum ist KEIN datumsqualifizierter Beleg moeglich — auch dann
-//
-// FIX 2 (Live-Lauf 5): 'found' ist BEREICHS-qualifiziert, nicht nur
-// DATUMS-qualifiziert. Live: eventWaitDateQualified:true bei
-// eventWaitInRangeLabels:0 -> found nach 41ms von 20000ms Budget. Ein
-// datierter Header der FALSCHEN Woche ist ein GEGENBELEG ("die Ansicht zeigt
-// nachweislich eine andere Woche"), kein Beleg. Er bekommt deshalb einen
-// eigenen, benannten Zustand (header-outside-requested-range) und loest
-// weder 'found' noch den Leer-Beweis aus.
   // nicht, wenn Labels vorhanden sind: "im angefragten Zeitraum" ist ohne
   // Zielzeitraum nicht definierbar. Diese Pruefung steht VOR den Beleg-
   // Kriterien, sonst wuerde ein weekenblind konfigurierter Aufruf doch noch
@@ -2165,19 +2175,19 @@ export async function waitForCalendarEvents({
       // BEWEIS FUER "NOCH NICHT FERTIG": der Spinner haelt den Poll am Leben.
       loadingPolls++;
       quietSince = null;
-    } else if (st.category === EVENT_WAIT_STATES.outsideRange) {
-      // BUG 4: Events sind da, aber keine aus dem angefragten Zeitraum. Das
-      // startet KEIN Ruhe-Fenster — ein Leer-Beweis waere hier eine Falschaussage.
-      // Genauso wird ein bestehendes Ruhe-Fenster invalidiert, weil sich das DOM
-      // nachweislich geaendert hat. Es wird bis zum Budget weiter gepollt.
-      outsideRangePolls++;
-      quietSince = null;
     } else if (st.category === EVENT_WAIT_STATES.headerOutsideRange) {
       // FIX 2: datierter Header der falschen Woche. startet KEIN Ruhe-Fenster
       // (es ist ein GEGENBELEG, kein Leer-Beweis) und invalidiert ein
       // bestehendes. Es wird bis zum Budget weiter gepollt — die Zielwoche
       // kann noch umschalten (Klick/Navigation/Rendering).
       headerOutsideRangePolls++;
+      quietSince = null;
+    } else if (st.category === EVENT_WAIT_STATES.outsideRange) {
+      // BUG 4: Events sind da, aber keine aus dem angefragten Zeitraum. Das
+      // startet KEIN Ruhe-Fenster — ein Leer-Beweis waere hier eine Falschaussage.
+      // Genauso wird ein bestehendes Ruhe-Fenster invalidiert, weil sich das DOM
+      // nachweislich geaendert hat. Es wird bis zum Budget weiter gepollt.
+      outsideRangePolls++;
       quietSince = null;
     } else if (st.category === EVENT_WAIT_STATES.emptyCandidate) {
       if (quietSince === null) quietSince = now();
@@ -2611,6 +2621,7 @@ export async function runWeekButtonClick({
   const notReached = (reason, rendered) => ({
     clicked: false, week: rendered || null, verified: 'guard-blocked', foundAny: false, clickedAny: false,
     targetReached: reason === WEEK_CLICK_GUARD_REASONS.targetReached,
+    effect: CLICK_EFFECTS.unverified,
     guard: reason
   });
 
@@ -2693,11 +2704,22 @@ export async function runWeekButtonClick({
     targetWeekNow = null;
     // eslint-disable-next-line no-await-in-loop
     const r = await afterClick(prevStart, clickWaitMs);
-    probe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified });
+    // FIX 3: die Annahme des Klicks wird am ANGEZEIGTEN Header bewertet
+    // (classifyClickEffect), nicht daran festgemacht, dass sich ueberhaupt
+    // etwas bewegt hat ('changed'). Der Aufrufer entscheidet danach ueber
+    // advanced/overshoot/unverified — er KANN nicht mehr blind weiterklicken.
+    const effect = classifyClickEffect({ prevStart, newWeek: r && r.week, targetStart, direction });
+    probe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified, effect });
     if (shouldTryNextCandidate(r.verified)) continue; // wirkungslos -> naechster Kandidat
-    return { clicked: true, week: r.week, verified: r.verified, foundAny, clickedAny, targetReached: false, guard: WEEK_CLICK_GUARD_REASONS.click };
+    return {
+      clicked: true, week: r.week, verified: r.verified, effect, foundAny, clickedAny,
+      targetReached: effect === CLICK_EFFECTS.reached, guard: WEEK_CLICK_GUARD_REASONS.click
+    };
   }
-  return { clicked: false, week: null, verified: 'not-found', foundAny, clickedAny, targetReached: false, guard: null };
+  return {
+    clicked: false, week: null, verified: 'not-found', effect: CLICK_EFFECTS.unchanged,
+    foundAny, clickedAny, targetReached: false, guard: null
+  };
 }
 
 // Darf in dieselbe Richtung erneut geklickt werden?
@@ -2825,6 +2847,51 @@ export function evaluateClickVerification(prevStart, newWeek) {
   return newStart !== prevStart ? 'changed' : 'unchanged';
 }
 
+// ---------------------------------------------------------------------------
+// FIX 3 (Live-Lauf 5): die Navigation war ungerichtet, unverifiziert und
+// unbegrenzt.
+// ---------------------------------------------------------------------------
+// Lauf 5 Aufruf 1, Live-Belege:
+//   - 6 Klicks in der Folge prev/next/prev/next, dann abortReason 'max-clicks',
+//     budget.usedMs 8706 — obwohl die View die GANZE ZEIT korrekt auf KW 39 stand
+//     und der angefragte Range 21.09.–02.10. KW 39 EINSCHLIESST.
+//   - Die Verifikation stuetzte sich auf 'changed' ("hat sich irgendetwas
+//     bewegt"), nicht darauf, ob sich die Woche der Zielwoche NAEHERT.
+//
+// 'changed' ist die schwächste mögliche Aussage. Notwendig ist die
+// WIRKUNG in Bezug auf das Ziel: hat sich die angezeigte Woche in
+// Klickrichtung um eine Woche bewegt, steht sie jetzt wochenrichtig, oder hat
+// sie die Zielwoche uebersprungen?
+export const CLICK_EFFECTS = {
+  // Vor oder nach dem Klick war kein datierter Header lesbar -> nicht bewertbar.
+  unverified: 'unverified',
+  // Header lesbar, Startdatum unveraendert -> der Klick hat nichts bewegt.
+  unchanged: 'unchanged',
+  // Die Zielwoche ist jetzt angezeigt.
+  reached: 'reached',
+  // Der Klick hat die Woche in Klickrichtung um eine Woche bewegt.
+  advanced: 'advanced',
+  // Der Klick hat die Woche in die GEGENRICHTUNG bewegt (oder mehr als eine
+  // Woche gesprungen): die Zielwoche wurde uebersprungen.
+  overshoot: 'overshoot'
+};
+
+// Wirkung EINES Klicks, bewertet am ANGEZEIGTEN Header (nicht an 'changed').
+// Reine Funktion, EIN Aufrufort (runWeekButtonClick).
+export function classifyClickEffect({ prevStart = null, newWeek = null, targetStart = null, direction = 0 } = {}) {
+  const newStart = newWeek && newWeek.startDate ? newWeek.startDate : null;
+  if (!newStart || !prevStart) return CLICK_EFFECTS.unverified;
+  if (newStart === prevStart) return CLICK_EFFECTS.unchanged;
+  // Die Zielwoche ist das staerkste Signal und wird VOR der Richtung geprueft.
+  if (renderedWeekContains(newWeek, targetStart)) return CLICK_EFFECTS.reached;
+  const stepWeeks = Math.round(
+    (new Date(newStart + 'T00:00:00') - new Date(prevStart + 'T00:00:00')) / (7 * 86400000)
+  );
+  const dir = Math.sign(direction);
+  if (dir !== 0 && Math.sign(stepWeeks) === dir) return CLICK_EFFECTS.advanced;
+  return CLICK_EFFECTS.overshoot;
+}
+
 // Nur bei NACHWEISLICH wirkungslosem Klick (Header lesbar und UNVERÄNDERT) wird
 // der nächste Selektor-Kandidat versucht — bei 'unverified' nie (Gefahr des
 // Doppel-Advancierens, wenn der erste Klick doch gewirkt hat).
@@ -2844,7 +2911,7 @@ export function classifyButtonFailure({ foundAny = false, clickedAny = false } =
 // (Runde-4-Forderung B): Der frühe Snapshot (direkt nach Navigation erhoben)
 // bleibt immer erhalten, auch wenn das Budget für eine frische Erhebung nicht
 // mehr reicht. Klick-Protokoll, Abbruchgrund und Budget-Report kommen hinzu.
-export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null, waitedForEventsMs = null, eventWaitOutcome = null, eventWaitAbortReason = null, eventWaitLoadingPolls = null, loadingIndicators = null, headerReadError = null } = {}) {
+export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null, waitedForEventsMs = null, eventWaitOutcome = null, eventWaitAbortReason = null, eventWaitLoadingPolls = null, loadingIndicators = null, headerReadError = null, navAttempts = null } = {}) {
   const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], weekNavCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
   const out = {
     ...base,
@@ -2857,6 +2924,9 @@ export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekBu
   // und wird auch in den FRUEHEN Abbruchpfaden sichtbar — sonst waere dort die
   // Diagnose "nichts gefunden" (und die Versuchung, den Button-Text zu nehmen).
   if (headerReadError) out.headerReadError = headerReadError;
+  // FIX 3: die Navigations-Versuche mit ihrem Beleg (weekBefore/weekAfter/
+  // movedView). Die URL-Korrektheit wird nirgends als Beleg der View gewertet.
+  if (Array.isArray(navAttempts) && navAttempts.length) out.navAttempts = navAttempts;
   // Runde-5-Kernlücke: Slot-Extraktions-Diagnostik auch im Erfolgsfall (status ok),
   // damit ein echter Free-Tag von einem Extraktions-Miss unterscheidbar ist.
   if (eventElementsFound !== null) out.eventElementsFound = eventElementsFound;
@@ -3518,6 +3588,13 @@ export class OwaClient {
     // zurückgegeben — so ist sichtbar, welcher Kandidat existierte/welcher
     // geklickt wurde bzw. dass gar kein Button gefunden wurde.
     const weekButtonProbe = [];
+    // FIX 1/FIX 3: Beide Felder werden hier deklariert und NICHT weiter unten —
+    // die fruehen Abbruchpfade (no-calendar-tab, early-no-dated-header) liegen
+    // VOR der Klick-Schleife und brauchen sie schon. Das ist exakt die TDZ-Falle
+    // aus 0d47105 und 8eb70cc: ein `let` nach der schliessenden Klammer einer
+    // fruehen Rueckgabe.
+    let headerReadError = null;
+    const navAttempts = [];
 
     // Kompakter Budget-Report für die Diagnostik (wo ging die Zeit verloren?)
     const freeBusyBudgetReport = () => ({
@@ -3824,14 +3901,21 @@ export class OwaClient {
     }
 
     // Button-basierte Wochen-Korrektur (PRIMÄRPFAD): Vor/Zurück bis die gerenderte
-    // Woche der Zielwoche entspricht. Rationierung gegen das Gesamtbudget
-    // (Runde-4-Forderung A): max. 6 Klicks, jeder Klick nur bei ausreichendem
-    // Restbudget; Eskalationsstufen (frische Navigation, Fernsprung) nur, wenn
-    // das Budget sie noch trägt — sonst Abbruch mit dem, was da ist.
+    // Woche der Zielwoche entspricht.
+    //
+    // FIX 3: die Klick-Rationierung ist auf FREEBUSY_MAX_BUTTON_CLICKS (= 2)
+    // verschärft. Eine Kalenderwochen-Navigation braucht fuer den belegten Fall
+    // EINE Woche vor/zurueck; in Lauf 5 wurden 6 Klicks in der Folge
+    // prev/next/prev/next abgesetzt (8706ms Budget) und dann 'max-clicks'
+    // gemeldet — bei einer View, die die ganze Zeit richtig war. Bei Mehrbedarf
+    // gibt es jetzt einen EHRlichen Abbruchgrund ('too-far'), kein Blindklicken.
     const MAX_BUTTON_CLICKS = FREEBUSY_MAX_BUTTON_CLICKS;
-    // FIX 1: der Grund, warum kein angezeigter Header gelesen werden konnte
-    // (null = Header gelesen). Wird unabhaengig vom Abbruch-Pfad berichtet.
-    let headerReadError = null;
+    // FIX 3: die Richtung wird aus der DIFFERenz angefragte vs. angezeigte
+    // Woche bestimmt und fuer den Aufruf VERRIEGELT. In Lauf 5 wechselte sie
+    // pro Iteration (prev/next/prev/next) — das ist per Definition kein
+    // gerichteter Weg zur Zielwoche. Ein Richtungswechsel wird als
+    // 'week-overshoot' gemeldet, nicht durchgefuehrt.
+    let lockedDirection = null;
     let gotoRetryDone = false;
     let farJumpDone = false;
     // BUG 5: 1x harter Reload der startdate-URL als Notfallweg fuer Zustand 1.
@@ -3883,10 +3967,22 @@ export class OwaClient {
         // braucht: harter Reload der startdate-URL (1x, budgetiert).
         if (!reloadDone && remaining() >= FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS) {
           reloadDone = true;
+          // FIX 3: der Reload bleibt EIN Versuch, und seine WIRKUNG wird
+          // belegt statt behauptet. In Lauf 5 war die URL nach dem Reload
+          // korrekt (startdate=2026-09-28) und die View trotzdem KW 39 — die
+          // URL-Korrektheit darf nie als Beleg der View gelten.
+          const before = await readRenderedCalendarWeek(page);
           await hardReloadOptimized();
           const w = await waitForViewReady();
           rendered = w.rendered || rendered;
           hasEvents = w.events === true;
+          navAttempts.push({
+            kind: 'startdate-reload',
+            url: page.url() || null,
+            weekBefore: before.startDate || null,
+            weekAfter: rendered.startDate || null,
+            movedView: Boolean(rendered.startDate && rendered.startDate !== before.startDate)
+          });
           continue;
         }
         // Ehrlicher Abbruch: 'view-not-ready' NACH verbrauchtem Wartebudget. Der
@@ -3910,13 +4006,23 @@ export class OwaClient {
 
       if (Math.abs(deltaWeeks) > MAX_BUTTON_CLICKS) {
         // Zu weit entfernt für Button-Klicks: 1x startdate-URL als Fernsprung
-        // (Optimierung), danach wird wieder verifiziert — nur bei ausreichendem Budget.
+        // (EIN Versuch, kein Beleg), danach wird wieder verifiziert — nur bei
+        // ausreichendem Budget. Wirkt er nicht, bricht der Aufruf mit 'too-far'
+        // ab (Lauf 5: URL korrekt, View unveraendert).
         if (!farJumpDone && remaining() >= 15000) {
           farJumpDone = true;
+          const before = await readRenderedCalendarWeek(page);
           await gotoCalendar(optimizedUrl);
           const retry = await waitForCalendarRendered(phase(6000));
           rendered = retry.rendered;
           hasEvents = hasEvents || retry.hasEvents;
+          navAttempts.push({
+            kind: 'startdate-far-jump',
+            url: page.url() || null,
+            weekBefore: before.startDate || null,
+            weekAfter: rendered.startDate || null,
+            movedView: Boolean(rendered.startDate && rendered.startDate !== before.startDate)
+          });
           continue;
         }
         abortReason = 'too-far';
@@ -3929,6 +4035,16 @@ export class OwaClient {
       // Iteration 7, Defekt 2: In dieselbe Richtung nur nach erneuter Wochen-
       // Bestätigung. Der Rückweg (Gegenrichtung) bleibt ausdrücklich erlaubt.
       const direction = Math.sign(deltaWeeks);
+      // FIX 3: die Richtung kommt aus der DIFFERenz angefragte vs. angezeigte
+      // Woche (oben berechnet) und wird verriegelt. Ein Wechsel der Richtung
+      // waere kein gerichteter Weg zur Zielwoche — er entsteht nur, wenn der
+      // Klick die Zielwoche uebersprungen hat, und wird dann ehrlich benannt.
+      if (lockedDirection === null) {
+        lockedDirection = direction;
+      } else if (Math.sign(direction) !== Math.sign(lockedDirection)) {
+        abortReason = 'week-overshoot';
+        break;
+      }
       if (!canClickSameDirection({ lastClickDirection, direction, weekConfirmedAfterClick })) {
         abortReason = 'same-direction-unconfirmed';
         break;
@@ -3945,12 +4061,28 @@ export class OwaClient {
         rendered = r.week || rendered;
         continue;
       }
+      // FIX 3: Die Zielwoche gilt nur als erreicht, wenn der ANGEZEIGTE Header
+      // sie jetzt traegt (classifyClickEffect -> 'reached'), nicht weil sich
+      // 'irgendetwas bewegt' hat.
       if (r.targetReached) {
-        // Zielwoche verifiziert -> uebernehmen und die Klick-Schleife
-        // verlassen. Bewusst VOR dem !r.clicked-Zweig: ein Skipped-Klick ist
-        // kein Fehlschlag.
         rendered = r.week;
         hasEvents = hasEvents || (await hasEventElements());
+        break;
+      }
+      // FIX 3: der Klick hat die Woche in die Gegenrichtung bewegt bzw. mehr als
+      // eine Woche gesprungen. Weiterzuklicken waere Blindklicken — der Abbruch
+      // benennt die tatsaechliche Ursache.
+      if (r.clicked && r.effect === CLICK_EFFECTS.overshoot) {
+        rendered = r.week || rendered;
+        abortReason = 'week-overshoot';
+        break;
+      }
+      // FIX 3: der Klick ist am angezeigten Header NICHT bewertbar (vor oder
+      // nach dem Klick unlesbar). In Lauf 5 hat genau das die Schleife am Leben
+      // gehalten ('changed' ohne Zielbezug). Ohne Bewertung kein weiterer Klick.
+      if (r.clicked && r.effect === CLICK_EFFECTS.unverified) {
+        rendered = r.week || rendered;
+        abortReason = 'click-unverified';
         break;
       }
       if (!r.clicked) {
@@ -3987,7 +4119,8 @@ export class OwaClient {
         weekButtonProbe,
         abortReason: abortReason !== 'none' ? abortReason : 'week-mismatch',
         budget: freeBusyBudgetReport(),
-        headerReadError
+        headerReadError,
+        navAttempts
       });
       return errorResult(
         `Kalender-Wochenansicht zeigt nicht die angefragte Woche: angefragt ab ${rangeStartDate}, ` +
@@ -4184,6 +4317,17 @@ export class OwaClient {
       `${a.date}T${a.start || '00:00'}`.localeCompare(`${b.date}T${b.start || '00:00'}`)
     );
 
+    // FIX 4: der Widerspruch wird VOR dem Ergebnis berechnet, nicht danach im
+    // Diagnostik-Block. In Lauf 2 stand busySlotsReliable:true GLEICHZEITIG mit
+    // der eigenen Warnung "18 Event-Element(e) im DOM gefunden, aber 0
+    // Busy-Slots extrahiert" — ein Selbstwiderspruch des Ergebnisses.
+    // Die Invariante: sobald der Widerspruchstext entsteht, ist
+    // busySlotsReliable ein hartes false.
+    const extractionWarning = slotExtractionWarning(eventElementsFound, busySlots.length);
+    const busySlotsReliable = resolveBusySlotsReliable({
+      dataQuality, eventElementsFound, busySlotCount: busySlots.length
+    });
+
     // Hinweise zusammenbauen (Verifikationsstatus + Range-Abdeckung)
     let note = 'Busy-Slots aus ARIA-Labels der Kalender-Event-Elemente der Wochenansicht extrahiert ' +
       '(Datum/Zeit strukturiert geparst, Work-Location-Pseudo-Slots entfernt, Zeit-Duplikate zusammengeführt, ' +
@@ -4258,6 +4402,7 @@ export class OwaClient {
         early: earlyDiagnostics,
         weekButtonProbe,
         abortReason: reportedAbortReason,
+        navAttempts,
         budget: freeBusyBudgetReport(),
         eventElementsFound,
         selectorUsed,
@@ -4280,6 +4425,11 @@ export class OwaClient {
       diag.eventWaitDateQualified = eventWait.dateQualified === true;
       diag.eventWaitInRangeLabels = eventWait.inRangeLabels === undefined ? null : eventWait.inRangeLabels;
       diag.eventWaitOutsideRangePolls = eventWait.outsideRangePolls || 0;
+      // FIX 2: der eigene Zaehler fuer "datierter Header der falschen Woche".
+      // Ohne dieses Feld laesst sich in Runde 6 nicht unterscheiden, ob der
+      // Wartepfad an einem Header-Gegenbeleg oder an echter Leere gescheitert ist.
+      diag.eventWaitHeaderOutsideRangePolls = eventWait.headerOutsideRangePolls || 0;
+      if (eventWait.lastState) diag.eventWaitLastState = eventWait.lastState;
       diag.viewWaitMsSpent = Math.round(viewWaitMsSpent);
       // BUG 5: 'Header noch nicht gerendert' und 'Header-Auswertung fehlgeschlagen'
       // waren in Runde 4 nicht unterscheidbar (beide: leere Kandidatenlisten).
@@ -4382,17 +4532,6 @@ export class OwaClient {
 
     await this.openCalendarEventByQuery(targetQuery);
 
-    // FIX 4: der Widerspruch wird VOR dem Ergebnis berechnet, nicht danach im
-    // Diagnostik-Block. In Lauf 2 stand busySlotsReliable:true GLEICHZEITIG mit
-    // der eigenen Warnung "18 Event-Element(e) im DOM gefunden, aber 0
-    // Busy-Slots extrahiert" — ein Selbstwiderspruch des Ergebnisses.
-    // Die Invariante: sobald der Widerspruchstext entsteht, ist
-    // busySlotsReliable ein hartes false.
-    const extractionWarning = slotExtractionWarning(eventElementsFound, busySlots.length);
-    const busySlotsReliable = resolveBusySlotsReliable({
-      dataQuality, eventElementsFound, busySlotCount: busySlots.length
-    });
-
     // Nach dem Öffnen des Events das "Löschen"-/Entfernen-Element finden und klicken.
     // Alle DOM-Vorgänge laufen nach dem dblclick im Editor-Dialog ab. Der Löschen-Button
     // im OWA-Editor hat aria-label "Delete". Echte Playwright-Klicks lösen React-Events
@@ -4426,11 +4565,6 @@ export class OwaClient {
     //    NUR im Bestätigungsdialog suchen (nicht im Editor-Dialog [0], der ebenfalls
     //    einen "Delete"-Button hat). Erkennung über Bestätigungs-Marker im Dialogtext.
     for (let i = 0; i < 5; i++) {
-      // FIX 2: der eigene Zaehler fuer "datierter Header der falschen Woche".
-      // Ohne dieses Feld laesst sich in Runde 6 nicht unterscheiden, ob der
-      // Wartepfad an einem Header-Gegenbeleg oder an echter Leere gescheitert ist.
-      diag.eventWaitHeaderOutsideRangePolls = eventWait.headerOutsideRangePolls || 0;
-      if (eventWait.lastState) diag.eventWaitLastState = eventWait.lastState;
       await page.waitForTimeout(800);
       const confirmHit = await page.evaluate(() => {
         // Nur Dialoge, die wie eine Lösch-Bestätigung aussehen (Textmarker)

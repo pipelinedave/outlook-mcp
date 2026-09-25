@@ -870,7 +870,12 @@ describe('formatCalendarDiagnostics - Diagnostik-Formatierung für Guards (Runde
 describe('FreeBusy-Budget-Konstanten (Runde-4-Forderung A)', () => {
   test('Gesamtbudget sicher unter dem MCP-Client-Timeout, Rationierung konsistent', () => {
     assert.ok(FREEBUSY_TOTAL_BUDGET_MS <= 45000);
-    assert.equal(FREEBUSY_MAX_BUTTON_CLICKS, 6);
+    // FIX 3 (Live-Lauf 5): 6 -> 2. Mit 6 Klicks wurden in Lauf 5 prev/next/
+    // prev/next abgesetzt (8706ms) und dann 'max-clicks' gemeldet — bei einer
+    // View, die die ganze Zeit richtig war. Fuer die Kalenderwochen-Navigation
+    // genuegen 2 (eine Woche vor/zurueck); mehr ergibt den ehrlichen
+    // Abbruchgrund 'too-far'.
+    assert.equal(FREEBUSY_MAX_BUTTON_CLICKS, 2);
     assert.equal(FREEBUSY_CLICK_RENDER_WAIT_MS, 4000);
     assert.ok(FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS < FREEBUSY_TOTAL_BUDGET_MS);
   });
@@ -913,8 +918,11 @@ describe('phaseBudgetMs - Budget-Rationierung der Phasen (Runde-4-Forderung A)',
 describe('affordableClicks - Klick-Rationierung (Runde-4-Forderung A)', () => {
   const clickCost = 1500 + FREEBUSY_CLICK_RENDER_WAIT_MS; // 5500ms
 
-  test('Volles Budget trägt die maximale Klickanzahl (6)', () => {
-    assert.equal(affordableClicks(FREEBUSY_TOTAL_BUDGET_MS, clickCost, FREEBUSY_MAX_BUTTON_CLICKS), 6);
+  test('Volles Budget traegt die maximale Klickanzahl (2 seit FIX 3)', () => {
+    assert.equal(affordableClicks(FREEBUSY_TOTAL_BUDGET_MS, clickCost, FREEBUSY_MAX_BUTTON_CLICKS), 2);
+    // Das Budget traegt mehr, als erlaubt ist — die Rationierung ist jetzt die
+    // Klick-Obergrenze, nicht das Budget.
+    assert.equal(affordableClicks(FREEBUSY_TOTAL_BUDGET_MS, clickCost, 6), 6, 'ohne Deckelung bleibt die Formel');
   });
 
   test('Knappes Budget rationiert die Klicks', () => {
