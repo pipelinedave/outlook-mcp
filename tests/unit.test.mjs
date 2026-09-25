@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, assembleFreeBusyDiagnostics, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -239,6 +239,26 @@ describe('parseWeekHeaderText - Wochen-Header der Kalenderansicht', () => {
 
   test('Numerischer Wochen-Header ohne Jahr ("28.9. - 4.10.") nutzt das aktuelle Jahr', () => {
     const out = parseWeekHeaderText('28.9. - 4.10.', new Date(2026, 8, 24));
+    assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-04' });
+  });
+
+  test('Live-Format Runde 4: Tages-zuerst EN ohne Punkt ("28 September – 4 October, 2026")', () => {
+    // Der ECHTE sichtbare OWA-Wochen-Header. Vorher griff keines der Muster ->
+    // die Erkennung fiel auf ein Event-Label zurück (Root Cause Runde 4).
+    const out = parseWeekHeaderText('28 September – 4 October, 2026', new Date(2026, 8, 24));
+    assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-04' });
+  });
+
+  test('Live-Format Runde 4 mit Suffix ("…, Jump to a specific date or date range.")', () => {
+    const out = parseWeekHeaderText(
+      '28 September – 4 October, 2026, Jump to a specific date or date range.',
+      new Date(2026, 8, 24)
+    );
+    assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-04' });
+  });
+
+  test('Tages-zuerst EN ohne Jahr nutzt das aktuelle Jahr', () => {
+    const out = parseWeekHeaderText('28 September – 4 October', new Date(2026, 8, 24));
     assert.deepEqual(out, { startDate: '2026-09-28', endDate: '2026-10-04' });
   });
 });
@@ -517,6 +537,63 @@ describe('resolveRenderedWeekFromCandidates - Wochen-Erkennung aus Kandidaten', 
     assert.equal(out.endDate, '2026-10-04');
   });
 
+  test('Live-Fail Runde 4: stale All-Day-Event-Label wird NICHT als Header akzeptiert', () => {
+    // Das DOM enthielt neben dem echten Range-Header ein stale/hidden Event-Label
+    // ("Urlaub … September 23", Woche 39). Dieses darf die Erkennung NICHT kapern.
+    const out = resolveRenderedWeekFromCandidates({
+      headerTexts: [
+        'Urlaub, all day event, Wednesday, September 23, 2026, Busy',
+        '28 September – 4 October, 2026, Jump to a specific date or date range.'
+      ],
+      dayHeaderTexts: []
+    }, now);
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+    assert.ok(!out.text.includes('Urlaub'));
+  });
+
+  test('Live-Fail Runde 4: Event-Label ALLEIN -> unknown (keine Woche 39 aus Event)', () => {
+    const out = resolveRenderedWeekFromCandidates({
+      headerTexts: ['Urlaub, all day event, Wednesday, September 23, 2026, Busy'],
+      dayHeaderTexts: []
+    }, now);
+    assert.equal(out.startDate, null);
+    assert.equal(out.endDate, null);
+    assert.equal(out.text, null);
+  });
+
+  test('Live-Fail Runde 4: Zeitfenster-Event-Label wird nicht als Header akzeptiert', () => {
+    const out = resolveRenderedWeekFromCandidates({
+      headerTexts: ['Stadt Osnabrück, 09:00 to 12:00, Monday, September 28, 2026'],
+      dayHeaderTexts: []
+    }, now);
+    assert.equal(out.startDate, null);
+  });
+
+  test('Prev/Next-Button-Ableitung: Week 39/41 -> angezeigte Woche 40', () => {
+    const out = resolveRenderedWeekFromCandidates({
+      headerTexts: [],
+      dayHeaderTexts: [],
+      navTexts: [
+        'Go to previous week 21–27 September, 2026 (Week 39)',
+        'Go to next week 5–11 October, 2026 (Week 41)'
+      ]
+    }, now);
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+    assert.equal(out.weekNumber, 40);
+  });
+
+  test('Prev/Next-Ableitung greift nur als Fallback (Range-Header hat Vorrang)', () => {
+    const out = resolveRenderedWeekFromCandidates({
+      headerTexts: ['28 September – 4 October, 2026'],
+      dayHeaderTexts: [],
+      navTexts: ['Go to previous week 21–27 September, 2026 (Week 39)']
+    }, now);
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.weekNumber, null);
+  });
+
   test('Leere Kandidaten -> unknown (alles null)', () => {
     const out = resolveRenderedWeekFromCandidates({ headerTexts: [], dayHeaderTexts: [] }, now);
     assert.equal(out.startDate, null);
@@ -528,6 +605,149 @@ describe('resolveRenderedWeekFromCandidates - Wochen-Erkennung aus Kandidaten', 
     const out = resolveRenderedWeekFromCandidates(undefined, now);
     assert.equal(out.startDate, null);
     assert.equal(out.text, null);
+  });
+});
+
+describe('isCalendarEventLabel / filterCalendarHeaderCandidates - strikte Header-/Event-Trennung (Runde 4)', () => {
+  test('Zeitfenster-Labels sind Events (to/bis/Bindestrich)', () => {
+    assert.equal(isCalendarEventLabel('Stadt Osnabrück, 09:00 to 12:00, Monday, September 28, 2026'), true);
+    assert.equal(isCalendarEventLabel('Teammeeting, 08:00 bis 09:00, Dienstag, 29. September 2026'), true);
+    assert.equal(isCalendarEventLabel('Block, 13:00 - 18:30, Wednesday, September 30, 2026'), true);
+  });
+
+  test('Ganztag-Labels sind Events (all day / ganztägig)', () => {
+    assert.equal(isCalendarEventLabel('Urlaub, all day event, Wednesday, September 23, 2026, Busy'), true);
+    assert.equal(isCalendarEventLabel('Urlaub, Ganztägig, Montag, 28. September 2026'), true);
+    assert.equal(isCalendarEventLabel('Feiertag, all-day, 3 October 2026'), true);
+  });
+
+  test('Statuswort + Datum ist ein Event (Busy/Tentative/Free/Besetzt/Vorbehalt)', () => {
+    assert.equal(isCalendarEventLabel('Review, Busy, September 28, 2026'), true);
+    assert.equal(isCalendarEventLabel('Termin, Besetzt, 28. September 2026'), true);
+    assert.equal(isCalendarEventLabel('Optional, Tentative, September 28, 2026'), true);
+  });
+
+  test('Statuswort OHNE Datum ist KEIN Event (kein Fehlfilter)', () => {
+    assert.equal(isCalendarEventLabel('Busy'), false);
+    assert.equal(isCalendarEventLabel('Free/Busy settings'), false);
+  });
+
+  test('Echter Wochen-Header ist KEIN Event', () => {
+    assert.equal(isCalendarEventLabel('28 September – 4 October, 2026, Jump to a specific date or date range.'), false);
+    assert.equal(isCalendarEventLabel('28. September – 4. Oktober 2026'), false);
+    assert.equal(isCalendarEventLabel('Go to previous week 21–27 September, 2026 (Week 39)'), false);
+  });
+
+  test('filterCalendarHeaderCandidates entfernt Event-Labels, behält Header', () => {
+    const out = filterCalendarHeaderCandidates([
+      'Urlaub, all day event, Wednesday, September 23, 2026, Busy',
+      '28 September – 4 October, 2026',
+      'Stadt Hörstel, 13:00 to 15:00, Tuesday, September 29, 2026'
+    ]);
+    assert.deepEqual(out, ['28 September – 4 October, 2026']);
+  });
+
+  test('Leere/undefined Eingabe -> leeres Array', () => {
+    assert.deepEqual(filterCalendarHeaderCandidates([]), []);
+    assert.deepEqual(filterCalendarHeaderCandidates(undefined), []);
+  });
+});
+
+describe('isVisibleCalendarElement - hidden-Element-Filter (Runde 4, Fixture)', () => {
+  test('offsetParent null (hidden) -> unsichtbar', () => {
+    assert.equal(isVisibleCalendarElement({ offsetParent: null, position: 'static', rect: { width: 100, height: 20 } }), false);
+  });
+
+  test('position:fixed mit offsetParent null ist sichtbar (Spezifikations-Ausnahme)', () => {
+    assert.equal(isVisibleCalendarElement({ offsetParent: null, position: 'fixed', rect: { width: 100, height: 20 } }), true);
+  });
+
+  test('Null-Fläche (Breite/Höhe 0) -> unsichtbar (virtualisiertes Element)', () => {
+    assert.equal(isVisibleCalendarElement({ offsetParent: {}, position: 'static', rect: { width: 0, height: 20 } }), false);
+    assert.equal(isVisibleCalendarElement({ offsetParent: {}, position: 'static', rect: { width: 100, height: 0 } }), false);
+    assert.equal(isVisibleCalendarElement({ offsetParent: {}, position: 'static', rect: null }), false);
+  });
+
+  test('Sichtbares Element mit Fläche -> sichtbar', () => {
+    assert.equal(isVisibleCalendarElement({ offsetParent: {}, position: 'static', rect: { width: 100, height: 20 } }), true);
+  });
+
+  test('Defensiver Default (kein Argument) -> unsichtbar', () => {
+    assert.equal(isVisibleCalendarElement(), false);
+  });
+});
+
+describe('Prev/Next-Wochen-Ableitung - parseWeekNumberFromNav / parseNavWeekRange / resolveWeekFromNavButtons', () => {
+  const now = new Date(2026, 8, 24);
+
+  test('parseWeekNumberFromNav liest "(Week NN)" und "(KW NN)"', () => {
+    assert.equal(parseWeekNumberFromNav('Go to previous week 21–27 September, 2026 (Week 39)'), 39);
+    assert.equal(parseWeekNumberFromNav('Vorherige Woche (KW 41)'), 41);
+    assert.equal(parseWeekNumberFromNav('Go to next week'), null);
+    assert.equal(parseWeekNumberFromNav('(Week 99)'), null);
+  });
+
+  test('parseNavWeekRange liest "21–27 September, 2026"', () => {
+    assert.deepEqual(parseNavWeekRange('Go to previous week 21–27 September, 2026 (Week 39)', now), {
+      startDate: '2026-09-21', endDate: '2026-09-27'
+    });
+    assert.deepEqual(parseNavWeekRange('Go to next week 5–11 October, 2026 (Week 41)', now), {
+      startDate: '2026-10-05', endDate: '2026-10-11'
+    });
+  });
+
+  test('resolveWeekFromNavButtons: Week 39/41 -> Woche 40 (28.09.–04.10.)', () => {
+    const out = resolveWeekFromNavButtons([
+      'Go to previous week 21–27 September, 2026 (Week 39)',
+      'Go to next week 5–11 October, 2026 (Week 41)'
+    ], now);
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+    assert.equal(out.weekNumber, 40);
+  });
+
+  test('resolveWeekFromNavButtons: nur prev -> Montag = Tag nach prev.endDate', () => {
+    const out = resolveWeekFromNavButtons(['Go to previous week 21–27 September, 2026 (Week 39)'], now);
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+    assert.equal(out.weekNumber, 40);
+  });
+
+  test('resolveWeekFromNavButtons: nur next -> Sonntag = Tag vor next.startDate', () => {
+    const out = resolveWeekFromNavButtons(['Go to next week 5–11 October, 2026 (Week 41)'], now);
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+    assert.equal(out.weekNumber, 40);
+  });
+
+  test('resolveWeekFromNavButtons: nur "(Week NN)" ohne Datumsbereich -> ISO-Woche', () => {
+    const out = resolveWeekFromNavButtons(['Go to previous week (Week 39)'], now);
+    assert.equal(out.weekNumber, 40);
+    assert.equal(out.startDate, '2026-09-28');
+    assert.equal(out.endDate, '2026-10-04');
+  });
+
+  test('resolveWeekFromNavButtons: keine Nav-Texte -> null', () => {
+    assert.equal(resolveWeekFromNavButtons([], now), null);
+    assert.equal(resolveWeekFromNavButtons(undefined, now), null);
+  });
+
+  test('isoWeekMonday: KW 40/2026 beginnt am 28.09.2026', () => {
+    const d = isoWeekMonday(40, 2026);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    assert.equal(iso, '2026-09-28');
+  });
+});
+
+describe('classifyButtonFailure - präzise Abbruch-Ursache (Runde-4-Forderung 3)', () => {
+  test('Button gefunden/geklickt, aber wirkungslos -> button-ineffective', () => {
+    assert.equal(classifyButtonFailure({ foundAny: true, clickedAny: true }), 'button-ineffective');
+    assert.equal(classifyButtonFailure({ foundAny: true, clickedAny: false }), 'button-ineffective');
+  });
+
+  test('Gar kein Button gefunden -> no-week-button', () => {
+    assert.equal(classifyButtonFailure({ foundAny: false, clickedAny: false }), 'no-week-button');
+    assert.equal(classifyButtonFailure(), 'no-week-button');
   });
 });
 
@@ -762,10 +982,10 @@ describe('assembleFreeBusyDiagnostics - Diagnostik überlebt den Transport (Rund
   const fresh = { url: 'https://outlook.office.com/calendar/view/week', headerCandidates: ['28. September – 4. Oktober 2026'], dayHeaderCandidates: ['Montag 28.9.'], ariaButtonCount: 42, ariaLabelSample: ['Team Meeting, 14:00 bis 15:00'] };
 
   test('Frische Diagnostik gewinnt, früher Snapshot bleibt als urlAfterNavigation erhalten', () => {
-    const out = assembleFreeBusyDiagnostics({ fresh, early, abortReason: 'wrong-week' });
+    const out = assembleFreeBusyDiagnostics({ fresh, early, abortReason: 'week-mismatch' });
     assert.equal(out.url, fresh.url);
     assert.equal(out.urlAfterNavigation, early.url);
-    assert.equal(out.abortReason, 'wrong-week');
+    assert.equal(out.abortReason, 'week-mismatch');
     assert.deepEqual(out.headerCandidates, fresh.headerCandidates);
   });
 
@@ -780,6 +1000,7 @@ describe('assembleFreeBusyDiagnostics - Diagnostik überlebt den Transport (Rund
     const out = assembleFreeBusyDiagnostics({});
     assert.equal(out.url, '');
     assert.deepEqual(out.headerCandidates, []);
+    assert.deepEqual(out.weekNavCandidates, []);
     assert.deepEqual(out.weekButtonProbe, []);
     assert.equal(out.abortReason, 'none');
   });
