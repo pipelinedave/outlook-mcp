@@ -854,6 +854,18 @@ export function isBelievableBusySlots(dataQuality) {
   return dataQuality === 'verified';
 }
 
+// FIX 4 (Live-Lauf 2): busySlotsReliable und die eigene Widerspruchs-Warnung
+// standen gleichzeitig: busySlotsReliable:true und "18 Event-Element(e) im DOM
+// gefunden, aber 0 Busy-Slots extrahiert". Ein Ergebnis, das sich selbst
+// widerspricht, ist nicht auswertbar — deshalb ist der Widerspruch ein HARTES
+// false und keine Ermessensfrage.
+// Reine Funktion (unit-testbar), benutzt vom Aufrufer; die Warnung selbst
+// bleibt in slotExtractionWarning (Single Source of Truth fuer den Text).
+export function resolveBusySlotsReliable({ dataQuality = null, eventElementsFound = 0, busySlotCount = 0 } = {}) {
+  if (!isBelievableBusySlots(dataQuality)) return false;
+  return slotExtractionWarning(Number(eventElementsFound) || 0, Number(busySlotCount) || 0) === null;
+}
+
 // ===========================================================================
 // Defekt 3 — Warte-Ausgang an die Beobachtung koppeln
 // ===========================================================================
@@ -4165,9 +4177,10 @@ export class OwaClient {
       // Wochen-Verifikation funktioniert und bleibt so sichtbar.
       weekVerified,
       dataQuality,
-      // Maschinenlesbare Ehrlichkeit: nur bei dataQuality==='verified' sind
-      // busySlots eine belastbare Aussage ueber Belegung.
-      busySlotsReliable: isBelievableBusySlots(dataQuality),
+      // Maschinenlesbare Ehrlichkeit: nur bei dataQuality==='verified' UND ohne
+      // Extraktions-Widerspruch sind busySlots eine belastbare Aussage ueber
+      // Belegung (FIX 4).
+      busySlotsReliable,
       busySlots,
       count: busySlots.length,
       note
@@ -4224,8 +4237,12 @@ export class OwaClient {
       }
       if (weekHeaderLabels.length) diag.weekHeaderLabels = weekHeaderLabels;
       const warnings = [
-        slotExtractionWarning(eventElementsFound, busySlots.length),
-        eventWaitWarning({ outcome: eventWait.outcome, waitedMs: eventWait.waitedMs, budgetMs: eventWaitBudget, abortReason: eventWait.abortReason })
+        extractionWarning,
+        eventWaitWarning({
+          outcome: eventWait.outcome, waitedMs: eventWait.waitedMs, budgetMs: eventWaitBudget,
+          abortReason: eventWait.abortReason,
+          renderedWeek: rendered.startDate ? `${rendered.startDate}–${rendered.endDate || '?'}` : null
+        })
       ].filter(Boolean);
       if (warnings.length) diag.warning = warnings.join(' ');
       result.diagnostics = diag;
@@ -4304,6 +4321,17 @@ export class OwaClient {
     }
 
     await this.openCalendarEventByQuery(targetQuery);
+
+    // FIX 4: der Widerspruch wird VOR dem Ergebnis berechnet, nicht danach im
+    // Diagnostik-Block. In Lauf 2 stand busySlotsReliable:true GLEICHZEITIG mit
+    // der eigenen Warnung "18 Event-Element(e) im DOM gefunden, aber 0
+    // Busy-Slots extrahiert" — ein Selbstwiderspruch des Ergebnisses.
+    // Die Invariante: sobald der Widerspruchstext entsteht, ist
+    // busySlotsReliable ein hartes false.
+    const extractionWarning = slotExtractionWarning(eventElementsFound, busySlots.length);
+    const busySlotsReliable = resolveBusySlotsReliable({
+      dataQuality, eventElementsFound, busySlotCount: busySlots.length
+    });
 
     // Nach dem Öffnen des Events das "Löschen"-/Entfernen-Element finden und klicken.
     // Alle DOM-Vorgänge laufen nach dem dblclick im Editor-Dialog ab. Der Löschen-Button
