@@ -479,6 +479,91 @@ export async function collectCalendarCandidates(page) {
   }).catch(() => ({ headerTexts: [], dayHeaderTexts: [], navTexts: [], ariaButtonCount: 0, ariaLabelSample: [] }));
 }
 
+// ---------------------------------------------------------------------------
+// Gemeinsamer Event-Kollektionspfad (Iteration 6, Live-Befund Runde 5 vom 25.09.):
+// Die Slot-Extraktion lieferte 0 Slots, obwohl dieselben Events in Runde 4 als
+// ARIA-Labels im DOM nachweisbar waren. Root Cause: Die Extraktion nutzte einen
+// EIGENEN, vom Diagnostik-Pfad abweichenden Inline-Collector (Hypothese 2) und
+// brach nach der jetzt erfolgreichen Wochen-Verifikation zu früh ab. Dieser EINE
+// Pfad liefert sowohl die Roh-Labels für die Slot-Extraktion als auch die
+// Diagnostik (eventElementsFound/selectorUsed/rawEventLabels/rejectionReasons).
+//
+// Sichtbarkeit (Runde-5-Forderung): Event-Buttons sind in virtualisierten Grids
+// teils mit offsetParent === null, haben aber echte Fläche (rect > 0). offsetParent
+// ist daher KEIN Hard-K.O. für Events — ein Label mit Event-Signatur gilt als
+// extrahierbar, solange das Element im DOM existiert. hiddenCount wird nur
+// diagnostisch erfasst. Der strenge Sichtbarkeitsfilter bleibt den Header-
+// Kandidaten in collectCalendarCandidates vorbehalten.
+// ---------------------------------------------------------------------------
+export async function collectCalendarEventLabels(page) {
+  return page.evaluate(() => {
+    const cap = (arr, n) => arr.slice(0, n);
+    const timeRe = /\d{1,2}:\d{2}/;
+    const allDayRe = /ganztägig|ganztages|all[- ]?day/i;
+    const nonEventRe = /arbeitsort|working location/i;
+    const dateish = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})|(\d{1,2}\s+[A-Za-zäöüÄÖÜß]{3,})/;
+
+    const collect = (selector) => {
+      const events = [];
+      const headerLike = [];
+      const candidates = [];
+      let hiddenCount = 0;
+      for (const el of document.querySelectorAll(selector)) {
+        const label = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        if (!label || label.length > 300) continue;
+        if (nonEventRe.test(label)) continue;
+        let rect = null;
+        let offsetParentNull = false;
+        try { rect = el.getBoundingClientRect(); } catch (e) { rect = null; }
+        try { offsetParentNull = el.offsetParent === null; } catch (e) { offsetParentNull = false; }
+        const visible = Boolean(rect && rect.width > 0 && rect.height > 0);
+        if (!visible) hiddenCount++;
+        const isEvent = timeRe.test(label) || allDayRe.test(label);
+        if (isEvent) {
+          events.push(label);
+          if (candidates.length < 30) candidates.push({ label: label.slice(0, 160), visible, offsetParentNull });
+        } else if (dateish.test(label) && label.length <= 160) {
+          headerLike.push(label);
+        }
+      }
+      return { events, headerLike, candidates, hiddenCount };
+    };
+
+    // Primär: der Runde-4-Pfad (ARIA-Labels der Event-Buttons).
+    let selectorUsed = '[role="button"][aria-label]';
+    let res = collect(selectorUsed);
+    // Fallback: breiterer aria-label-Scan, falls der Button-Selektor keine Events
+    // liefert (OWA-Builds, in denen Events als gridcell/option gerendert werden).
+    // headerLike aus dem Primärversuch bleibt erhalten (Fallback betrifft nur Events).
+    if (res.events.length === 0) {
+      const broad = collect('[aria-label]');
+      selectorUsed = '[aria-label]';
+      res = { ...broad, headerLike: [...res.headerLike, ...broad.headerLike] };
+    }
+
+    const dedupe = (arr) => {
+      const out = [];
+      const seen = new Set();
+      for (const l of arr) { if (!seen.has(l)) { seen.add(l); out.push(l); } }
+      return out;
+    };
+    const events = dedupe(res.events);
+    const headerLike = dedupe(res.headerLike);
+
+    return {
+      labels: cap(events, 60),
+      eventElementsFound: events.length,
+      selectorUsed,
+      hiddenCount: res.hiddenCount,
+      headerLikeLabels: cap(headerLike, 20),
+      candidates: cap(res.candidates, 20)
+    };
+  }).catch(() => ({
+    labels: [], eventElementsFound: 0, selectorUsed: 'error', hiddenCount: 0,
+    headerLikeLabels: [], candidates: []
+  }));
+}
+
 // Löst aus den gesammelten Kandidaten-Texten die gerenderte Kalenderwoche auf.
 // Reine Funktion (unit-testbar). Erkennungs-Reihenfolge (spezifisch zuerst):
 //  1. Wochen-Range-Header mit Monatsnamen ODER numerisch ("28. September – 4. Oktober",
@@ -686,7 +771,7 @@ export function classifyButtonFailure({ foundAny = false, clickedAny = false } =
 // (Runde-4-Forderung B): Der frühe Snapshot (direkt nach Navigation erhoben)
 // bleibt immer erhalten, auch wenn das Budget für eine frische Erhebung nicht
 // mehr reicht. Klick-Protokoll, Abbruchgrund und Budget-Report kommen hinzu.
-export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null } = {}) {
+export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null } = {}) {
   const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], weekNavCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
   const out = {
     ...base,
@@ -695,7 +780,23 @@ export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekBu
   };
   if (early && early.url) out.urlAfterNavigation = early.url;
   if (budget) out.budget = budget;
+  // Runde-5-Kernlücke: Slot-Extraktions-Diagnostik auch im Erfolgsfall (status ok),
+  // damit ein echter Free-Tag von einem Extraktions-Miss unterscheidbar ist.
+  if (eventElementsFound !== null) out.eventElementsFound = eventElementsFound;
+  if (selectorUsed !== null) out.selectorUsed = selectorUsed;
+  if (rawEventLabels !== null) out.rawEventLabels = rawEventLabels;
+  if (rejectionReasons !== null) out.rejectionReasons = rejectionReasons;
   return out;
+}
+
+// Widerspruchs-Warnung (Runde-5-Forderung): 0 Slots, obwohl Event-Elemente im DOM
+// gefunden wurden -> Extraktions-Miss, kein leerer Kalender. Reine Funktion.
+export function slotExtractionWarning(eventElementsFound, slotCount) {
+  if (eventElementsFound > 0 && slotCount === 0) {
+    return `Widerspruch: ${eventElementsFound} Event-Element(e) im DOM gefunden, aber 0 Busy-Slots extrahiert — ` +
+      `Extraktions-Miss wahrscheinlich (siehe rejectionReasons).`;
+  }
+  return null;
 }
 
 // Parst ein OWA-Event-ARIA-Label in einen strukturierten Busy-Slot.
@@ -746,11 +847,14 @@ export function parseEventLabel(label, defaultYear) {
   const tm = label.match(timeRe);
 
   if (!tm) {
-    // Kein Zeitfenster im Label -> Ganztag-Event (start/end bewusst null)
-    const title = label
-      .replace(/[,;]?\s*(Ganztägig|Ganztägiges Ereignis|All day|All-day event).*/i, '')
-      .replace(/[,;:\s]+$/, '')
-      .trim() || '(Ganztägig)';
+    // Kein Zeitfenster im Label -> Ganztag-Event (start/end bewusst null).
+    // Titel = Label-Anteil VOR der ersten Zeitkomponente (hier: dem Ganztag-Marker),
+    // damit Titel mit Kommas/Doppelpunkten (z.B. "Stadt Hörstel: CMIS …") intakt
+    // bleiben und Folge-Attribute (Datum, Status, "Recurring event") abgeschnitten
+    // werden.
+    const allDayMatch = label.match(/all[- ]?day|ganztägig|ganztages/i);
+    const cut = allDayMatch ? allDayMatch.index : label.length;
+    const title = label.slice(0, cut).replace(/[,;:\s]+$/, '').trim() || '(Ganztägig)';
     return { date: dateIso, start: null, end: null, title, allDay: true, raw: label };
   }
 
@@ -830,6 +934,26 @@ export function dedupeBusySlots(slots) {
     }
   }
   return Array.from(byKey.values());
+}
+
+// Partitioniert Slots in "im angefragten Range [rangeStartMs, rangeEndMs)" und
+// "verworfen" (mit Grund). Ganztag-Events belegen 00:00–24:00 ihres Tages und
+// überlappen den Range, wenn ihr Tag im Fenster liegt (z.B. allDay am 30.09. bei
+// Range 28.09.–02.10. -> behalten). Explizit freie Slots ('free') sind keine
+// Belegung. Reine Funktion (unit-testbar).
+export function partitionSlotsByRange(slots, rangeStartMs, rangeEndMs) {
+  const kept = [];
+  const rejected = [];
+  for (const slot of slots || []) {
+    if (!slot || !slot.date) { rejected.push({ slot, reason: 'no-time-pattern' }); continue; }
+    if (slot.status === 'free') { rejected.push({ slot, reason: 'free' }); continue; }
+    const dayStartMs = new Date(`${slot.date}T00:00:00`).getTime();
+    const s = slot.allDay ? dayStartMs : new Date(`${slot.date}T${slot.start}:00`).getTime();
+    const e = slot.allDay ? dayStartMs + 86400000 : new Date(`${slot.date}T${slot.end}:00`).getTime();
+    if (s < rangeEndMs && e > rangeStartMs) kept.push(slot);
+    else rejected.push({ slot, reason: 'date-out-of-range' });
+  }
+  return { kept, rejected };
 }
 
 // Parst aus dem Zeilentext einer OWA-Nachrichtenliste/Suchergebniszeile einen
@@ -1353,31 +1477,46 @@ export class OwaClient {
     };
 
     // Prüft, ob Event-Elemente (Zeit- oder Ganztag-Labels) im Grid gerendert sind.
+    // Runde-5-Fix: Primär der Button-Selektor, Fallback auf den breiteren aria-label-
+    // Scan — Events können je nach OWA-Build auch als gridcell/option gerendert sein.
     const hasEventElements = async () => page.evaluate(() => {
       const timeRe = /\d{1,2}:\d{2}/;
-      const allDayRe = /ganztägig|all day|all-day/i;
-      return Array.from(document.querySelectorAll('[role="button"][aria-label]')).some((b) => {
+      const allDayRe = /ganztägig|ganztages|all[- ]?day/i;
+      const nonEventRe = /arbeitsort|working location/i;
+      const check = (sel) => Array.from(document.querySelectorAll(sel)).some((b) => {
         const label = b.getAttribute('aria-label') || '';
+        if (nonEventRe.test(label)) return false;
         return timeRe.test(label) || allDayRe.test(label);
       });
+      return check('[role="button"][aria-label]') || check('[aria-label]');
     }).catch(() => false);
 
     // Zustandswarten statt starrem Timeout: auf gerenderten Wochen-/Tages-Header
     // ODER Event-Elemente warten (Live-Fail 24.09.2026: 6s reichten nicht, das Grid
     // war noch nicht da -> 0 Slots, "Work week" als einziger Text). Poll-Intervall
     // 500ms mit Budget-Check je Iteration (Runde-4-Forderung A).
+    //
+    // Runde-5-Fix (Root Cause 0 Slots trotz verifizierter Woche): Der Header rendert
+    // VOR den Events. Früher brach die Schleife beim ersten datierten Header sofort
+    // ab -> die Slot-Extraktion lief, bevor die Events im DOM waren. Jetzt bekommt
+    // ein datierter Header eine kurze Gnadenfrist, in der weiter auf Events gepollt
+    // wird (budgetiert), damit die Extraktion nicht ins Leere greift.
+    const EVENT_GRACE_MS = 2500;
     const waitForCalendarRendered = async (budgetMs) => {
       const waitDeadline = Date.now() + budgetMs;
       let rendered = { text: null, startDate: null, endDate: null };
       let events = false;
+      let headerSeenAt = null;
       while (Date.now() < waitDeadline && remaining() > 0) {
         rendered = await readRenderedCalendarWeek(page);
+        events = await hasEventElements();
         if (rendered.startDate) {
-          events = await hasEventElements();
+          if (!headerSeenAt) headerSeenAt = Date.now();
+          if (events) break;
+          if (Date.now() - headerSeenAt >= EVENT_GRACE_MS) break; // Gnadenfrist abgelaufen
+        } else if (events) {
           break;
         }
-        events = await hasEventElements();
-        if (events) break;
         if (Date.now() + 500 > waitDeadline || remaining() <= 0) break;
         await page.waitForTimeout(500);
       }
@@ -1632,49 +1771,59 @@ export class OwaClient {
     // 'unverified' = Header nicht lesbar (Slots werden trotzdem geliefert, mit Warnung).
     const dataQuality = (rendered.startDate && rendered.endDate) ? 'verified' : 'unverified';
 
-    // Alle Event-Elemente über ihre ARIA-Labels sammeln (roh, Dedupe + Klassifikation in Node).
-    // Lockerer Match (Live-Fail 24.09.2026): Zeitmuster (HH:MM) ODER Ganztag-Kennzeichnung
-    // genügt — DE/EN-Statuswörter ("Busy"/"Besetzt"/"to"/"bis") sind NICHT mehr Bedingung,
-    // da die Labels je nach Sprache/Status variieren. Arbeitsort-Banner sind keine Belegung.
-    const rawLabels = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('[role="button"][aria-label]'));
-      const timeRe = /\d{1,2}:\d{2}/;
-      const allDayRe = /ganztägig|ganztages|all day|all-day/i;
-      const nonEventRe = /arbeitsort|working location/i;
-      const labels = [];
-      for (const btn of buttons) {
-        const label = (btn.getAttribute('aria-label') || '').trim();
-        if (!label || label.length > 300) continue;
-        if (nonEventRe.test(label)) continue;
-        if (!timeRe.test(label) && !allDayRe.test(label)) continue;
-        labels.push(label);
+    // Runde-5-Fix: Kurze, budgetierte Gnadenfrist, falls die Woche zwar verifiziert
+    // ist, die Events aber noch nicht gerendert wurden (Header rendert vor Events).
+    // Verhindert die 0-Slot-Extraktion direkt nach erfolgreicher Wochen-Verifikation.
+    if (!hasEvents) {
+      const graceDeadline = Date.now() + Math.min(2500, Math.max(0, remaining() - 2000));
+      while (Date.now() < graceDeadline) {
+        if (await hasEventElements()) { hasEvents = true; break; }
+        await page.waitForTimeout(400);
       }
-      return labels;
-    });
+    }
+
+    // Alle Event-Elemente über den GEMEINSAMEN Kollektionspfad sammeln (Runde-5-Fix):
+    // derselbe Pfad wie die Diagnostik, toleranter Sichtbarkeitsfilter (offsetParent
+    // ist KEIN Hard-K.O. für Events), inkl. Roh-Diagnostik für den 0-Slot-Fall.
+    const eventCollection = await collectCalendarEventLabels(page);
+    const rawLabels = eventCollection.labels;
+    const eventElementsFound = eventCollection.eventElementsFound;
+    const selectorUsed = eventCollection.selectorUsed;
 
     // Deduplizieren (gleiche Events können mehrfach im DOM hängen), strukturiert parsen
-    // und anhand der Wortliste klassifizieren (Busy/Tentative/Free).
+    // und anhand der Wortliste klassifizieren (Busy/Tentative/Free). Jede Verwerfung
+    // wird mit Grund protokolliert (Runde-5-Forderung: 0-Slots von echtem Free-Tag
+    // unterscheidbar machen).
     const seen = new Set();
     const parsedSlots = [];
+    const rejectionReasons = [];
+    const reject = (label, reason) => rejectionReasons.push({ label: String(label).slice(0, 120), reason });
     for (const label of rawLabels) {
-      if (seen.has(label)) continue;
+      if (seen.has(label)) { reject(label, 'duplicate'); continue; }
       seen.add(label);
       const slot = parseEventLabel(label, defaultYear);
-      if (!slot) continue;
+      if (!slot) { reject(label, 'no-time-pattern'); continue; }
       slot.status = classifyEventStatus(label);
       parsedSlots.push(slot);
     }
+    // Header-artige Labels (Datum ohne Zeit) hat der Kollektor als Event-Kandidaten
+    // verworfen -> als 'header-misclassified' ausweisen.
+    for (const label of eventCollection.headerLikeLabels) reject(label, 'header-misclassified');
 
     // Beauty-Fix (Live Runde 2): Work-Location-Banner und titellose Pseudo-Slots
     // ("(ohne Titel)", Büro/Homeoffice/URL-Schnipsel) sind keine echte Belegung
     // und werden aus den Slots ausgeschlossen.
-    const realSlots = parsedSlots.filter((slot) =>
-      slot.status !== 'non_event' && !isWorkLocationPseudoSlot(slot.title)
-    );
+    const realSlots = parsedSlots.filter((slot) => {
+      const pseudo = slot.status === 'non_event' || isWorkLocationPseudoSlot(slot.title);
+      if (pseudo) reject(slot.raw, 'work-location');
+      return !pseudo;
+    });
 
     // Dedupe: identisches Datum+Zeit nur 1x; überlappende Duplikate gleicher Zeit
     // zusammenführen (bevorzugt wird der Slot mit echtem Titel behalten).
     const dedupedSlots = dedupeBusySlots(realSlots);
+    const keptSet = new Set(dedupedSlots);
+    for (const slot of realSlots) if (!keptSet.has(slot)) reject(slot.raw, 'duplicate');
 
     // Nur Slots zurückgeben, die mit dem angefragten Range [start, end) überlappen.
     // Ganztag-Events belegen 00:00–24:00 ihres Tages. Explizit freie Slots ('free')
@@ -1684,14 +1833,8 @@ export class OwaClient {
     const rangeStartMs = new Date(rangeStartIso).getTime();
     const rangeEndMs = new Date(rangeEndIso).getTime();
 
-    const busySlots = dedupedSlots
-      .filter((slot) => slot.status !== 'free')
-      .filter((slot) => {
-        const dayStartMs = new Date(`${slot.date}T00:00:00`).getTime();
-        const s = slot.allDay ? dayStartMs : new Date(`${slot.date}T${slot.start}:00`).getTime();
-        const e = slot.allDay ? dayStartMs + 86400000 : new Date(`${slot.date}T${slot.end}:00`).getTime();
-        return s < rangeEndMs && e > rangeStartMs;
-      });
+    const { kept: busySlots, rejected: rangeRejected } = partitionSlotsByRange(dedupedSlots, rangeStartMs, rangeEndMs);
+    for (const r of rangeRejected) reject(r.slot && r.slot.raw ? r.slot.raw : '', r.reason);
 
     // Stabil nach Datum und Beginn sortieren
     busySlots.sort((a, b) =>
@@ -1729,17 +1872,28 @@ export class OwaClient {
       count: busySlots.length,
       note
     };
-    // Reiche Diagnostik bei unverifizierten Daten mitliefern (Runde-3/4-Forderung):
-    // URL (inkl. früher Snapshot), Header-/Tageskopf-Kandidaten, ARIA-Sample,
-    // Klick-Protokoll, Abbruchgrund und Budget-Report.
-    if (dataQuality === 'unverified') {
-      result.diagnostics = assembleFreeBusyDiagnostics({
+    // Reiche Diagnostik mitliefern (Runde-3/4/5-Forderung):
+    //  - bei unverifizierten Daten (Wochen-Header nicht lesbar), UND
+    //  - bei 0 Slots trotz verifizierter Woche (Runde-5-Kernlücke): nur so ist ein
+    //    echter Free-Tag von einem Extraktions-Miss unterscheidbar.
+    // Enthält URL (inkl. früher Snapshot), Header-/Tageskopf-Kandidaten, ARIA-Sample,
+    // Klick-Protokoll, Abbruchgrund, Budget-Report sowie die Slot-Extraktions-Diagnostik
+    // (eventElementsFound/selectorUsed/rawEventLabels/rejectionReasons).
+    if (dataQuality === 'unverified' || busySlots.length === 0) {
+      const diag = assembleFreeBusyDiagnostics({
         fresh: await freshDiag(),
         early: earlyDiagnostics,
         weekButtonProbe,
         abortReason,
-        budget: freeBusyBudgetReport()
+        budget: freeBusyBudgetReport(),
+        eventElementsFound,
+        selectorUsed,
+        rawEventLabels: rawLabels.slice(0, 20),
+        rejectionReasons: rejectionReasons.slice(0, 40)
       });
+      const warning = slotExtractionWarning(eventElementsFound, busySlots.length);
+      if (warning) diag.warning = warning;
+      result.diagnostics = diag;
     }
     return result;
   }
