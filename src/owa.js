@@ -251,6 +251,58 @@ export function parseNumericDayHeaderText(text, now = new Date()) {
 // Wochen-Header akzeptiert werden.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// EIN Pattern-Satz, zwei Verbraucher (Iteration 7, Live-Befund Runde 6 vom
+// 28.09.2026 — Hauptursache "0 Busy-Slots trotz verifizierter Woche").
+//
+// Root Cause Runde 6: Die Event-Wartephase fragte "gibt es irgendein
+// [aria-label] mit einer Uhrzeit?" — und bekam vom Zeit-Indikator
+// "calendar view, current time: Fri 22:31" die Antwort JA (22:31 matcht
+// /\d{1,2}:\d{2}/). Der Lauf brach nach ~4s "erfolgreich" ab, obwohl das
+// Event-Grid erst nach ~17s rendert (Runde 4 hatte die 6 Labels nach 16,9s).
+//
+// Deshalb EIN serialisierbarer Pattern-Satz (Strings statt RegExp-Objekte, damit
+// er die evaluate-Grenze nach page.evaluate passieren kann) und zwei Prädikate:
+//  - isCalendarEventLabel: BREIT (Header-Trennung, inkl. Statuswort+Datum)
+//  - isEventGridLabel:     STRENG (Beweis "Grid ist fertig gerendert": echtes
+//                          ZeitFENSTER oder Ganztag; Uhrzeit-/Nav-Indikatoren
+//                          explizit ausgeschlossen)
+// ---------------------------------------------------------------------------
+
+// Patterns als Strings (serialisierbar über page.evaluate; RegExp-Flags 'i').
+export const EVENT_LABEL_PATTERNS = {
+  // ZeitFENSTER (nicht einzelne Uhrzeit): "09:00 to 12:00" / "14:00 bis 15:00" / "9:00 AM - 10:00 AM"
+  timeRange: String.raw`\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:to|bis|[\u2013\u2014-])\s*\d{1,2}:\d{2}`,
+  // Ganztag: "all day event" / "all-day" / "ganztägig" / "ganztages"
+  allDay: 'all[- ]?day|ganzt\u00e4gig|ganztages',
+  // Statuswort (nur für die breite Header-Trennung)
+  status: String.raw`\b(busy|tentative|free|besetzt|vorbehalt|frei)\b`,
+  // Datum-ish (nur für die breite Header-Trennung)
+  dateish: String.raw`(\d{1,2}\.\s*[A-Za-z\u00e4\u00f6\u00fc\u00c4\u00d6\u00dc\u00df]{3,})|([A-Za-z\u00e4\u00f6\u00fc\u00c4\u00d6\u00dc\u00df]{3,}\.?\s+\d{1,2})|(\d{1,2}\s+[A-Za-z\u00e4\u00f6\u00fc\u00c4\u00d6\u00dc\u00df]{3,})`,
+  // KEIN Event: Work-Location-Banner
+  nonEvent: 'arbeitsort|working location',
+  // KEIN Event: Uhrzeit-/Navigations-Indikatoren der Kalenderansicht — der
+  // Runde-6-Fehltreffer. Muss explizit ausgeschlossen sein, weil "22:31"
+  // zwar KEIN Zeitfenster ist, aber in einem naiven Uhrzeit-Test als Treffer
+  // durchging.
+  gridBlocker: 'current time|aktuelle uhrzeit|clock indicator'
+};
+
+// Kompiliert den Pattern-Satz einmalig (lazy) — dieselben RegExp-Objekte
+// werden von der Node-Seite und der Browser-Seite benutzt.
+let compiledEventPatterns = null;
+let compiledEventPatternsSource = null;
+function eventPatterns() {
+  if (!compiledEventPatterns || compiledEventPatternsSource !== EVENT_LABEL_PATTERNS) {
+    compiledEventPatterns = {};
+    for (const key of Object.keys(EVENT_LABEL_PATTERNS)) {
+      compiledEventPatterns[key] = new RegExp(EVENT_LABEL_PATTERNS[key], 'i');
+    }
+    compiledEventPatternsSource = EVENT_LABEL_PATTERNS;
+  }
+  return compiledEventPatterns;
+}
+
 // Erkennt Event-Signaturen in einem ARIA-Label/Text. Reine Funktion (unit-testbar).
 //  - Zeitfenster: "09:00 to 12:00" / "14:00 bis 15:00" / "9:00 AM - 10:00 AM"
 //  - Ganztag: "all day event" / "all-day" / "ganztägig" / "ganztages"
@@ -258,13 +310,24 @@ export function parseNumericDayHeaderText(text, now = new Date()) {
 export function isCalendarEventLabel(text) {
   if (!text) return false;
   const t = String(text);
-  const timeRangeRe = /\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:to|bis|[–—-])\s*\d{1,2}:\d{2}/i;
-  if (timeRangeRe.test(t)) return true;
-  const allDayRe = /all[- ]?day|ganztägig|ganztages/i;
-  if (allDayRe.test(t)) return true;
-  const statusRe = /\b(busy|tentative|free|besetzt|vorbehalt|frei)\b/i;
-  const dateRe = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})|(\d{1,2}\s+[A-Za-zäöüÄÖÜß]{3,})/;
-  return statusRe.test(t) && dateRe.test(t);
+  const re = eventPatterns();
+  if (re.timeRange.test(t)) return true;
+  if (re.allDay.test(t)) return true;
+  return re.status.test(t) && re.dateish.test(t);
+}
+
+// STRENGES Prädikat: "das Event-Grid ist fertig gerendert". Verlangt ein echtes
+// Zeitfenster ODER ein Ganztag-Marker — bewusst OHNE die Statuswort+Datum-
+// Fallback-Regel des breiten Prädikats, denn ein solches Label ist kein Beweis
+// für ein gerendertes Grid. Work-Location- und Uhrzeit-Indikatoren sind
+// explizit ausgeschlossen (der Runde-6-Fehltreffer "current time: Fri 22:31").
+export function isEventGridLabel(text) {
+  if (!text) return false;
+  const t = String(text);
+  const re = eventPatterns();
+  if (re.nonEvent.test(t)) return false;
+  if (re.gridBlocker.test(t)) return false;
+  return re.timeRange.test(t) || re.allDay.test(t);
 }
 
 // Filtert Event-Labels aus einer Kandidatenliste (Header dürfen keine Events sein).
@@ -495,51 +558,54 @@ export async function collectCalendarCandidates(page) {
 // diagnostisch erfasst. Der strenge Sichtbarkeitsfilter bleibt den Header-
 // Kandidaten in collectCalendarCandidates vorbehalten.
 // ---------------------------------------------------------------------------
-export async function collectCalendarEventLabels(page) {
-  return page.evaluate(() => {
+export async function collectCalendarEventLabels(page, { preferSelector = null } = {}) {
+  return page.evaluate(({ pats, prefer }) => {
+    const re = {};
+    for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
     const cap = (arr, n) => arr.slice(0, n);
-    const timeRe = /\d{1,2}:\d{2}/;
-    const allDayRe = /ganztägig|ganztages|all[- ]?day/i;
-    const nonEventRe = /arbeitsort|working location/i;
-    const dateish = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})|(\d{1,2}\s+[A-Za-zäöüÄÖÜß]{3,})/;
+    // STRENGER Event-Beweis (Iteration 7, Runde-6-Fehltreffer): echtes
+    // Zeitfenster ODER Ganztag. Der alte lose Test /\d{1,2}:\d{2}/ wertete den
+    // Zeit-Indikator "calendar view, current time: Fri 22:31" als Event und
+    // erzeugte dadurch eventElementsFound: 1 bei einer real leeren Grid-Zeit.
+    const isGridEvent = (label) => {
+      if (re.nonEvent.test(label)) return false;
+      if (re.gridBlocker.test(label)) return false;
+      return re.timeRange.test(label) || re.allDay.test(label);
+    };
+    // Warum ein Label KEIN Event ist — für rejectionReasons (statt 12x
+    // 'header-misclassified' im 0-Slot-Fall).
+    const nonEventReason = (label) => {
+      if (re.gridBlocker.test(label)) return 'clock-indicator';
+      if (re.nonEvent.test(label)) return 'work-location';
+      return null;
+    };
 
     const collect = (selector) => {
       const events = [];
       const headerLike = [];
+      const nonEventLabels = [];
       const candidates = [];
       let hiddenCount = 0;
       for (const el of document.querySelectorAll(selector)) {
         const label = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
         if (!label || label.length > 300) continue;
-        if (nonEventRe.test(label)) continue;
+        const rejectReason = nonEventReason(label);
+        if (rejectReason) { nonEventLabels.push({ label, reason: rejectReason }); continue; }
         let rect = null;
         let offsetParentNull = false;
         try { rect = el.getBoundingClientRect(); } catch (e) { rect = null; }
         try { offsetParentNull = el.offsetParent === null; } catch (e) { offsetParentNull = false; }
         const visible = Boolean(rect && rect.width > 0 && rect.height > 0);
         if (!visible) hiddenCount++;
-        const isEvent = timeRe.test(label) || allDayRe.test(label);
-        if (isEvent) {
+        if (isGridEvent(label)) {
           events.push(label);
           if (candidates.length < 30) candidates.push({ label: label.slice(0, 160), visible, offsetParentNull });
-        } else if (dateish.test(label) && label.length <= 160) {
+        } else if (re.dateish.test(label) && label.length <= 160) {
           headerLike.push(label);
         }
       }
-      return { events, headerLike, candidates, hiddenCount };
+      return { events, headerLike, nonEventLabels, candidates, hiddenCount };
     };
-
-    // Primär: der Runde-4-Pfad (ARIA-Labels der Event-Buttons).
-    let selectorUsed = '[role="button"][aria-label]';
-    let res = collect(selectorUsed);
-    // Fallback: breiterer aria-label-Scan, falls der Button-Selektor keine Events
-    // liefert (OWA-Builds, in denen Events als gridcell/option gerendert werden).
-    // headerLike aus dem Primärversuch bleibt erhalten (Fallback betrifft nur Events).
-    if (res.events.length === 0) {
-      const broad = collect('[aria-label]');
-      selectorUsed = '[aria-label]';
-      res = { ...broad, headerLike: [...res.headerLike, ...broad.headerLike] };
-    }
 
     const dedupe = (arr) => {
       const out = [];
@@ -547,20 +613,64 @@ export async function collectCalendarEventLabels(page) {
       for (const l of arr) { if (!seen.has(l)) { seen.add(l); out.push(l); } }
       return out;
     };
-    const events = dedupe(res.events);
-    const headerLike = dedupe(res.headerLike);
-
-    return {
-      labels: cap(events, 60),
-      eventElementsFound: events.length,
-      selectorUsed,
-      hiddenCount: res.hiddenCount,
-      headerLikeLabels: cap(headerLike, 20),
-      candidates: cap(res.candidates, 20)
+    // nonEventLabels sind OBJEKTE — Dedupe ueber das Label, nicht ueber Identitaet
+    // (collect erzeugt pro Selektor neue Objekte, sonst steht dasselbe Label
+    // mehrfach in rejectionReasons).
+    const dedupeNonEvent = (arr) => {
+      const out = [];
+      const seen = new Set();
+      for (const e of arr) {
+        if (seen.has(e.label)) continue;
+        seen.add(e.label);
+        out.push(e);
+      }
+      return out;
     };
-  }).catch(() => ({
+    const order = [];
+    if (prefer) order.push(prefer);
+    order.push('[role="button"][aria-label]', '[aria-label]');
+    const tried = [];
+    // Header-/Ablehnungs-Labels werden über ALLE Versuche hinweg gesammelt (der
+    // breite Fallback-Scan liefert sie nicht zwingend auch) — sonst ginge die
+    // Diagnostik im 0-Event-Fall verloren.
+    const allHeaderLike = [];
+    const allNonEvent = [];
+    let hiddenCount = 0;
+    for (const sel of order) {
+      if (tried.includes(sel)) continue;
+      tried.push(sel);
+      const res = collect(sel);
+      allHeaderLike.push(...res.headerLike);
+      allNonEvent.push(...res.nonEventLabels);
+      hiddenCount += res.hiddenCount;
+      if (res.events.length > 0) {
+        return {
+          labels: cap(dedupe(res.events), 60),
+          eventElementsFound: dedupe(res.events).length,
+          selectorUsed: sel,
+          hiddenCount,
+          headerLikeLabels: cap(dedupe(allHeaderLike), 20),
+          nonEventLabels: cap(dedupeNonEvent(allNonEvent), 20),
+          candidates: cap(res.candidates, 20)
+        };
+      }
+    }
+
+    // Kein Selektor lieferte Events: das Ergebnis trägt headerLike/nonEventLabels
+    // für die Diagnostik, selectorUsed markiert den breitesten Versuch.
+    const last = tried[tried.length - 1];
+    return {
+      labels: [],
+      eventElementsFound: 0,
+      selectorUsed: last,
+      hiddenCount,
+      headerLikeLabels: cap(dedupe(allHeaderLike), 20),
+      nonEventLabels: cap(dedupeNonEvent(allNonEvent), 20),
+      candidates: []
+    };
+  }, { pats: EVENT_LABEL_PATTERNS, prefer: preferSelector }).catch(() => ({
     labels: [], eventElementsFound: 0, selectorUsed: 'error', hiddenCount: 0,
-    headerLikeLabels: [], candidates: []
+    headerLikeLabels: [], nonEventLabels: [], candidates: []
   }));
 }
 
@@ -693,6 +803,100 @@ export const FREEBUSY_CLICK_RENDER_WAIT_MS = 4000;
 // zurückgegeben statt weiterzuklicken.
 export const FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS = 12000;
 
+// ---------------------------------------------------------------------------
+// Event-Wartephase (Iteration 7, Live-Befund Runde 6 vom 28.09.2026 — HAUPTURSACHE)
+// ---------------------------------------------------------------------------
+// Runde 6 lief nach ~4s "erfolgreich" durch (usedMs 4141 bei remainingMs 40859),
+// obwohl das Event-Grid erst nach ~17s rendert (Runde 4: 16,9s, 6 Labels). Die
+// 2,5s-Gnadenfrist nach datiertem Header galt als "fertig", weil hasEventElements
+// den Uhrzeit-Indikator "calendar view, current time: Fri 22:31" als Event
+// wertete. Deshalb wird nach bestätigter Wochen-Verifikation GEZIELT auf echte
+// Event-Labels gepollt — budgetgebunden, mit Reserve für die Extraktion.
+
+// Obergrenze der Event-Wartephase (Events rendern teils erst nach ~17s).
+export const FREEBUSY_EVENT_WAIT_MAX_MS = 20000;
+// Reserve, die für Extraktion + Diagnostik vom Gesamtbudget ABGEZOGEN wird, damit
+// der Call nie ins MCP-Client-Timeout läuft.
+export const FREEBUSY_EVENT_WAIT_RESERVE_MS = 5000;
+// Poll-Intervall der Event-Wartephase.
+export const FREEBUSY_EVENT_WAIT_POLL_MS = 500;
+
+// Mögliche Ausgänge der Event-Wartephase (Diagnose-Feld eventWaitOutcome).
+export const EVENT_WAIT_OUTCOMES = ['found', 'budget-exhausted', 'not-rendered'];
+
+// Wartebudget = min(Cap, Restzeit - Reserve), nie negativ. Runde-6-Kennzahlen als
+// Beispiel: remainingMs 40859 -> 20000 (Cap greift), remainingMs 6000 -> 1000,
+// remainingMs 3000 -> 0 (Wartephase wird ganz übersprungen).
+export function eventWaitBudgetMs(remainingMs, { maxMs = FREEBUSY_EVENT_WAIT_MAX_MS, reserveMs = FREEBUSY_EVENT_WAIT_RESERVE_MS } = {}) {
+  if (!remainingMs || remainingMs <= 0) return 0;
+  return Math.max(0, Math.min(maxMs, remainingMs - (reserveMs || 0)));
+}
+
+// Pollt, bis das Event-Grid echte Event-Labels zeigt. Dependency-Injection
+// (hasEvents/now/sleep) macht die Wartephase ohne Browser testbar — Fixture:
+// Events erscheinen erst im 3. Poll. Pollt NIE über budgetMs hinaus und schläft
+// nie über das Budget hinaus (kein Überziehen der Gesamtdeadline).
+// Rückgabe: { found, outcome, waitedMs, polls }
+export async function pollUntilEventGrid({ hasEvents, budgetMs, pollMs = FREEBUSY_EVENT_WAIT_POLL_MS, now = () => Date.now(), sleep } = {}) {
+  const startedAt = now();
+  const waited = () => now() - startedAt;
+  if (typeof hasEvents !== 'function' || !budgetMs || budgetMs <= 0) {
+    return { found: false, outcome: 'budget-exhausted', waitedMs: waited(), polls: 0 };
+  }
+  let polls = 0;
+  while (waited() < budgetMs) {
+    polls++;
+    // eslint-disable-next-line no-await-in-loop
+    if (await hasEvents()) return { found: true, outcome: 'found', waitedMs: waited(), polls };
+    if (waited() + pollMs >= budgetMs) break;
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(pollMs);
+  }
+  return { found: false, outcome: 'budget-exhausted', waitedMs: waited(), polls };
+}
+
+// ---------------------------------------------------------------------------
+// Klick-Pfad (Iteration 7, Defekt 2 — latenter Wochen-Skip)
+// ---------------------------------------------------------------------------
+// Runde 6 protokollierte einen Klick auf "Next week" (found: true, clicked: true,
+// verified: 'unverified'), OBWOHL der Header die Zielwoche bereits bestätigt hatte.
+// Gefährlich: bei noch unlesbarem Header ('unverified') ist die aktuelle Woche
+// unbekannt — ein Klick kann die Zielwoche ÜBERSPRINGEN (KW 39 -> KW 41 statt
+// -> KW 40). Deshalb: Klick nur bei echter Abweichung, und in dieselbe Richtung
+// nie ohne erneute Wochen-Bestätigung.
+
+// Protokolleintrag, wenn ohne Probe/Klick bereits die Zielwoche gerendert ist.
+export function weekProbeSkipEntry(renderedStart) {
+  return { skipped: 'target-week-verified', renderedWeek: renderedStart || null, clicked: false };
+}
+
+// Darf in dieselbe Richtung erneut geklickt werden?
+//  - noch nie geklickt                    -> ja
+//  - Gegenrichtung (direction != last)    -> ja; das ist der RÜCKWEG, der
+//    ausdrücklich vorbereitet bleiben muss
+//  - gleiche Richtung                     -> nur wenn die Woche nach dem letzten
+//    Klick ERNEUT bestätigt wurde (datierbarer Header). Sonst unbestätigter
+//    Sprung -> nein.
+export function canClickSameDirection({ lastClickDirection = null, direction = 0, weekConfirmedAfterClick = false } = {}) {
+  if (!lastClickDirection || !direction) return true;
+  if (Math.sign(direction) !== Math.sign(lastClickDirection)) return true;
+  return Boolean(weekConfirmedAfterClick);
+}
+
+// Hinweis, wenn die Event-Wartephase ohne echte Events endete. Reine Funktion.
+export function eventWaitWarning({ outcome, waitedMs = 0, budgetMs = null } = {}) {
+  if (outcome === 'found') return null;
+  if (outcome === 'budget-exhausted') {
+    return `Event-Wartephase nach ${Math.round(waitedMs)}ms ohne echtes Event-Label beendet ` +
+      `(Budget ${budgetMs === null ? 'n/a' : budgetMs}ms, Reserve für Extraktion abgezogen). ` +
+      `0 Busy-Slots können damit ein noch nicht gerendertes Grid bedeuten, nicht einen leeren Kalender.`;
+  }
+  if (outcome === 'not-rendered') {
+    return 'Event-Grid wurde nicht gerendert — weder datierter Wochen-Header noch echtes Event-Label gefunden.';
+  }
+  return null;
+}
+
 // Teilt das Gesamtbudget auf Phasen auf: Eine Phase bekommt nie mehr als ihr
 // Cap und nie mehr als die Restzeit; unterhalb der Mindestscheibe wird sie
 // GESKIPPT (0). Runde-3-Root-Cause: Der `Math.max(1000, ...)`-Floor ließ Phasen
@@ -771,7 +975,7 @@ export function classifyButtonFailure({ foundAny = false, clickedAny = false } =
 // (Runde-4-Forderung B): Der frühe Snapshot (direkt nach Navigation erhoben)
 // bleibt immer erhalten, auch wenn das Budget für eine frische Erhebung nicht
 // mehr reicht. Klick-Protokoll, Abbruchgrund und Budget-Report kommen hinzu.
-export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null } = {}) {
+export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null, waitedForEventsMs = null, eventWaitOutcome = null } = {}) {
   const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], weekNavCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
   const out = {
     ...base,
@@ -786,6 +990,12 @@ export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekBu
   if (selectorUsed !== null) out.selectorUsed = selectorUsed;
   if (rawEventLabels !== null) out.rawEventLabels = rawEventLabels;
   if (rejectionReasons !== null) out.rejectionReasons = rejectionReasons;
+  // Runde-6-Diagnostik (Iteration 7): Die Event-Wartephase ist jetzt eine eigene,
+  // budgetgebundene Phase — ihre Dauer und ihr Ausgang gehören in die Diagnostik,
+  // damit "0 Slots" zwischen "leerer Kalender" und "Grid noch nicht gerendert"
+  // unterscheidbar bleibt.
+  if (waitedForEventsMs !== null) out.waitedForEventsMs = waitedForEventsMs;
+  if (eventWaitOutcome !== null) out.eventWaitOutcome = eventWaitOutcome;
   return out;
 }
 
@@ -1476,20 +1686,46 @@ export class OwaClient {
       return waitOnCalendarUrl(phase(4000));
     };
 
-    // Prüft, ob Event-Elemente (Zeit- oder Ganztag-Labels) im Grid gerendert sind.
-    // Runde-5-Fix: Primär der Button-Selektor, Fallback auf den breiteren aria-label-
-    // Scan — Events können je nach OWA-Build auch als gridcell/option gerendert sein.
-    const hasEventElements = async () => page.evaluate(() => {
-      const timeRe = /\d{1,2}:\d{2}/;
-      const allDayRe = /ganztägig|ganztages|all[- ]?day/i;
-      const nonEventRe = /arbeitsort|working location/i;
-      const check = (sel) => Array.from(document.querySelectorAll(sel)).some((b) => {
-        const label = b.getAttribute('aria-label') || '';
-        if (nonEventRe.test(label)) return false;
-        return timeRe.test(label) || allDayRe.test(label);
-      });
-      return check('[role="button"][aria-label]') || check('[aria-label]');
-    }).catch(() => false);
+    // Event-Grid-Fertig-Beweis (Iteration 7, Defekt 1 — HAUPTURSACHE): NICHT
+    // "irgendein [aria-label] mit einer Uhrzeit". Runde 6 bekam vom Zeit-Indikator
+    // "calendar view, current time: Fri 22:31" die Antwort JA (22:31 matchte
+    // /\d{1,2}:\d{2}/), brach nach ~4s ab und lieferte 0 Slots. Verlangt wird jetzt
+    // ein echtes Zeitfenster ("HH:MM to/bis/- HH:MM") oder Ganztag; Uhrzeit- und
+    // Navigations-Indikatoren sowie Work-Location sind explizit ausgeschlossen.
+    // Selektor-Memory: der zuletzt erfolgreiche Selektor wird zuerst probiert.
+    let lastEventSelector = null;
+    const probeEventGrid = async () => page.evaluate(({ pats, prefer }) => {
+      const re = {};
+      for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
+      const isGridEvent = (label) => {
+        if (re.nonEvent.test(label)) return false;
+        if (re.gridBlocker.test(label)) return false;
+        return re.timeRange.test(label) || re.allDay.test(label);
+      };
+      const order = [];
+      if (prefer) order.push(prefer);
+      order.push('[role="button"][aria-label]', '[aria-label]');
+      const seen = [];
+      for (const sel of order) {
+        if (seen.includes(sel)) continue;
+        seen.push(sel);
+        let els = null;
+        try { els = document.querySelectorAll(sel); } catch (e) { els = null; }
+        if (!els) continue;
+        for (let i = 0; i < els.length; i++) {
+          if (isGridEvent(els[i].getAttribute('aria-label') || '')) {
+            return { found: true, selectorUsed: sel };
+          }
+        }
+      }
+      return { found: false, selectorUsed: null };
+    }, { pats: EVENT_LABEL_PATTERNS, prefer: lastEventSelector }).catch(() => ({ found: false, selectorUsed: null }));
+
+    const hasEventElements = async () => {
+      const r = await probeEventGrid();
+      if (r.found && r.selectorUsed) lastEventSelector = r.selectorUsed;
+      return r.found;
+    };
 
     // Zustandswarten statt starrem Timeout: auf gerenderten Wochen-/Tages-Header
     // ODER Event-Elemente warten (Live-Fail 24.09.2026: 6s reichten nicht, das Grid
@@ -1647,9 +1883,21 @@ export class OwaClient {
     let farJumpDone = false;
     let buttonClicks = 0;
     let abortReason = 'none';
+    // Klick-Sperre pro Richtung (Iteration 7, Defekt 2): verhindert, dass bei
+    // unlesbarem Header ('unverified') mehrfach in dieselbe Richtung geklickt und
+    // die Zielwoche ÜBERSPRUNGEN wird. Die Gegenrichtung (Rückweg) bleibt frei.
+    let lastClickDirection = null;
+    let weekConfirmedAfterClick = false;
 
     for (let step = 0; step < 30; step++) {
-      if (rendered.startDate && isRequestedWeek(rendered)) break;
+      // Klick-Pfad NUR bei echter Abweichung (Iteration 7, Defekt 2): Ist die
+      // Zielwoche bereits gerendert und verifiziert, wird das als SKIP
+      // protokolliert — keine Button-Probe, kein Klick. Runde 6 protokollierte
+      // trotz bestätigter Zielwoche einen "Next week"-Klick.
+      if (rendered.startDate && isRequestedWeek(rendered)) {
+        weekButtonProbe.push(weekProbeSkipEntry(rendered.startDate));
+        break;
+      }
       if (remaining() <= 0) { abortReason = 'budget'; break; }
 
       if (!rendered.startDate) {
@@ -1666,11 +1914,19 @@ export class OwaClient {
         if (!forcedNextRetryDone && remaining() >= CLICK_COST_MS + 1000) {
           // Erzwungene Korrektur auch bei unbekannter Woche: 1x "Nächste Woche" +
           // Re-Render + erneuter Erkennungsversuch, bevor abgebrochen wird.
+          // Iteration 7: Nur wenn die Woche seit dem letzten Klick ERNEUT
+          // bestätigt wurde — sonst überspringt der Klick die Zielwoche.
+          if (!canClickSameDirection({ lastClickDirection, direction: 1, weekConfirmedAfterClick })) {
+            abortReason = 'same-direction-unconfirmed';
+            break;
+          }
           forcedNextRetryDone = true;
           const forced = await clickWeekButton(1, rendered.startDate);
           if (forced.clicked) {
             rendered = forced.week;
             hasEvents = hasEvents || (await hasEventElements());
+            lastClickDirection = 1;
+            weekConfirmedAfterClick = Boolean(forced.week && forced.week.startDate);
           }
           continue;
         }
@@ -1704,7 +1960,15 @@ export class OwaClient {
       // Klick-Rationierung: Klick + Re-Render-Wait müssen ins Restbudget passen
       if (remaining() < CLICK_COST_MS) { abortReason = 'budget'; break; }
 
-      const r = await clickWeekButton(Math.sign(deltaWeeks), rendered.startDate);
+      // Iteration 7, Defekt 2: In dieselbe Richtung nur nach erneuter Wochen-
+      // Bestätigung. Der Rückweg (Gegenrichtung) bleibt ausdrücklich erlaubt.
+      const direction = Math.sign(deltaWeeks);
+      if (!canClickSameDirection({ lastClickDirection, direction, weekConfirmedAfterClick })) {
+        abortReason = 'same-direction-unconfirmed';
+        break;
+      }
+
+      const r = await clickWeekButton(direction, rendered.startDate);
       if (!r.clicked) {
         // Kein Kandidat wirkungsvoll -> 1x frische Navigation als Fallback (budgetiert)
         if (!gotoRetryDone && remaining() >= 15000) {
@@ -1724,6 +1988,8 @@ export class OwaClient {
 
       // Klick war verifiziert wirkungsvoll (Header geändert) — gerenderte Woche übernehmen
       rendered = r.week;
+      lastClickDirection = direction;
+      weekConfirmedAfterClick = Boolean(r.week && r.week.startDate);
       hasEvents = hasEvents || (await hasEventElements());
     }
 
@@ -1757,7 +2023,9 @@ export class OwaClient {
         early: earlyDiagnostics,
         weekButtonProbe,
         abortReason: abortReason !== 'none' ? abortReason : 'not-rendered',
-        budget: freeBusyBudgetReport()
+        budget: freeBusyBudgetReport(),
+        waitedForEventsMs: 0,
+        eventWaitOutcome: 'not-rendered'
       });
       return errorResult(
         `Kalenderansicht nicht geladen — Kalender-Tab nicht erreicht oder Woche nicht gerendert. ` +
@@ -1771,21 +2039,30 @@ export class OwaClient {
     // 'unverified' = Header nicht lesbar (Slots werden trotzdem geliefert, mit Warnung).
     const dataQuality = (rendered.startDate && rendered.endDate) ? 'verified' : 'unverified';
 
-    // Runde-5-Fix: Kurze, budgetierte Gnadenfrist, falls die Woche zwar verifiziert
-    // ist, die Events aber noch nicht gerendert wurden (Header rendert vor Events).
-    // Verhindert die 0-Slot-Extraktion direkt nach erfolgreicher Wochen-Verifikation.
+    // ECHTE Event-Wartephase (Iteration 7, Defekt 1 — HAUPTURSACHE der 0 Slots):
+    // Nach bestätigter Wochen-Verifikation nicht mehr nur 2,5s Gnadenfrist, sondern
+    // GEZIELT auf echte Event-Labels pollen. Runde 6 brach nach ~4s ab, weil der
+    // Uhrzeit-Indikator als Event galt; das Grid rendert erst nach ~17s.
+    // Budgetgebunden: min(20s, Restzeit - 5s Reserve) — die Reserve trägt Extraktion
+    // + Diagnostik, damit der Call nie ins MCP-Client-Timeout läuft. Bei
+    // Budgeterschöpfung geht es mit aktuellem Stand + Warnung weiter (kein Fehler).
+    let eventWaitBudget = eventWaitBudgetMs(remaining());
+    let eventWait = { found: Boolean(hasEvents), outcome: hasEvents ? 'found' : 'budget-exhausted', waitedMs: 0, polls: 0 };
     if (!hasEvents) {
-      const graceDeadline = Date.now() + Math.min(2500, Math.max(0, remaining() - 2000));
-      while (Date.now() < graceDeadline) {
-        if (await hasEventElements()) { hasEvents = true; break; }
-        await page.waitForTimeout(400);
-      }
+      eventWait = await pollUntilEventGrid({
+        hasEvents: hasEventElements,
+        budgetMs: eventWaitBudget,
+        pollMs: FREEBUSY_EVENT_WAIT_POLL_MS,
+        sleep: (ms) => page.waitForTimeout(ms)
+      });
+      hasEvents = eventWait.found;
     }
 
     // Alle Event-Elemente über den GEMEINSAMEN Kollektionspfad sammeln (Runde-5-Fix):
     // derselbe Pfad wie die Diagnostik, toleranter Sichtbarkeitsfilter (offsetParent
     // ist KEIN Hard-K.O. für Events), inkl. Roh-Diagnostik für den 0-Slot-Fall.
-    const eventCollection = await collectCalendarEventLabels(page);
+    // Iteration 7: der zuletzt erfolgreiche Selektor wird ZUERST probiert.
+    const eventCollection = await collectCalendarEventLabels(page, { preferSelector: lastEventSelector });
     const rawLabels = eventCollection.labels;
     const eventElementsFound = eventCollection.eventElementsFound;
     const selectorUsed = eventCollection.selectorUsed;
@@ -1809,6 +2086,11 @@ export class OwaClient {
     // Header-artige Labels (Datum ohne Zeit) hat der Kollektor als Event-Kandidaten
     // verworfen -> als 'header-misclassified' ausweisen.
     for (const label of eventCollection.headerLikeLabels) reject(label, 'header-misclassified');
+    // Iteration 7: Labels mit EXPLIZITEM Ablehnungsgrund. Runde 6 lieferte 12x
+    // 'header-misclassified' für "calendar view, current time: Fri 22:31" — das
+    // Rauschen verdeckte die eigentliche Ursache. Jetzt: 'clock-indicator' bzw.
+    // 'work-location'.
+    for (const ne of eventCollection.nonEventLabels) reject(ne.label, ne.reason);
 
     // Beauty-Fix (Live Runde 2): Work-Location-Banner und titellose Pseudo-Slots
     // ("(ohne Titel)", Büro/Homeoffice/URL-Schnipsel) sind keine echte Belegung
@@ -1853,6 +2135,10 @@ export class OwaClient {
     if (dataQuality === 'verified' && abortReason !== 'none') {
       note += ` HINWEIS: Navigation vorzeitig beendet (${abortReason}); die angezeigte Woche wurde verifiziert.`;
     }
+    if (eventWait.outcome === 'budget-exhausted') {
+      note += ` HINWEIS: Auf echte Event-Labels wurde ${Math.round(eventWait.waitedMs)}ms lang gepollt ` +
+        `(Budget ${eventWaitBudget}ms) — ohne Treffer. 0 Slots bedeuten dann nicht sicher "leerer Kalender".`;
+    }
     if (rendered.endDate && rangeEndDate > rendered.endDate) {
       note += ` HINWEIS: Der angefragte Range endet (${rangeEndDate}) nach der gerenderten Woche (${rendered.endDate}) — spätere Tage sind nicht enthalten.`;
     }
@@ -1879,7 +2165,7 @@ export class OwaClient {
     // Enthält URL (inkl. früher Snapshot), Header-/Tageskopf-Kandidaten, ARIA-Sample,
     // Klick-Protokoll, Abbruchgrund, Budget-Report sowie die Slot-Extraktions-Diagnostik
     // (eventElementsFound/selectorUsed/rawEventLabels/rejectionReasons).
-    if (dataQuality === 'unverified' || busySlots.length === 0) {
+    if (dataQuality === 'unverified' || busySlots.length === 0 || eventWait.outcome === 'budget-exhausted') {
       const diag = assembleFreeBusyDiagnostics({
         fresh: await freshDiag(),
         early: earlyDiagnostics,
@@ -1889,10 +2175,15 @@ export class OwaClient {
         eventElementsFound,
         selectorUsed,
         rawEventLabels: rawLabels.slice(0, 20),
-        rejectionReasons: rejectionReasons.slice(0, 40)
+        rejectionReasons: rejectionReasons.slice(0, 40),
+        waitedForEventsMs: Math.round(eventWait.waitedMs),
+        eventWaitOutcome: eventWait.outcome
       });
-      const warning = slotExtractionWarning(eventElementsFound, busySlots.length);
-      if (warning) diag.warning = warning;
+      const warnings = [
+        slotExtractionWarning(eventElementsFound, busySlots.length),
+        eventWaitWarning({ outcome: eventWait.outcome, waitedMs: eventWait.waitedMs, budgetMs: eventWaitBudget })
+      ].filter(Boolean);
+      if (warnings.length) diag.warning = warnings.join(' ');
       result.diagnostics = diag;
     }
     return result;
