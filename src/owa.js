@@ -72,12 +72,12 @@ export function buildCalendarComposeUrl(realm, { subject, start, end, body, is_a
 
 // Baut die URL der OWA-Kalender-Wochenansicht für eine Zielwoche (ISO 'YYYY-MM-DD' = Montag).
 //
-// WICHTIG (Live-Fail 24.09.2026): Die vorherige Variante "?startdate=...&realm=..." lieferte
-// keine gerenderte Kalenderwoche (Header "Work week", 0 Slots). Die im Repo bewährte
-// Kalender-Navigation (openCalendarEventByQuery/deleteCalendarEvent) nutzt realm als ERSTEN
-// Query-Parameter — diese Reihenfolge wird hier übernommen, startdate hängt hinten an.
-// Für den Datums-Parameter selbst gibt es keine offizielle MS-Doku; die Wochen-Verifikation
-// in getFreeBusy prüft daher immer das gerenderte Ergebnis und korrigiert ggf. per Button.
+// STRATEGIE (Iteration 3, Live-Befunde 25.09.2026): Der startdate-Param wird von
+// outlook.cloud.microsoft NICHT zuverlässig befolgt (zukünftige Woche renderte leer,
+// während die aktuelle Woche funktionierte). Die URL MIT startdate wird nur noch als
+// OPTIMIERUNG aufgerufen (spart Button-Klicks, wenn der Param wirkt) — vertraut wird
+// ihr NIE. Primärpfad in getFreeBusy: bewährte Kalender-URL, gerenderte Woche ermitteln,
+// dann per Vor/Zurück-Buttons zur Zielwoche navigieren (Verifikation nach jedem Klick).
 export function buildCalendarWeekUrl(realm, iso) {
   const realmParam = realm ? `realm=${encodeURIComponent(realm)}&` : '';
   return `https://outlook.office.com/calendar/view/week?${realmParam}startdate=${iso}`;
@@ -184,85 +184,220 @@ export function parseWeekHeaderText(text, now = new Date()) {
     }
   }
 
+  // Numerisches Muster: "28.9. – 4.10.2026" / "28.9. - 4.10." (OWA rendert den
+  // Wochen-Header je nach Locale/Build numerisch statt mit Monatsnamen).
+  const num = t.match(/(\d{1,2})\.(\d{1,2})\.?(?:(\d{4}))?\s*[–—-]\s*(\d{1,2})\.(\d{1,2})\.?(?:(\d{4}))?/);
+  if (num) {
+    const d1 = parseInt(num[1], 10);
+    const m1 = parseInt(num[2], 10);
+    const d2 = parseInt(num[4], 10);
+    const m2 = parseInt(num[5], 10);
+    if (d1 >= 1 && d1 <= 31 && d2 >= 1 && d2 <= 31 && m1 >= 1 && m1 <= 12 && m2 >= 1 && m2 <= 12) {
+      const y1 = num[3] ? parseInt(num[3], 10) : (num[6] ? parseInt(num[6], 10) : currentYear);
+      const y2 = num[6] ? parseInt(num[6], 10) : y1;
+      let s = new Date(y1, m1 - 1, d1);
+      let e = new Date(y2, m2 - 1, d2);
+      if (e < s) e = new Date(y2 + 1, m2 - 1, d2);
+      return { startDate: toIsoDate(s), endDate: toIsoDate(e) };
+    }
+  }
+
   return null;
 }
 
-// Liest den gerenderten Wochen-Header aus der OWA-Kalenderansicht aus und parst ihn.
-// OWA rendert z.B. "28. September – 4. Oktober 2026" (DE) bzw. "September 28 – October 4, 2026" (EN).
-// Rückgabe: { text, startDate, endDate } — startDate/endDate als ISO-Strings 'YYYY-MM-DD',
-// null wenn der Header nicht gefunden oder nicht parsebar war.
+// Parst eine NUMERISCHE Tagesangabe ("Montag, 28.9." / "28.9.2026" / "Di 29.9.")
+// in ein ISO-Datum. OWA rendert Tages-Spaltenköpfe je nach Locale/Build mit
+// Monatsnamen ("Montag, 28. September") ODER numerisch ("Montag 28.9.") — beide
+// Varianten müssen für die Wochen-Erkennung lesbar sein (Live-Lücke Runde 2).
+// Rückgabe: ISO-String 'YYYY-MM-DD' oder null.
+export function parseNumericDayHeaderText(text, now = new Date()) {
+  if (!text) return null;
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  // "28.9." / "28.9.2026" — Tag.Monat, Jahr optional (direkt anhängend ODER getrennt)
+  const m = t.match(/(?:^|[\s,])(\d{1,2})\.(\d{1,2})\.(?:(\d{4})|(?=$|[\s,]))/);
+  if (!m) return null;
+  const day = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
+  const year = m[3] ? parseInt(m[3], 10) : now.getFullYear();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${year}-${pad(month)}-${pad(day)}`;
+}
+
+// Sammelt rohe Kandidaten-Texte und Diagnostik-Rohdaten aus der gerenderten
+// Kalenderansicht (Browser-seitig, OHNE Interpretation). Die Wochen-Erkennung
+// passiert deterministisch in resolveRenderedWeekFromCandidates.
 //
-// Live-Fail 24.09.2026: Der alte Selektor griff mit [aria-label*="week" i] den
-// ANSICHTSUMSCHALTER ("Work week") und lieferte dessen Text ohne Datum zurück. Jetzt:
-// Nur Texte mit Datums-/Monatsmuster werden akzeptiert; zusätzlich wird als Fallback die
-// Woche aus einem Tages-Spaltenkopf ("Montag, 28. September") abgeleitet.
-export async function readRenderedCalendarWeek(page) {
-  // Kandidaten-Texte im Browser sammeln: mehrere Selektor-Gruppen, spezifisch zuerst.
-  const candidates = await page.evaluate(() => {
-    const texts = [];
-    const push = (t) => {
+// Live-Befund Runde 2 (25.09.2026): Bei zukünftigen Wochen war unbekannt, WAS im DOM
+// stand — die Response enthielt keine Diagnostik. Diese Sammlung liefert jetzt
+// Header-Kandidaten, Tageskopf-Kandidaten (inkl. Body-Text-Heuristik) und ein
+// ARIA-Label-Sample zurück.
+export async function collectCalendarCandidates(page) {
+  return page.evaluate(() => {
+    const cap = (arr, n) => arr.slice(0, n);
+    const push = (arr, t) => {
       const s = String(t || '').replace(/\s+/g, ' ').trim();
-      if (s && texts.indexOf(s) === -1) texts.push(s);
+      if (s && arr.indexOf(s) === -1) arr.push(s);
     };
+    const headerTexts = [];
+    const dayHeaderTexts = [];
     // Datums-/Monatsmuster (DE + EN): "28. September" bzw. "September 28"
     const dateish = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})/;
     const timeRe = /\d{1,2}:\d{2}/;
+
     // 1) Klassische Header-Rollen (Banner/Überschriften)
     for (const el of document.querySelectorAll('[role="banner"], [role="heading"], h1, h2')) {
-      push(el.getAttribute('aria-label') || el.innerText);
+      push(headerTexts, el.getAttribute('aria-label') || el.innerText);
     }
     // 2) Toolbar-/Button-Elemente mit Datums-Label: OWA rendert den Wochenbereich als
-    //    klickbaren Datums-Button in der Toolbar. Der Ansichtsumschalter ("Work week"/
-    //    "Arbeitswoche") enthält KEIN Datum und fällt hier bewusst heraus.
+    //    klickbaren Datums-Button. Der Ansichtsumschalter ("Work week"/"Arbeitswoche")
+    //    enthält KEIN Datum und fällt hier bewusst heraus.
     for (const el of document.querySelectorAll(
       '[role="banner"] button, [role="banner"] [role="button"], header button, [role="toolbar"] button, [role="toolbar"] [role="button"]'
     )) {
       const label = el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '';
-      if (dateish.test(label) && !timeRe.test(label)) push(label);
+      if (dateish.test(label) && !timeRe.test(label)) push(headerTexts, label);
     }
     // 3) Alle aria-labels mit Datums-/Monatsmuster, aber OHNE Uhrzeit (z.B. der
     //    Datumsauswahl-Button). Zeitmuster-Labels sind Event-Elemente, keine Header.
     for (const el of document.querySelectorAll('[aria-label]')) {
       const label = el.getAttribute('aria-label') || '';
-      if (dateish.test(label) && !timeRe.test(label) && label.length <= 120) push(label);
+      if (dateish.test(label) && !timeRe.test(label) && label.length <= 120) push(headerTexts, label);
     }
-    // 4) Tages-Spaltenköpfe der Woche ("Montag, 28. September") — Fallback, falls der
-    //    Toolbar-Bereich nicht lesbar ist; die Woche lässt sich daraus ableiten.
-    for (const el of document.querySelectorAll('[role="columnheader"], [role="grid"] [role="columnheader"]')) {
-      push(el.getAttribute('aria-label') || el.innerText);
+    // 4) Tages-Spaltenköpfe der Woche — mehrere Selektor-Varianten (OWA nutzt je nach
+    //    Build role="columnheader", th-Elemente oder Grid-Köpfe)
+    for (const el of document.querySelectorAll(
+      '[role="columnheader"], [role="grid"] [role="columnheader"], th, [role="grid"] th'
+    )) {
+      push(dayHeaderTexts, el.getAttribute('aria-label') || el.innerText);
     }
-    // 5) Gesamter Seitentext als letzter Kandidat
-    if (document.body) push(document.body.innerText);
-    return texts;
-  }).catch(() => []);
+    // 5) Body-Text-Heuristik: Zeilen mit Wochentag + Datum ("Montag, 28. September",
+    //    "Montag 28.9.") ODER Wochen-Range-Muster — Fallback, falls die Spaltenköpfe
+    //    über keine der Rollen erreichbar sind. Wochentag+Datum ZUSAMMEN (oder ein
+    //    explizites Range-Muster) sind Pflicht, um Rauschen zu filtern.
+    try {
+      const weekdayRe = /\b(montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+      const lineDateRe = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,}\.?)|(\d{1,2}\.\d{1,2}\.?)/;
+      const rangeRe = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,}\.?\s*[–—-]\s*\d{1,2}\.?\s*[A-Za-zäöüÄÖÜß]{3,})|(\d{1,2}\.\d{1,2}\.?\s*[–—-]\s*\d{1,2}\.\d{1,2}\.?)/;
+      const lines = (document.body ? document.body.innerText : '').split('\n');
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s || s.length > 60) continue;
+        if ((weekdayRe.test(s) && lineDateRe.test(s)) || rangeRe.test(s)) push(dayHeaderTexts, s);
+        if (dayHeaderTexts.length >= 12) break;
+      }
+    } catch (e) { /* bewusst ignorieren */ }
 
-  // Ersten Kandidaten mit parsebarem Datumsbereich verwenden. Texte ohne Datums-/
-  // Monatsmuster ("Work week", "Posteingang") fallen bewusst durch — sie werden NICHT
-  // als Header-Text mit null-Daten zurückgegeben.
-  for (const text of candidates) {
-    const parsed = parseWeekHeaderText(text);
-    if (parsed) {
-      return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate };
-    }
+    // Diagnostik: Anzahl + Sample aller ARIA-Buttons (Event-Elemente)
+    const buttons = Array.from(document.querySelectorAll('[role="button"][aria-label]'));
+    const ariaLabelSample = cap(
+      buttons
+        .map((b) => String(b.getAttribute('aria-label') || '').trim())
+        .filter((l) => l.length > 0)
+        .map((l) => l.slice(0, 120)),
+      15
+    );
+
+    return {
+      headerTexts: cap(headerTexts, 20),
+      dayHeaderTexts: cap(dayHeaderTexts, 20),
+      ariaButtonCount: buttons.length,
+      ariaLabelSample
+    };
+  }).catch(() => ({ headerTexts: [], dayHeaderTexts: [], ariaButtonCount: 0, ariaLabelSample: [] }));
+}
+
+// Löst aus den gesammelten Kandidaten-Texten die gerenderte Kalenderwoche auf.
+// Reine Funktion (unit-testbar). Erkennungs-Reihenfolge (spezifisch zuerst):
+//  1. Wochen-Range-Header mit Monatsnamen ODER numerisch ("28. September – 4. Oktober",
+//     "28.9. – 4.10.2026")
+//  2. Einzel-Datum mit Monatsnamen (Toolbar-Datumsbutton, "Montag, 28. September")
+//  3. Numerische Tagesangaben ("Montag 28.9." / "28.9.2026")
+// Rückgabe: { text, startDate, endDate } — bei NICHTS Datierbarem sind alle Felder null.
+// Der Ansichtsumschalter ("Work week") hat kein Datums-/Monatsmuster und kann daher NIE
+// als gerenderte Woche durchkommen (Live-Fail 24.09.2026).
+export function resolveRenderedWeekFromCandidates({ headerTexts = [], dayHeaderTexts = [] } = {}, now = new Date()) {
+  // Aus einem Einzel-Datum die OWA-Wochenansicht (Montag–Sonntag) ableiten.
+  const deriveWeek = (dateIso, text) => {
+    const d = new Date(dateIso + 'T00:00:00');
+    const offsetToMonday = d.getDay() === 0 ? -6 : 1 - d.getDay();
+    const monday = new Date(d.getTime() + offsetToMonday * 86400000);
+    const sunday = new Date(monday.getTime() + 6 * 86400000);
+    return { text: String(text).slice(0, 200), startDate: toIsoDate(monday), endDate: toIsoDate(sunday) };
+  };
+  const currentYear = now.getFullYear();
+
+  // 1) Wochen-Range-Header (Header-Bereich zuerst, dann Tageskopf-/Body-Kandidaten)
+  for (const text of headerTexts) {
+    const parsed = parseWeekHeaderText(text, now);
+    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate };
   }
-
-  // Fallback: Aus einem Tages-Spaltenkopf die gerenderte Woche ableiten (OWA-Wochenansicht
-  // beginnt montags — gleiche Regel wie in getFreeBusy). parseEventLabel parst zuverlässig
-  // "Montag, 28. September" / "Monday, September 28" zu einem Datum.
-  const currentYear = new Date().getFullYear();
-  for (const text of candidates) {
+  for (const text of dayHeaderTexts) {
+    const parsed = parseWeekHeaderText(text, now);
+    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate };
+  }
+  // 2) Einzel-Datum mit Monatsnamen
+  for (const text of headerTexts) {
     const slot = parseEventLabel(text, currentYear);
-    if (slot && slot.date) {
-      const d = new Date(slot.date + 'T00:00:00');
-      const offsetToMonday = d.getDay() === 0 ? -6 : 1 - d.getDay();
-      const monday = new Date(d.getTime() + offsetToMonday * 86400000);
-      const sunday = new Date(monday.getTime() + 6 * 86400000);
-      return { text: text.slice(0, 200), startDate: toIsoDate(monday), endDate: toIsoDate(sunday) };
-    }
+    if (slot && slot.date) return deriveWeek(slot.date, text);
+  }
+  for (const text of dayHeaderTexts) {
+    const slot = parseEventLabel(text, currentYear);
+    if (slot && slot.date) return deriveWeek(slot.date, text);
+  }
+  // 3) Numerische Tagesangaben (Spaltenköpfe + kurze Header-Texte)
+  for (const text of dayHeaderTexts) {
+    const dateIso = parseNumericDayHeaderText(text, now);
+    if (dateIso) return deriveWeek(dateIso, text);
+  }
+  for (const text of headerTexts) {
+    if (String(text).length > 60) continue; // lange Texte nur mit stärkerem Muster akzeptieren
+    const dateIso = parseNumericDayHeaderText(text, now);
+    if (dateIso) return deriveWeek(dateIso, text);
   }
 
-  // Nichts Datierbares gefunden -> bewusst LEER zurückgeben (kein "Work week"-Fehlgreifer).
-  return { text: '', startDate: null, endDate: null };
+  // Nichts Datierbares gefunden -> bewusst NULL zurückgeben (kein "Work week"-Fehlgreifer).
+  return { text: null, startDate: null, endDate: null };
+}
+
+// Liest die gerenderte Kalenderwoche aus der OWA-Wochenansicht aus.
+// Rückgabe: { text, startDate, endDate } — startDate/endDate als ISO-Strings
+// 'YYYY-MM-DD', alles null wenn der Header nicht gefunden oder nicht parsebar war.
+export async function readRenderedCalendarWeek(page) {
+  const collected = await collectCalendarCandidates(page);
+  return resolveRenderedWeekFromCandidates(collected);
+}
+
+// Sammelt reiche Diagnostik für Fehlerfälle und unverified-Responses (Kernforderung
+// Runde 3): URL, Header-Kandidaten, Tageskopf-Kandidaten, ARIA-Button-Anzahl und ein
+// Sample der ersten ARIA-Labels — so zeigt der nächste Live-Test sofort, was das DOM
+// wirklich enthielt.
+export async function collectCalendarDiagnostics(page) {
+  const collected = await collectCalendarCandidates(page);
+  let url = '';
+  try { url = page.url() || ''; } catch (e) { /* bewusst ignorieren */ }
+  return {
+    url,
+    headerCandidates: collected.headerTexts,
+    dayHeaderCandidates: collected.dayHeaderTexts,
+    ariaButtonCount: collected.ariaButtonCount,
+    ariaLabelSample: collected.ariaLabelSample
+  };
+}
+
+// Formatiert Kalender-Diagnostik als kompakte mehrzeilige Zeichenkette (für Fehlermeldungen).
+export function formatCalendarDiagnostics(diag) {
+  if (!diag) return '(keine Diagnostik verfügbar)';
+  const fmtList = (list, max) => (list && list.length)
+    ? list.slice(0, max).map((t) => `"${String(t).slice(0, 80)}"`).join(' | ')
+    : '(keine)';
+  return [
+    `URL: ${diag.url || 'unbekannt'}`,
+    `Header-Kandidaten: ${fmtList(diag.headerCandidates, 8)}`,
+    `Tageskopf-Kandidaten: ${fmtList(diag.dayHeaderCandidates, 8)}`,
+    `ARIA-Buttons gesamt: ${diag.ariaButtonCount ?? '?'}`,
+    `ARIA-Label-Sample: ${fmtList(diag.ariaLabelSample, 15)}`
+  ].join('\n');
 }
 
 // Parst ein OWA-Event-ARIA-Label in einen strukturierten Busy-Slot.
@@ -355,6 +490,48 @@ export function classifyEventStatus(label) {
   if (/\bfree\b|\bfrei\b/i.test(t)) return 'free';
   if (/tentative|\bvorbehalt\b/i.test(t)) return 'tentative';
   return 'busy';
+}
+
+// Erkennt Work-Location-/Pseudo-Slots OHNE echten Titel (Beauty-Fix Live Runde 2):
+// OWA rendert "Arbeitsort"/"Working location"-Banner und titellose Platzhalter-Events
+// ("(ohne Titel)") als belegungsähnliche Elemente — sie blockieren keine echte
+// Meetingzeit und werden aus den Busy-Slots ausgeschlossen. Auch reine URL-Schnipsel
+// als "Titel" (z.B. Teams-Links) gelten nicht als echter Termin.
+// Rückgabe: true = Pseudo-Slot (ausschließen), false = echter Termin.
+export function isWorkLocationPseudoSlot(title) {
+  const t = String(title || '').trim();
+  if (!t) return true; // gar kein Titel -> Pseudo-Slot
+  if (/^\(?\s*(ohne titel|no title|unbenannt|untitled)\s*\)?$/i.test(t)) return true;
+  if (/arbeitsort|working location|homeoffice|home office|\bbüro\b/i.test(t)) return true;
+  if (/https?:\/\//i.test(t)) return true;
+  return false;
+}
+
+// Dedupliziert Busy-Slots (Beauty-Fix Live Runde 2): identisches Datum + Zeitfenster
+// nur 1x; überlappende Duplikate gleicher Zeit werden zusammengeführt — bevorzugt
+// bleibt der Slot mit echtem (nicht-pseudo) Titel, sonst der längere Titel.
+// Ganztag-Slots werden pro Tag zusammengeführt. Reine Funktion (unit-testbar).
+export function dedupeBusySlots(slots) {
+  const byKey = new Map();
+  for (const slot of slots || []) {
+    if (!slot || !slot.date) continue;
+    const timeKey = slot.allDay ? 'allday' : `${slot.start}-${slot.end}`;
+    const key = `${slot.date}|${timeKey}`;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, slot);
+      continue;
+    }
+    const exPseudo = isWorkLocationPseudoSlot(existing.title);
+    const newPseudo = isWorkLocationPseudoSlot(slot.title);
+    if (exPseudo && !newPseudo) {
+      byKey.set(key, slot);
+    } else if (!exPseudo && !newPseudo
+      && String(slot.title || '').length > String(existing.title || '').length) {
+      byKey.set(key, slot);
+    }
+  }
+  return Array.from(byKey.values());
 }
 
 // Parst aus dem Zeilentext einer OWA-Nachrichtenliste/Suchergebniszeile einen
@@ -730,11 +907,19 @@ export class OwaClient {
     const offsetToMonday = weekday === 0 ? -6 : 1 - weekday;
     const mondayIso = toIsoDate(new Date(startDateObj.getTime() + offsetToMonday * 86400000));
 
-    // Navigation MIT Zielwoche. URL-Format an der bewährten Kalender-Navigation
-    // orientiert (openCalendarEventByQuery): realm ZUERST, startdate als zweiter
-    // Parameter (Live-Fail 24.09.2026: "?startdate=...&realm=..." lieferte keine
-    // gerenderte Woche — Reihenfolge war nicht verifiziert).
-    const targetUrl = buildCalendarWeekUrl(this.realm, mondayIso);
+    // ---------------------------------------------------------------------
+    // Navigations-Strategie (Iteration 3, Live-Befunde Runde 2 vom 25.09.):
+    // Der startdate-Param wird von outlook.cloud.microsoft NICHT zuverlässig
+    // befolgt (zukünftige Woche renderte leer, aktuelle Woche funktionierte).
+    // Er bleibt nur noch OPTIMIERUNG (spart Klicks, wenn er wirkt) — vertraut
+    // wird ihm NIE. PRIMÄRPFAD: bewährte Kalender-URL, gerenderte Woche
+    // ermitteln, dann per Vor/Zurück-Buttons zur Zielwoche navigieren
+    // (max. 12 Klicks, Re-Render + Verifikation nach jedem Klick).
+    // ---------------------------------------------------------------------
+    const optimizedUrl = buildCalendarWeekUrl(this.realm, mondayIso); // mit startdate (Optimierung)
+    const provenUrl = this.realm
+      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+      : 'https://outlook.office.com/calendar/view/week';
 
     // Globales Zeitbudget: Das Tool muss auch im Fehlerfall rechtzeitig mit klarer
     // Meldung zurückkehren (statt in einen MCP-Timeout zu laufen).
@@ -752,21 +937,75 @@ export class OwaClient {
       return (page.url() || '').includes('/calendar');
     };
 
-    // Bis zu 2 Navigationsversuche; danach MUSS die URL auf /calendar zeigen,
-    // sonst klarer Fehler statt leerer Daten.
-    let onCalendar = false;
-    for (let attempt = 1; attempt <= 2 && !onCalendar; attempt++) {
-      if (attempt === 1) {
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }).catch(() => null);
-      } else {
-        // Fallback: bewährte URL ohne startdate (lädt die aktuell gerenderte Woche;
-        // die Wochen-Korrektur unten navigiert dann per Button zur Zielwoche).
-        const fallbackUrl = this.realm
-          ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
-          : 'https://outlook.office.com/calendar/view/week';
-        await page.goto(fallbackUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }).catch(() => null);
+    const gotoCalendar = async (url) => {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }).catch(() => null);
+      return waitOnCalendarUrl(Math.min(6000, remaining()));
+    };
+
+    // Prüft, ob Event-Elemente (Zeit- oder Ganztag-Labels) im Grid gerendert sind.
+    const hasEventElements = async () => page.evaluate(() => {
+      const timeRe = /\d{1,2}:\d{2}/;
+      const allDayRe = /ganztägig|all day|all-day/i;
+      return Array.from(document.querySelectorAll('[role="button"][aria-label]')).some((b) => {
+        const label = b.getAttribute('aria-label') || '';
+        return timeRe.test(label) || allDayRe.test(label);
+      });
+    }).catch(() => false);
+
+    // Zustandswarten statt starrem Timeout: auf gerenderten Wochen-/Tages-Header
+    // ODER Event-Elemente warten (Live-Fail 24.09.2026: 6s reichten nicht, das Grid
+    // war noch nicht da -> 0 Slots, "Work week" als einziger Text).
+    const waitForCalendarRendered = async (timeoutMs) => {
+      const waitDeadline = Date.now() + timeoutMs;
+      let rendered = { text: null, startDate: null, endDate: null };
+      let events = false;
+      while (Date.now() < waitDeadline) {
+        rendered = await readRenderedCalendarWeek(page);
+        events = await hasEventElements();
+        if (rendered.startDate || events) break;
+        await page.waitForTimeout(1000);
       }
-      onCalendar = await waitOnCalendarUrl(Math.min(6000, remaining()));
+      return { rendered, hasEvents: events };
+    };
+
+    // Klickt den Vor/Zurück-Button der Wochenansicht (direction > 0 = nächste Woche).
+    const clickWeekButton = async (direction) => {
+      const selector = direction > 0
+        ? '[aria-label*="Nächste Woche" i], [aria-label*="Next week" i], [title*="Nächste Woche" i], [title*="Next week" i]'
+        : '[aria-label*="Vorherige Woche" i], [aria-label*="Previous week" i], [title*="Vorherige Woche" i], [title*="Previous week" i]';
+      const btn = page.locator(selector).first();
+      try {
+        await btn.waitFor({ state: 'visible', timeout: 4000 });
+        await btn.click({ timeout: 4000 });
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    // Wartet nach einem Button-Klick auf das Re-Render (Header-Änderung) und liefert
+    // die neu erkannte Woche — oder unknown, wenn der Header weiter unlesbar ist.
+    const waitRenderAfterClick = async (prevStart) => {
+      const renderDeadline = Date.now() + Math.min(8000, remaining());
+      let updated = null;
+      while (Date.now() < renderDeadline) {
+        updated = await readRenderedCalendarWeek(page);
+        if (updated.startDate && updated.startDate !== prevStart) return updated;
+        await page.waitForTimeout(800);
+      }
+      // Header nach Klick nicht lesbar geworden: kurz nachwarten, dann Ergebnis werten
+      // (kein blindes Re-Klicken — Gefahr des Doppel-Advancierens).
+      await page.waitForTimeout(1500);
+      const recheck = await readRenderedCalendarWeek(page);
+      if (recheck && recheck.startDate) return recheck;
+      return { text: null, startDate: null, endDate: null };
+    };
+
+    // 1) Optimierungsversuch MIT startdate (spart Button-Klicks, wenn der Param wirkt)
+    let onCalendar = await gotoCalendar(optimizedUrl);
+    // 2) Fallback: bewährte URL OHNE startdate (Basis des Primärpfads)
+    if (!onCalendar) {
+      onCalendar = await gotoCalendar(provenUrl);
     }
     if (!onCalendar) {
       throw new Error(
@@ -775,118 +1014,118 @@ export class OwaClient {
       );
     }
 
-    // Zustandswarten statt starrem Timeout: auf gerenderten Wochen-/Tages-Header
-    // ODER Event-Elemente warten (Live-Fail 24.09.2026: 6s reichten nicht, das Grid
-    // war noch nicht da -> 0 Slots, "Work week" als einziger Text).
-    const waitForCalendarRendered = async (timeoutMs) => {
-      const waitDeadline = Date.now() + timeoutMs;
-      let rendered = { text: '', startDate: null, endDate: null };
-      let hasEvents = false;
-      while (Date.now() < waitDeadline) {
-        rendered = await readRenderedCalendarWeek(page);
-        hasEvents = await page.evaluate(() => {
-          const timeRe = /\d{1,2}:\d{2}/;
-          const allDayRe = /ganztägig|all day|all-day/i;
-          return Array.from(document.querySelectorAll('[role="button"][aria-label]')).some((b) => {
-            const label = b.getAttribute('aria-label') || '';
-            return timeRe.test(label) || allDayRe.test(label);
-          });
-        }).catch(() => false);
-        if (rendered.startDate || hasEvents) break;
-        await page.waitForTimeout(1000);
-      }
-      return { rendered, hasEvents };
-    };
-
     let { rendered, hasEvents } = await waitForCalendarRendered(Math.min(20000, remaining()));
 
-    // VERIFIKATION + KORREKTUR: Gerenderten Wochen-Header gegen den angefragten Range
-    // prüfen. Nie blind Daten der falschen Woche zurückgeben.
+    // VERIFIKATION: Gerenderten Wochen-Header gegen den angefragten Range prüfen.
+    // Nie blind Daten der falschen Woche zurückgeben.
     const isRequestedWeek = (r) => Boolean(
       r && r.startDate && r.endDate &&
       r.startDate <= rangeStartDate && rangeStartDate <= r.endDate
     );
 
-    // Wochen-Korrektur: Zielwoche ansteuern — Vor/Zurück-Buttons bevorzugt, direkte
-    // URL-Navigation als Fallback. Bounded (max. 8 Schritte + Zeitbudget).
+    // Button-basierte Wochen-Korrektur (PRIMÄRPFAD): Vor/Zurück bis die gerenderte
+    // Woche der Zielwoche entspricht. Eskalationsleiter bei unbekannter gerendeter
+    // Woche: 1x frische Navigation -> 1x erzwungenes "Nächste Woche" -> Abbruch
+    // mit reicher Diagnostik (Guard unten).
+    const MAX_BUTTON_CLICKS = 12;
     let gotoRetryDone = false;
-    for (let step = 0; step < 8 && Date.now() < deadline; step++) {
-      if (isRequestedWeek(rendered)) break;
+    let forcedNextRetryDone = false;
+    let farJumpDone = false;
+    let buttonClicks = 0;
+
+    for (let step = 0; step < 40 && Date.now() < deadline; step++) {
+      if (rendered.startDate && isRequestedWeek(rendered)) break;
 
       if (!rendered.startDate) {
-        // Header unlesbar: EINMAL frisch navigieren und erneut zustandsbasiert warten.
-        if (gotoRetryDone) break;
-        gotoRetryDone = true;
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }).catch(() => null);
-        const retry = await waitForCalendarRendered(Math.min(15000, remaining()));
-        rendered = retry.rendered;
-        hasEvents = hasEvents || retry.hasEvents;
-        continue;
+        // Gerenderte Woche UNBEKANNT: Eskalationsleiter
+        if (!gotoRetryDone) {
+          // 1x frisch navigieren und erneut zustandsbasiert warten
+          gotoRetryDone = true;
+          await gotoCalendar(provenUrl);
+          const retry = await waitForCalendarRendered(Math.min(15000, remaining()));
+          rendered = retry.rendered;
+          hasEvents = hasEvents || retry.hasEvents;
+          continue;
+        }
+        if (!forcedNextRetryDone) {
+          // Erzwungene Korrektur auch bei unbekannter Woche: 1x "Nächste Woche" +
+          // Re-Render + erneuter Erkennungsversuch, bevor abgebrochen wird.
+          forcedNextRetryDone = true;
+          const forcedClicked = await clickWeekButton(1);
+          if (forcedClicked) {
+            rendered = await waitRenderAfterClick(rendered.startDate);
+            hasEvents = hasEvents || (await hasEventElements());
+          }
+          continue;
+        }
+        break; // Nichts hilft -> Guard unten wirft mit reicher Diagnostik
       }
 
-      // Delta in Wochen zwischen gerendertem und Ziel-Montag berechnen
+      // Gerenderte Woche BEKANNT: Delta in Wochen berechnen und per Buttons navigieren
       const deltaWeeks = Math.round(
         (new Date(mondayIso + 'T00:00:00') - new Date(rendered.startDate + 'T00:00:00')) / (7 * 86400000)
       );
-      if (deltaWeeks === 0) break; // gleiche Woche, aber Range ragt heraus -> unten bewerten
+      if (deltaWeeks === 0) break; // Zielwoche gerendert -> unten bewerten
 
-      const btn = page.locator(deltaWeeks > 0
-        ? '[aria-label*="Nächste Woche" i], [aria-label*="Next week" i], [title*="Nächste Woche" i], [title*="Next week" i]'
-        : '[aria-label*="Vorherige Woche" i], [aria-label*="Previous week" i], [title*="Vorherige Woche" i], [title*="Previous week" i]'
-      ).first();
-      let clicked = false;
-      try {
-        await btn.waitFor({ state: 'visible', timeout: 4000 });
-        await btn.click({ timeout: 4000 });
-        clicked = true;
-      } catch (e) {
-        // Button nicht gefunden -> Fallback: direkte URL-Navigation auf die Zielwoche
-      }
-      if (!clicked) {
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }).catch(() => null);
-      }
-
-      // Auf Re-Render warten: Header-Änderung abwarten (statt starrem Timeout)
-      const prevStart = rendered.startDate;
-      const renderDeadline = Date.now() + Math.min(8000, remaining());
-      let updated = null;
-      while (Date.now() < renderDeadline) {
-        updated = await readRenderedCalendarWeek(page);
-        if (updated.startDate && updated.startDate !== prevStart) break;
-        await page.waitForTimeout(800);
-      }
-      if (updated && updated.startDate) {
-        rendered = updated;
-      } else {
-        // Header nach Klick nicht lesbar geworden: kurz nachwarten, dann Schleife
-        // verlassen (kein blindes Re-Klicken — Gefahr des Doppel-Advancierens).
-        await page.waitForTimeout(1500);
-        const recheck = await readRenderedCalendarWeek(page);
-        if (recheck && recheck.startDate) {
-          rendered = recheck;
-        } else {
-          break;
+      if (buttonClicks >= MAX_BUTTON_CLICKS || Math.abs(deltaWeeks) > MAX_BUTTON_CLICKS) {
+        // Zu weit entfernt für Button-Klicks: 1x startdate-URL als Fernsprung
+        // (Optimierung), danach wird wieder verifiziert.
+        if (!farJumpDone) {
+          farJumpDone = true;
+          await gotoCalendar(optimizedUrl);
+          const retry = await waitForCalendarRendered(Math.min(15000, remaining()));
+          rendered = retry.rendered;
+          hasEvents = hasEvents || retry.hasEvents;
+          continue;
         }
+        break;
       }
+
+      const clicked = await clickWeekButton(Math.sign(deltaWeeks));
+      if (!clicked) {
+        // Button nicht gefunden -> 1x frische Navigation als Fallback, dann Abbruch
+        if (!gotoRetryDone) {
+          gotoRetryDone = true;
+          await gotoCalendar(provenUrl);
+          const retry = await waitForCalendarRendered(Math.min(15000, remaining()));
+          rendered = retry.rendered;
+          hasEvents = hasEvents || retry.hasEvents;
+          continue;
+        }
+        break;
+      }
+      buttonClicks++;
+
+      // Re-Render abwarten und nach JEDEM Klick neu verifizieren
+      rendered = await waitRenderAfterClick(rendered.startDate);
+      hasEvents = hasEvents || (await hasEventElements());
     }
 
+    // Reiche Diagnostik sammeln (für Guards + unverified-Response) — Kernforderung Runde 3
+    const diagnostics = await collectCalendarDiagnostics(page);
+    const diagBlock = formatCalendarDiagnostics(diagnostics);
+
+    // GUARD 1: Falsche Woche gerendert -> keine Daten statt falscher Daten.
     if (rendered.startDate && !isRequestedWeek(rendered)) {
       throw new Error(
         `Kalender-Wochenansicht zeigt nicht die angefragte Woche: angefragt ab ${rangeStartDate}, ` +
         `gerendert ${rendered.startDate} – ${rendered.endDate || '?'} ` +
         `(Header: "${(rendered.text || '').slice(0, 120)}"). ` +
-        `Es werden bewusst KEINE falschen Belegungsdaten zurückgegeben. Bitte erneut versuchen oder OWA manuell prüfen.`
+        `Es werden bewusst KEINE falschen Belegungsdaten zurückgegeben.\n` +
+        `Diagnostik:\n${diagBlock}`
       );
     }
 
-    // DEFENSIV (Live-Fail 24.09.2026): Weder datierter Header noch Event-Elemente ->
-    // die Kalenderansicht wurde nicht erreicht/nicht gerendert. Klare Fehlermeldung
-    // statt leerer unverified-Response. (Leere Woche mit datiertem Header ist legitim.)
+    // GUARD 2 (defensiv, geschärft): Weder datierter Header noch Event-Elemente nach
+    // Navigation + Warten + Retry -> Kalenderansicht nicht erreicht/nicht gerendert.
+    // Klare Fehlermeldung MIT Diagnostik statt leerer unverified-Response.
+    // (Leere Woche mit datiertem Header ist legitim.)
     if (!rendered.startDate && !hasEvents) {
       throw new Error(
-        `Kalenderansicht nicht geladen — Kalender-Tab nicht erreicht oder Woche nicht gerendert ` +
-        `(URL: ${page.url() || 'unbekannt'}). Weder ein datierter Wochen-Header noch Event-Elemente gefunden. ` +
-        `Bitte erneut versuchen bzw. Session prüfen (outlook_login).`
+        `Kalenderansicht nicht geladen — Kalender-Tab nicht erreicht oder Woche nicht gerendert. ` +
+        `Weder ein datierter Wochen-Header noch Event-Elemente gefunden (nach Navigation, Warten und Retry). ` +
+        `Bitte erneut versuchen bzw. Session prüfen (outlook_login).\n` +
+        `Diagnostik:\n${diagBlock}`
       );
     }
 
@@ -927,6 +1166,17 @@ export class OwaClient {
       parsedSlots.push(slot);
     }
 
+    // Beauty-Fix (Live Runde 2): Work-Location-Banner und titellose Pseudo-Slots
+    // ("(ohne Titel)", Büro/Homeoffice/URL-Schnipsel) sind keine echte Belegung
+    // und werden aus den Slots ausgeschlossen.
+    const realSlots = parsedSlots.filter((slot) =>
+      slot.status !== 'non_event' && !isWorkLocationPseudoSlot(slot.title)
+    );
+
+    // Dedupe: identisches Datum+Zeit nur 1x; überlappende Duplikate gleicher Zeit
+    // zusammenführen (bevorzugt wird der Slot mit echtem Titel behalten).
+    const dedupedSlots = dedupeBusySlots(realSlots);
+
     // Nur Slots zurückgeben, die mit dem angefragten Range [start, end) überlappen.
     // Ganztag-Events belegen 00:00–24:00 ihres Tages. Explizit freie Slots ('free')
     // sind keine Belegung und werden ausgeschlossen.
@@ -935,7 +1185,7 @@ export class OwaClient {
     const rangeStartMs = new Date(rangeStartIso).getTime();
     const rangeEndMs = new Date(rangeEndIso).getTime();
 
-    const busySlots = parsedSlots
+    const busySlots = dedupedSlots
       .filter((slot) => slot.status !== 'free')
       .filter((slot) => {
         const dayStartMs = new Date(`${slot.date}T00:00:00`).getTime();
@@ -951,7 +1201,9 @@ export class OwaClient {
 
     // Hinweise zusammenbauen (Verifikationsstatus + Range-Abdeckung)
     let note = 'Busy-Slots aus ARIA-Labels der Kalender-Event-Elemente der Wochenansicht extrahiert ' +
-      '(Datum/Zeit strukturiert geparst, dedupliziert, per Wortliste klassifiziert, auf den angefragten Zeitraum gefiltert).';
+      '(Datum/Zeit strukturiert geparst, Work-Location-Pseudo-Slots entfernt, Zeit-Duplikate zusammengeführt, ' +
+      'per Wortliste klassifiziert, auf den angefragten Zeitraum gefiltert). ' +
+      'Navigation: startdate-Param nur als Optimierung, Zielwoche wird per Button-Navigation angesteuert und verifiziert.';
     if (dataQuality === 'unverified') {
       note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
     }
@@ -959,7 +1211,7 @@ export class OwaClient {
       note += ` HINWEIS: Der angefragte Range endet (${rangeEndDate}) nach der gerenderten Woche (${rendered.endDate}) — spätere Tage sind nicht enthalten.`;
     }
 
-    return {
+    const result = {
       start: startDt,
       end: endDt,
       calendar: 'Firmenkalender (Outlook Web)',
@@ -973,6 +1225,12 @@ export class OwaClient {
       count: busySlots.length,
       note
     };
+    // Reiche Diagnostik bei unverifizierten Daten mitliefern (Kernforderung Runde 3):
+    // URL, Header-/Tageskopf-Kandidaten und ARIA-Sample des gerenderten DOMs.
+    if (dataQuality === 'unverified') {
+      result.diagnostics = diagnostics;
+    }
+    return result;
   }
 
   // Lokalisiert ein Kalender-Event im OWA-Firmenkalender und öffnet dessen Detail-Panel.
