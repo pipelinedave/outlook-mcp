@@ -1210,4 +1210,328 @@ describe('collectCalendarEventLabels - gemeinsamer Kollektionspfad & Sichtbarkei
     const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage));
     assert.equal(res.eventElementsFound, 0);
   });
+
+  // ---------------------------------------------------------------------
+  // Iteration 7 (Live-Befund Runde 6): der Uhrzeit-Indikator war der Grund
+  // fuer eventElementsFound: 1 bei real leerem Grid.
+  // ---------------------------------------------------------------------
+  test('Uhrzeit-Indikator "current time" ist KEIN Event (Runde-6-Fehltreffer)', async () => {
+    const doc = {
+      querySelectorAll: () => [fakeEl('calendar view, current time: Fri 22:31')]
+    };
+    const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage));
+    assert.equal(res.eventElementsFound, 0);
+    assert.equal(res.labels.length, 0);
+    assert.equal(res.nonEventLabels.length, 1);
+    assert.equal(res.nonEventLabels[0].reason, 'clock-indicator');
+  });
+
+  test('Doppelte Event-Labels werden dedupliziert (eventElementsFound bleibt ehrlich)', async () => {
+    const label = 'Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy';
+    const doc = {
+      querySelectorAll: (sel) => (sel === '[role="button"][aria-label]'
+        ? [fakeEl(label), fakeEl(label), fakeEl(label)]
+        : [])
+    };
+    const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage));
+    assert.equal(res.eventElementsFound, 1);
+    assert.equal(res.labels.length, 1);
+  });
+
+  test('Selektor-Memory: gemerkter Selektor wird zuerst probiert, Fallback danach', async () => {
+    const calls = [];
+    const doc = {
+      querySelectorAll: (sel) => {
+        calls.push(sel);
+        return sel === '[aria-label]'
+          ? [fakeEl('Urlaub, all day event, Wednesday, September 30, 2026, Busy')]
+          : [];
+      }
+    };
+    const res = await withFakeDocument(doc, () => collectCalendarEventLabels(fakePage, { preferSelector: '[role="button"][aria-label]' }));
+    assert.equal(res.eventElementsFound, 1);
+    assert.equal(res.selectorUsed, '[aria-label]');
+    assert.deepEqual(calls.slice(0, 2), ['[role="button"][aria-label]', '[aria-label]']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Iteration 7 (Live-Befund Runde 6 vom 28.09.2026): Defekt 1 — die
+// Event-Wartephase nahm den Zeit-Indikator "calendar view, current time: Fri
+// 22:31" als gerendertes Grid und brach nach ~4s "erfolgreich" ab (usedMs 4141
+// bei remainingMs 40859), waehrend das Grid erst nach ~17s rendert.
+// ---------------------------------------------------------------------------
+
+describe('isEventGridLabel - strenger Grid-Fertig-Beweis (Defekt 1)', () => {
+  test('echte Zeitfenster-Labels gelten als Grid-Beweis', () => {
+    assert.equal(isEventGridLabel('Stadt Osnabrück I Portalintegration OpenRathaus, 09:00 to 12:00, Monday, September 28, 2026'), true);
+    assert.equal(isEventGridLabel('Besetzt von 09:00 bis 10:00 Montag, 28. September'), true);
+    assert.equal(isEventGridLabel('Block, 13:00 - 18:30, Wednesday, September 30, 2026'), true);
+    assert.equal(isEventGridLabel('Block, 9:00 AM - 10:30 AM, Wednesday'), true);
+  });
+
+  test('Ganztag-Labels gelten als Grid-Beweis', () => {
+    assert.equal(isEventGridLabel('Urlaub, all day event, Wednesday, September 30, 2026, Busy'), true);
+    assert.equal(isEventGridLabel('Urlaub, Ganztägig, Montag, 28. September 2026'), true);
+    assert.equal(isEventGridLabel('Homeoffice, all-day, Tuesday'), true);
+  });
+
+  test('der Runde-6-Fehltreffer wird abgelehnt', () => {
+    // 22:31 matcht /\\d{1,2}:\\d{2}/ — ist aber KEIN Zeitfenster.
+    assert.equal(isEventGridLabel('calendar view, current time: Fri 22:31'), false);
+  });
+
+  test('Work-Location bleibt ausgeschlossen', () => {
+    assert.equal(isEventGridLabel('Arbeitsort, 09:00 to 17:00, Monday, September 28, 2026'), false);
+    assert.equal(isEventGridLabel('Working location, 08:00 to 16:00, Monday'), false);
+  });
+
+  test('Header/Datum ohne Zeitfenster ist kein Beweis, leere Eingaben ebenso', () => {
+    assert.equal(isEventGridLabel('28 September – 4 October, 2026, Jump to a specific date or date range.'), false);
+    assert.equal(isEventGridLabel('Work week'), false);
+    assert.equal(isEventGridLabel(''), false);
+    assert.equal(isEventGridLabel(null), false);
+    assert.equal(isEventGridLabel(undefined), false);
+  });
+
+  test('alle 6 Live-Labels aus Runde 5/6 gelten als Grid-Beweis', () => {
+    for (const l of [
+      'Stadt Osnabrück I Portalintegration OpenRathaus, 09:00 to 12:00, Monday, September 28, 2026',
+      'Austausch Mathis:David:Alex, 14:00 to 15:00, Monday, September 28, 2026',
+      'Teammeeting Team 1 - Local Administration, 08:00 to 09:00, Tuesday, September 29, 2026',
+      "Stadt Hörstel: CMIS Übertragungsfehler, 13:00 to 15:00, Tuesday, September 29, 2026",
+      'Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy',
+      'Urlaub, all day event, Wednesday, September 30, 2026, Busy'
+    ]) {
+      assert.equal(isEventGridLabel(l), true, l);
+    }
+  });
+});
+
+describe('EVENT_LABEL_PATTERNS - serialisierbarer Pattern-Satz', () => {
+  test('alle Patterns sind Strings (die evaluate-Grenze ist serialisierbar)', () => {
+    for (const [key, value] of Object.entries(EVENT_LABEL_PATTERNS)) {
+      assert.equal(typeof value, 'string', `${key} muss ein String sein`);
+    }
+    assert.doesNotThrow(() => JSON.parse(JSON.stringify(EVENT_LABEL_PATTERNS)));
+  });
+
+  test('jedes Pattern laesst sich mit Flag i kompilieren', () => {
+    for (const [key, value] of Object.entries(EVENT_LABEL_PATTERNS)) {
+      assert.doesNotThrow(() => new RegExp(value, 'i'), `${key} kompiliert nicht`);
+    }
+  });
+});
+
+describe('eventWaitBudgetMs - Budget der Event-Wartephase (Defekt 1)', () => {
+  test('Konstanten: Cap 20s, Reserve 5s, Poll 500ms', () => {
+    assert.equal(FREEBUSY_EVENT_WAIT_MAX_MS, 20000);
+    assert.equal(FREEBUSY_EVENT_WAIT_RESERVE_MS, 5000);
+    assert.equal(FREEBUSY_EVENT_WAIT_POLL_MS, 500);
+    // Die Phase muss in das Gesamtbudget passen (Cap + Reserve <= 45s).
+    assert.ok(FREEBUSY_EVENT_WAIT_MAX_MS + FREEBUSY_EVENT_WAIT_RESERVE_MS <= FREEBUSY_TOTAL_BUDGET_MS);
+  });
+
+  test('viel Restzeit -> Cap greift (Runde 6: remainingMs 40859 -> 20000)', () => {
+    assert.equal(eventWaitBudgetMs(40859), 20000);
+    assert.equal(eventWaitBudgetMs(45000), 20000);
+    assert.equal(eventWaitBudgetMs(100000), 20000);
+  });
+
+  test('wenig Restzeit -> Reserve wird abgezogen', () => {
+    assert.equal(eventWaitBudgetMs(24000), 19000);
+    assert.equal(eventWaitBudgetMs(6000), 1000);
+  });
+
+  test('zu wenig Restzeit -> 0 (Wartephase wird uebersprungen, nie negativ)', () => {
+    assert.equal(eventWaitBudgetMs(5000), 0);
+    assert.equal(eventWaitBudgetMs(3000), 0);
+    assert.equal(eventWaitBudgetMs(0), 0);
+    assert.equal(eventWaitBudgetMs(-100), 0);
+    assert.equal(eventWaitBudgetMs(undefined), 0);
+    assert.equal(eventWaitBudgetMs(null), 0);
+  });
+
+  test('Overrides werden respektiert', () => {
+    assert.equal(eventWaitBudgetMs(40000, { maxMs: 5000 }), 5000);
+    assert.equal(eventWaitBudgetMs(9000, { reserveMs: 1000 }), 8000);
+  });
+});
+
+describe('pollUntilEventGrid - Wartephase pollt bis echte Events da sind (Defekt 1)', () => {
+  const fakeClock = () => {
+    let t = 0;
+    return { now: () => t, sleep: async (ms) => { t += ms; } };
+  };
+
+  test('Fixture: Events erscheinen erst im 3. Poll -> found nach 1000ms', async () => {
+    const clock = fakeClock();
+    let polls = 0;
+    const res = await pollUntilEventGrid({
+      hasEvents: async () => { polls++; return polls >= 3; },
+      budgetMs: 20000,
+      pollMs: 500,
+      now: clock.now,
+      sleep: clock.sleep
+    });
+    assert.equal(res.found, true);
+    assert.equal(res.outcome, 'found');
+    assert.equal(res.polls, 3);
+    assert.equal(res.waitedMs, 1000);
+  });
+
+  test('sofort vorhandene Events -> 1 Poll, 0ms Wartezeit', async () => {
+    const clock = fakeClock();
+    const res = await pollUntilEventGrid({
+      hasEvents: async () => true,
+      budgetMs: 20000, pollMs: 500, now: clock.now, sleep: clock.sleep
+    });
+    assert.equal(res.found, true);
+    assert.equal(res.outcome, 'found');
+    assert.equal(res.polls, 1);
+    assert.equal(res.waitedMs, 0);
+  });
+
+  test('Budget-Cap: nie laenger als budgetMs, dann budget-exhausted', async () => {
+    const clock = fakeClock();
+    const res = await pollUntilEventGrid({
+      hasEvents: async () => false,
+      budgetMs: eventWaitBudgetMs(40859), // 20000
+      pollMs: 500, now: clock.now, sleep: clock.sleep
+    });
+    assert.equal(res.found, false);
+    assert.equal(res.outcome, 'budget-exhausted');
+    assert.ok(res.waitedMs <= 20000, `waitedMs ${res.waitedMs} darf das Budget nicht ueberziehen`);
+    assert.ok(res.waitedMs > 19000);
+    assert.equal(res.polls, 40); // 20000/500 Polls, letzter Poll ohne Ueberziehung
+  });
+
+  test('Budget 0 -> sofort budget-exhausted, kein Poll', async () => {
+    const clock = fakeClock();
+    let polls = 0;
+    const res = await pollUntilEventGrid({
+      hasEvents: async () => { polls++; return true; },
+      budgetMs: 0, pollMs: 500, now: clock.now, sleep: clock.sleep
+    });
+    assert.equal(res.found, false);
+    assert.equal(res.outcome, 'budget-exhausted');
+    assert.equal(res.polls, 0);
+    assert.equal(polls, 0);
+  });
+
+  test('fehlendes hasEvents crasht nicht (defensiv)', async () => {
+    const res = await pollUntilEventGrid({ budgetMs: 20000 });
+    assert.equal(res.found, false);
+    assert.equal(res.outcome, 'budget-exhausted');
+  });
+
+  test('Ausgaenge sind genau die dokumentierten Werte', () => {
+    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'budget-exhausted', 'not-rendered']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Iteration 7, Defekt 2: latenter Wochen-Skip. Runde 6 protokollierte einen
+// "Next week"-Klick, obwohl der Header die Zielwoche bereits bestaetigt hatte.
+// ---------------------------------------------------------------------------
+
+describe('canClickSameDirection - Klick-Sperre pro Richtung (Defekt 2)', () => {
+  test('vor dem ersten Klick ist jede Richtung erlaubt', () => {
+    assert.equal(canClickSameDirection({ lastClickDirection: null, direction: 1, weekConfirmedAfterClick: false }), true);
+    assert.equal(canClickSameDirection({ lastClickDirection: -1, direction: 1, weekConfirmedAfterClick: false }), true);
+  });
+
+  test('gleiche Richtung OHNE erneute Wochen-Bestaetigung -> blockiert (verhindert KW-Skip)', () => {
+    assert.equal(canClickSameDirection({ lastClickDirection: 1, direction: 1, weekConfirmedAfterClick: false }), false);
+    assert.equal(canClickSameDirection({ lastClickDirection: -1, direction: -1, weekConfirmedAfterClick: false }), false);
+  });
+
+  test('gleiche Richtung NACH erneuter Wochen-Bestaetigung -> erlaubt', () => {
+    assert.equal(canClickSameDirection({ lastClickDirection: 1, direction: 1, weekConfirmedAfterClick: true }), true);
+  });
+
+  test('Gegenrichtung bleibt erlaubt — der Rueckweg ist vorbereitet', () => {
+    assert.equal(canClickSameDirection({ lastClickDirection: 1, direction: -1, weekConfirmedAfterClick: false }), true);
+    assert.equal(canClickSameDirection({ lastClickDirection: -1, direction: 1, weekConfirmedAfterClick: false }), true);
+  });
+
+  test('Vorzeichen wird normalisiert (3 und 1 sind dieselbe Richtung, 2 und -1 nicht)', () => {
+    // Gleiches Vorzeichen trotz anderer Betraege -> gleiche Richtung -> ohne
+    // Wochen-Bestaetigung blockiert.
+    assert.equal(canClickSameDirection({ lastClickDirection: 3, direction: 1, weekConfirmedAfterClick: false }), false);
+    // Umgekehrtes Vorzeichen -> Rueckweg, erlaubt.
+    assert.equal(canClickSameDirection({ lastClickDirection: 2, direction: -1, weekConfirmedAfterClick: false }), true);
+  });
+});
+
+describe('weekProbeSkipEntry - Skip-Protokoll bei verifizierter Zielwoche (Defekt 2)', () => {
+  test('protokolliert explizit den Verzicht auf Probe und Klick', () => {
+    const e = weekProbeSkipEntry('2026-09-28');
+    assert.equal(e.skipped, 'target-week-verified');
+    assert.equal(e.renderedWeek, '2026-09-28');
+    assert.equal(e.clicked, false);
+    // Kein Selektor, kein found -> es wurde tatsaechlich nicht geprobt/geklickt.
+    assert.equal('selector' in e, false);
+    assert.equal('found' in e, false);
+    assert.equal('verified' in e, false);
+  });
+
+  test('toleriert fehlendes renderndes Wochen-Datum', () => {
+    const e = weekProbeSkipEntry(null);
+    assert.equal(e.skipped, 'target-week-verified');
+    assert.equal(e.renderedWeek, null);
+    assert.equal(e.clicked, false);
+  });
+
+  test('der Skip-Eintrag beendet die Klick-Sequenz (kein Folgeeintrag noetig)', () => {
+    const probe = [weekProbeSkipEntry('2026-09-28')];
+    assert.equal(probe.length, 1);
+    assert.equal(probe.filter((p) => p.clicked === true).length, 0);
+  });
+});
+
+describe('eventWaitWarning - Warnung bei erschoepfter Wartephase', () => {
+  test('found -> keine Warnung', () => {
+    assert.equal(eventWaitWarning({ outcome: 'found', waitedMs: 1200, budgetMs: 20000 }), null);
+  });
+
+  test('budget-exhausted -> erklaert, dass 0 Slots ein noch nicht gerendertes Grid sein koennen', () => {
+    const w = eventWaitWarning({ outcome: 'budget-exhausted', waitedMs: 19500, budgetMs: 20000 });
+    assert.ok(w);
+    assert.ok(/19500ms/.test(w));
+    assert.ok(/20000ms/.test(w));
+    assert.ok(/noch nicht gerendertes Grid/.test(w));
+  });
+
+  test('not-rendered -> eigener Hinweistext', () => {
+    const w = eventWaitWarning({ outcome: 'not-rendered', waitedMs: 0, budgetMs: 0 });
+    assert.ok(/nicht gerendert/.test(w));
+  });
+
+  test('unbekannter Ausgang -> keine Warnung', () => {
+    assert.equal(eventWaitWarning({ outcome: 'irgendwas' }), null);
+  });
+});
+
+describe('assembleFreeBusyDiagnostics - Event-Wartephase in der Diagnostik (Iteration 7)', () => {
+  test('waitedForEventsMs und eventWaitOutcome werden uebernommen', () => {
+    const d = assembleFreeBusyDiagnostics({
+      abortReason: 'none',
+      eventElementsFound: 0,
+      selectorUsed: '[aria-label]',
+      rawEventLabels: [],
+      rejectionReasons: [{ label: 'calendar view, current time: Fri 22:31', reason: 'clock-indicator' }],
+      waitedForEventsMs: 19500,
+      eventWaitOutcome: 'budget-exhausted'
+    });
+    assert.equal(d.waitedForEventsMs, 19500);
+    assert.equal(d.eventWaitOutcome, 'budget-exhausted');
+    assert.equal(d.rejectionReasons[0].reason, 'clock-indicator');
+  });
+
+  test('ohne die neuen Felder bleiben sie weg (Rueckwaertskompatibilitaet)', () => {
+    const d = assembleFreeBusyDiagnostics({ abortReason: 'none' });
+    assert.equal('waitedForEventsMs' in d, false);
+    assert.equal('eventWaitOutcome' in d, false);
+  });
 });
