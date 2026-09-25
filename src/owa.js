@@ -2764,14 +2764,14 @@ export class OwaClient {
     // Der zuletzt erfolgreiche Selektor wird ZUERST probiert. Diese Sammlung —
     // nicht die Vorab-Probe — entscheidet ueber eventElementsFound, dataQuality
     // und eventWaitOutcome.
-    const rawLabels = eventCollection.labels;
-    const eventElementsFound = eventCollection.eventElementsFound;
-    const selectorUsed = eventCollection.selectorUsed;
-
     const eventCollection = await collectCalendarEventLabels(page, {
       preferSelector: lastEventSelector,
       weekStartIso: rendered.startDate || mondayIso
     });
+    const rawLabels = eventCollection.labels;
+    const eventElementsFound = eventCollection.eventElementsFound;
+    const selectorUsed = eventCollection.selectorUsed;
+
     // Defekt 3: Der Ausgang der Wartephase wird an die TATSAECHLICH in der
     // Abschluss-Sammlung beobachtete Event-Elementzahl gekoppelt. 'found' ist
     // damit unmöglich, wenn 0 Knoten gelesen wurden (der Smoke-Test meldete
