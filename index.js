@@ -522,9 +522,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unbekanntes Tool: ${name}`);
     }
   } catch (error) {
+    // Runde 4: Diagnostik am Error-Objekt muss den Transport überleben —
+    // sie wird an die Fehlermeldung angehängt, nicht verworfen.
+    let text = `Fehler in ${name}: ${error.message}`;
+    if (error.diagnostics) {
+      const diagText = typeof error.diagnostics === 'string'
+        ? error.diagnostics
+        : JSON.stringify(error.diagnostics, null, 2);
+      text += `\nDiagnostik:\n${diagText}`;
+    }
     return {
       isError: true,
-      content: [{ type: 'text', text: `Fehler in ${name}: ${error.message}` }]
+      content: [{ type: 'text', text }]
     };
   }
 });

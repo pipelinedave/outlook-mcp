@@ -749,14 +749,22 @@ export class OwaClient {
   }
 
   // Bestimmt die tatsächlich aktive Mailbox-Adresse (nicht nur den Titel).
-  // Probierte Quellen in OWA: Account-Button (Initialen) aria-label/title,
-  // Persona/ProfileCard-Anker, OWA-Header-Account-Elemente. Fallback: null.
-  // Diese Methode ist bewusst tolerant — jeder Hinweis ist besser als gar keiner,
-  // weil sie die Verwechslungsgefahr zwischen Tenants (d.velop/adesso) sichtbar macht.
+  // Runde-4-Forderung D (Kollateral-Bug): Die Hints dürfen NICHT ausschließlich
+  // aus der Mail-Ansicht stammen — im Kalender-Tab war die bisherige Heuristik
+  // leer (Live-Befund 25.09.), wodurch checkStatus fälschlich
+  // activeMailboxMatchesRealm:false meldete. Quellen-Kaskade:
+  //   1. 'mail-view'        — bisherige DOM-Heuristik (Account-Button, Persona-
+  //                           Anker, Header-Text; bewährt in der Mail-Ansicht)
+  //   2. 'calendar-header'  — Account-Switcher/ARIA-Labels mit @ im App-Bereich
+  //                           (funktioniert auch im Kalender-Tab)
+  //   3. 'tab-title'        — E-Mail-Adresse im Fenster-/Tab-Titel
+  //   4. 'unknown'          — keine Hints gefunden (Verifikation unbekannt, s. resolveMailboxVerification)
+  // Rückgabe: { hints: string[], source: MAILBOX_VERIFICATION_SOURCES-Eintrag }.
   async detectActiveMailbox() {
     const page = this.lastPage || (await this.getPage(true));
+    // 1) Bisherige DOM-Heuristik (Mail-Ansicht + generische Header-Elemente)
     try {
-      const leaked = await page.evaluate(() => {
+      const domHints = await page.evaluate(() => {
         const candidates = [];
         // 1) OWA-Account-Button (oben rechts): aria-label / title / Text
         const accountBtn = document.querySelector('[data-tid="account"] button, [role="button"][aria-label*="Account" i], [role="button"][aria-label*="Konto" i]');
@@ -778,10 +786,41 @@ export class OwaClient {
         }
         return [...new Set(candidates.map(c => c.trim()).filter(Boolean))].slice(0, 8);
       });
-      return leaked;
-    } catch (e) {
-      return [];
-    }
+      if (domHints && domHints.length) return { hints: domHints, source: 'mail-view' };
+    } catch (e) { /* bewusst ignorieren — nächste Quelle */ }
+    // 2) Kalender-Header: Account-Switcher/ARIA-Labels mit @ im gesamten App-Bereich
+    try {
+      const calHints = await page.evaluate(() => {
+        const candidates = [];
+        // Account-Elemente im Banner/App-Bar mit @ in Label oder Titel
+        document.querySelectorAll(
+          '[role="banner"] [aria-label*="@"], [role="banner"] [title*="@"], header [aria-label*="@"], header [title*="@"], [data-tid="account"]'
+        ).forEach(el => {
+          const txt = (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || '').trim();
+          if (txt) candidates.push(txt);
+        });
+        // Account-Menü-/Switcher-Button (Initialen) — aria-label enthält oft Name ODER Adresse
+        document.querySelectorAll('[role="button"][aria-label*="Konto" i], [role="button"][aria-label*="Account" i], [role="button"][aria-label*="account manager" i], [role="button"][aria-label*="Kontomanager" i]').forEach(el => {
+          const txt = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+          if (txt) candidates.push(txt);
+        });
+        // E-Mail-Muster im gesamten Banner-Text
+        const banner = document.querySelector('[role="banner"], header, #owaHeader');
+        if (banner) {
+          const emails = (banner.innerText || '').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [];
+          candidates.push(...emails);
+        }
+        return [...new Set(candidates.map(c => c.trim()).filter(Boolean))].slice(0, 8);
+      });
+      if (calHints && calHints.length) return { hints: calHints, source: 'calendar-header' };
+    } catch (e) { /* bewusst ignorieren — nächste Quelle */ }
+    // 3) Tab-/Fenstertitel (OWA rendert dort je nach Build Name/Adresse)
+    try {
+      const title = await page.title();
+      const emails = (title || '').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [];
+      if (emails.length) return { hints: emails, source: 'tab-title' };
+    } catch (e) { /* bewusst ignorieren */ }
+    return { hints: [], source: 'unknown' };
   }
 
   async checkStatus() {
@@ -798,21 +837,31 @@ export class OwaClient {
         };
       }
 
-      await page.waitForSelector('#topSearchInput, input[aria-label*="Search"], div[aria-label*="Message list"]', { timeout: 12000 }).catch(() => null);
+      // Ansichtsgerechtes Warten: Im Kalender-Tab existieren die Mail-Selektoren
+      // nie (Live-Befund Runde 4) — dort auf den Kalender-Banner warten statt
+      // 12s in die Leere zu laufen.
+      const onCalendarView = url.includes('/calendar');
+      await page.waitForSelector(
+        onCalendarView
+          ? '[role="banner"], div[role="main"]'
+          : '#topSearchInput, input[aria-label*="Search"], div[aria-label*="Message list"]',
+        { timeout: onCalendarView ? 6000 : 12000 }
+      ).catch(() => null);
 
       const title = await page.title();
-      const isLoaded = title.toLowerCase().includes('outlook') || page.url().includes('/mail');
+      const isLoaded = title.toLowerCase().includes('outlook') || page.url().includes('/mail') || page.url().includes('/calendar');
 
-      // Aktive Mailbox-Adresse robust bestimmen (Verwechslungs-Schutz zwischen Tenants)
-      const mailboxHints = await this.detectActiveMailbox();
+      // Aktive Mailbox-Adresse robust bestimmen (Verwechslungs-Schutz zwischen
+      // Tenants) — mit Verifikationsquelle statt reiner Mail-Ansicht-Heuristik.
+      const { hints: mailboxHints, source: verificationSource } = await this.detectActiveMailbox();
 
       // Sanfter Abgleich: Zeigt an, ob die aktive Mailbox zum erwarteten Realm passt.
-      // Ein Realm passt, wenn ein Hint die Realm-/Domain endung enthält (z.B. @adesso.de).
+      // Runde 4 (Kollateral-Bug): Ohne Hints oder ohne Realm ist das Ergebnis
+      // bewusst NULL (unbekannt) statt false — ein fehlender Hint ist kein
+      // Nachweis einer falschen Mailbox.
       const realmDomain = this.realm && this.realm.includes('.') ? this.realm.toLowerCase() : null;
-      const matchingHint = realmDomain
-        ? (mailboxHints.find(h => h.toLowerCase().includes(realmDomain)) || null)
-        : null;
-      const activeMailboxMatchesRealm = matchingHint !== null;
+      const verification = resolveMailboxVerification(mailboxHints, realmDomain);
+      const activeMailboxMatchesRealm = verification.activeMailboxMatchesRealm;
 
       return {
         authenticated: isLoaded,
@@ -820,11 +869,14 @@ export class OwaClient {
         title: title,
         realm: this.realm,
         mailboxHints,
+        verificationSource,
         activeMailboxMatchesRealm,
         message: isLoaded
-          ? (activeMailboxMatchesRealm
-              ? `Outlook Web ist eingeloggt (Mailbox passt zu ${this.realm}).`
-              : `ACHTUNG: Eingeloggt, aber Mailbox konnte nicht eindeutig zu '${this.realm}' verifiziert werden. Aktiv geprüfte Account-Hinweise: ${mailboxHints.length ? mailboxHints.join(' | ') : '(keine gefunden)'}. Bitte im sichtbaren Fenster die korrekte Mailbox bestätigen.`)
+          ? (activeMailboxMatchesRealm === true
+              ? `Outlook Web ist eingeloggt (Mailbox passt zu ${this.realm}, Verifikation: ${verificationSource}).`
+              : activeMailboxMatchesRealm === false
+                ? `ACHTUNG: Eingeloggt, aber die aktive Mailbox passt nachweislich NICHT zu '${this.realm}' (Verifikation: ${verificationSource}; Hints: ${mailboxHints.join(' | ')}). Bitte im sichtbaren Fenster die korrekte Mailbox bestätigen.`
+                : `Eingeloggt, aber Mailbox konnte nicht verifiziert werden (Verifikationsquelle: ${verificationSource}; keine Account-Hinweise in dieser Ansicht). Bitte bei kritischen Aktionen im sichtbaren Fenster die Mailbox bestätigen.`)
           : "Seite lädt noch oder erfordert Anmeldung."
       };
     } catch (err) {
