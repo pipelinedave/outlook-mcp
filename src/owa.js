@@ -971,7 +971,7 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
   let collectError = null;
   try {
     const res = await page.evaluate(
-      ({ pats, plan, clockStrict, weekStart, fastMode, maxElements, maxCensusNodes }) => {
+      ({ pats, plan, clockStrict, weekStart, fastMode, maxElements, maxCensusNodes, maxStructureNodes }) => {
         const re = {};
         for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
         const clockOnlyRe = new RegExp(clockStrict, 'i');
@@ -1187,7 +1187,7 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
             // prueft nur, ob das Attribut ueberhaupt vorhanden ist.
             let broadScanned = 0;
             for (const el of safeQSA('*')) {
-              if (broadScanned >= SCAN_MAX_ELEMENTS) { truncated = true; break; }
+              if (broadScanned >= maxElements) { truncated = true; break; }
               broadScanned++;
               if (step.source === 'title' && !hasAttr(el, 'title')) continue;
               if (step.source === 'data-attr' && !hasDataAttr(el)) continue;
@@ -1218,7 +1218,9 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
           dateMissingLabels: cap(dateMissing, 20),
           // Rohe Struktur-Knoten fuer die Node-seitige Geometrie-Ableitung
           // (grosszuegiges Limit: das ist der eigentliche Datentraeger).
-          structureNodes: fastMode ? [] : cap(structureNodes, SCAN_MAX_STRUCTURE_NODES),
+          // SCAN_MAX_STRUCTURE_NODES wird ueber maxStructureNodes gereicht —
+          // ein nackter Modul-Identifier waere im Browser ein ReferenceError.
+          structureNodes: fastMode ? [] : cap(structureNodes, maxStructureNodes),
           census: fastMode
             ? { skipped: 'fast-mode' }
             : {
@@ -1238,7 +1240,10 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         weekStart: weekStartIso,
         fastMode: fast === true,
         maxElements: SCAN_MAX_ELEMENTS,
-        maxCensusNodes: CENSUS_MAX_NODES
+        maxCensusNodes: CENSUS_MAX_NODES,
+        // Eigenes Limit: maxCensusNodes ist CENSUS_MAX_NODES (14, reine
+        // Antwortgroesse) und NICHT das Scan-Limit fuer die Rohknoten (200).
+        maxStructureNodes: SCAN_MAX_STRUCTURE_NODES
       }
     );
     // GEOMETRIE-Pfad (Node-seitig, gleiche Prueflogik wie der Rest):
@@ -1281,6 +1286,24 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
     return { collectError: null, ...res };
   } catch (e) {
     collectError = String((e && e.message) || e).slice(0, 160);
+    // Live-Befund 25.09.2026: Ein ReferenceError aus dem evaluate-Callback ist
+    // KEIN DOM-Zustand, sondern ein Code-Defekt — fast immer eine nackte
+    // Modul-Referenz, die die evaluate-Grenze nicht ueberquert hat
+    // (SCAN_MAX_ELEMENTS o. Ae.). Ein solcher Fehler wurde bisher still in
+    // ein leeres Standardobjekt verwandelt und dadurch als "Kalender leer"
+    // gemeldet. Das ist exakt die Falschaussage, die diese Runde beseitigen
+    // soll: er wird laut geworfen. Jeder DOM-Zugriff im Callback ist bereits
+    // try/catch-geschuetzt, ein ReferenceError kann dort nicht entstehen.
+    if (e && e.name === 'ReferenceError') {
+      const err = new Error(
+        `collectCalendarEventLabels: ReferenceError im Browser-Callback (${collectError}). ` +
+        `Das ist ein Code-Defekt (nackte Modul-Referenz ueber die page.evaluate-Grenze), ` +
+        `kein DOM-Zustand — Werte muessen ueber das Argument-Objekt gereicht werden.`
+      );
+      err.name = 'CollectCallbackReferenceError';
+      err.collectError = collectError;
+      throw err;
+    }
     return {
       labels: [], eventElementsFound: 0, selectorUsed: 'error', sourceUsed: null,
       sourceTried: [], hiddenCount: 0, headerLikeLabels: [], nonEventLabels: [],
