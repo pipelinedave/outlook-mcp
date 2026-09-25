@@ -203,6 +203,25 @@ export function parseWeekHeaderText(text, now = new Date()) {
     }
   }
 
+  // Ein-Tag-zuerst / EIN Monat: "21–27 September, 2026" (OWA-Form des
+  // angezeigten Headers, Live-Beleg 26.09.2026: "21–27 September, 2026,
+  // Jump to a specific date or date range." bzw. "… (Week 39)"). Weder das
+  // DE- noch das EN- noch das EN-Tag-zuerst-Muster griffen hier: es fehlt der
+  // Monatsname NACH dem zweiten Tag. Vor dem Fix fiel dieser Knoten deshalb
+  // auf den next-Button zurueck (der als "28 September – 4 October" durchaus
+  // parsebar war) — der echte Header wurde also gefunden und dann weggeworfen.
+  const dayFirstOneMonth = t.match(/(\d{1,2})\s*[–—-]\s*(\d{1,2})\s+([A-Za-zäöüÄÖÜß]{3,})\.?(?:,?\s*(\d{4}))?/);
+  if (dayFirstOneMonth) {
+    const month = MONTH_NAMES[dayFirstOneMonth[3].toLowerCase()];
+    if (month !== undefined) {
+      const year = dayFirstOneMonth[4] ? parseInt(dayFirstOneMonth[4], 10) : currentYear;
+      const s = new Date(year, month, parseInt(dayFirstOneMonth[1], 10));
+      let e = new Date(year, month, parseInt(dayFirstOneMonth[2], 10));
+      if (e < s) e = new Date(year + 1, month, parseInt(dayFirstOneMonth[2], 10));
+      return { startDate: toIsoDate(s), endDate: toIsoDate(e) };
+    }
+  }
+
   // Numerisches Muster: "28.9. – 4.10.2026" / "28.9. - 4.10." (OWA rendert den
   // Wochen-Header je nach Locale/Build numerisch statt mit Monatsnamen).
   const num = t.match(/(\d{1,2})\.(\d{1,2})\.?(?:(\d{4}))?\s*[–—-]\s*(\d{1,2})\.(\d{1,2})\.?(?:(\d{4}))?/);
@@ -303,6 +322,31 @@ function eventPatterns() {
   return compiledEventPatterns;
 }
 
+// Dasselbe fuer die Wochen-Header-/Navigations-Muster (FIX 1). Die
+// Pattern-Saetze selbst sind serialisierbare Strings und werden ueber die
+// evaluate-Grenze gereicht; kompiliert wird hier und dort aus DIESER Quelle.
+let compiledWeekRange = null;
+let compiledWeekNav = null;
+let compiledWeekPatternsSource = null;
+function weekRangePatterns() {
+  if (!compiledWeekRange || compiledWeekPatternsSource !== WEEK_RANGE_PATTERNS) {
+    compiledWeekRange = {};
+    for (const key of Object.keys(WEEK_RANGE_PATTERNS)) {
+      compiledWeekRange[key] = new RegExp(WEEK_RANGE_PATTERNS[key], 'i');
+    }
+    compiledWeekPatternsSource = WEEK_RANGE_PATTERNS;
+    compiledWeekNav = null;
+  }
+  return compiledWeekRange;
+}
+function weekNavPatterns() {
+  if (!compiledWeekNav || compiledWeekPatternsSource !== WEEK_RANGE_PATTERNS) {
+    weekRangePatterns();
+    compiledWeekNav = WEEK_NAV_LABEL_PATTERNS.map((p) => new RegExp(p, 'i'));
+  }
+  return compiledWeekNav;
+}
+
 // Erkennt Event-Signaturen in einem ARIA-Label/Text. Reine Funktion (unit-testbar).
 //  - Zeitfenster: "09:00 to 12:00" / "14:00 bis 15:00" / "9:00 AM - 10:00 AM"
 //  - Ganztag: "all day event" / "all-day" / "ganztägig" / "ganztages"
@@ -333,6 +377,113 @@ export function isEventGridLabel(text) {
 // Filtert Event-Labels aus einer Kandidatenliste (Header dürfen keine Events sein).
 export function filterCalendarHeaderCandidates(texts = []) {
   return (texts || []).filter((t) => !isCalendarEventLabel(t));
+}
+
+// ---------------------------------------------------------------------------
+// FIX 1 (Live-Befund Lauf 5, 26.09.2026): der angezeigte Wochen-Header wurde
+// aus dem ARIA-Label des "Go to next week"-Buttons gelesen.
+// ---------------------------------------------------------------------------
+// Live-Belege (beide Aufrufe desselben Laufs, Commit 3907f0d):
+//   Aufruf 1: angefragt 21.09.–02.10., View stand korrekt auf KW 39
+//             (21.–27.09.) -> renderedWeek wurde 2026-09-28–2026-10-04
+//             gemeldet (= next-Button-Label) -> Abbruch 'max-clicks' nach 6
+//             Klicks (prev/next/prev/next), obwohl die View RICHTIG war.
+//   Aufruf 2: next-Button-Label = "28 September – 4 October, 2026" = Zielwoche
+//             -> weekVerified:true, dataQuality:'verified', 0 Klicks,
+//             View blieb auf KW 39 -> Falschpass; alle 10 Events wurden als
+//             'date-out-of-range' verworfen (21.–25.09.).
+// Der echte Header lag die ganze Zeit im DOM:
+//   "21–27 September, 2026, Jump to a specific date or date range."
+//   "21–27 September, 2026 (Week 39)"   (dort als 'header-misclassified'
+//                                        verworfen)
+//
+// KERN: Header und Navigations-Button haben dieselbe FORM (Datumsbereich +
+// Monatsnamen). Unterschieden sind sie nur an der NAVIGATIONS-ABSICHT, und
+// die steht im Label-ANFANG. Deshalb ist das entscheidende Kriterium NICHT
+// "sieht wie ein Datumsbereich aus", sondern "ist es ein Datumsbereich UND
+// kein Navigations-Label".
+//
+// Die Positiv-Bedingung bleibt der Bereich: ein gueltiger Header MUSS einen
+// ableitbaren Datumsbereich liefern (parseWeekHeaderText). Die Bereich-Pruefung
+// wird VOR jeder Text-Heuristik angewandt — die Reihenfolge in
+// resolveRenderedWeekFromCandidates ist genau das.
+//
+// Als Strings (serialisierbar ueber die page.evaluate-Grenze, vgl.
+// EVENT_LABEL_PATTERNS): die Browser-Seite braucht dieselbe Definition, ohne
+// die evaluate-Grenze zu verletzen.
+export const WEEK_NAV_LABEL_PATTERNS = [
+  // EN: "Go to previous week 21–27 September, 2026 (Week 39)" / "Go to next week 28 September – 4 October, 2026"
+  String.raw`\bgo\s+to\s+(?:the\s+)?(?:previous|prior|preceding|next)\s+week\b`,
+  String.raw`\bgo\s+to\s+(?:the\s+)?week\s+number\b`,
+  String.raw`\b(?:previous|prior|preceding|next)\s+week\b`,
+  // EN: "Week number 39" als eigenstaendiger Indikator
+  String.raw`\bweek\s+number\s*\d{1,2}\b`,
+  // DE: "Zur vorherigen Woche" / "Nächste Woche" / "Woche 41" (KW-Schalter)
+  String.raw`\b(?:vorherige[nrs]?|vorige[nrs]?|nächste[nrs]?|nachfolgende[nrs]?|naechste[nrs]?)\s+woche\b`,
+  String.raw`\bwochennummer\s*\d{1,2}\b`,
+  String.raw`\bwoche\s+(?:vorherige[nrs]?|zur(?:ü|ue)ck|vor|nach)\b`
+];
+
+// Ist das Label eine Wochennavigation? Dann beschreibt es die Woche, die der
+// Button ANSTEUERN wuerde — sie ist per Definition NICHT die angezeigte.
+// Reine Funktion, unit-testbar, Spiegel der Browser-Logik in
+// collectCalendarCandidates.
+export function isWeekNavLabel(text) {
+  if (!text) return false;
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  for (const re of weekNavPatterns()) if (re.test(t)) return true;
+  return false;
+}
+
+// Der angezeigte Header traegt die Absicht "springe zu Datum/Datumspanne"
+// ("Jump to a specific date or date range") — bzw. die reine Angabe der
+// angezeigten Woche mit Wochennummer ("21–27 September, 2026 (Week 39)").
+// Beide Formen sind Header und wurden in Lauf 5 als 'header-misclassified'
+// verworfen bzw. nie als Header-Kandidat gefuehrt.
+export const WEEK_DISPLAYED_HEADER_PATTERN = String.raw`jump\s+to\s+a\s+specific\s+date|date\s+range`;
+
+// Ein Datumsbereich als serialisierbare Muster (Browser-Seite braucht dieselbe
+// Definition ueber die evaluate-Grenze, vgl. EVENT_LABEL_PATTERNS):
+//   range:  "21–27 September", "28 September – 4 October", "28.9. – 4.10.2026"
+//   dotted: "28.9." — der Ersatzbeleg fuer einen Bereich OHNE Monatsnamen
+export const WEEK_RANGE_PATTERNS = {
+  range: String.raw`\d{1,2}\.?\s*[\u2013\u2014-]\s*\d{1,2}`,
+  dotted: String.raw`\d{1,2}\.\d{1,2}`
+};
+
+// Sieht dieser Text aus wie ein Wochen-Header? Positiv: er traegt einen
+// Datumsbereich MIT Datumsanker (Monatsname oder numerischer Tag) UND ist
+// keine Navigation. Der Bereich kommt VOR jeder Text-Heuristik.
+export function isWeekHeaderShaped(text) {
+  if (!text || isWeekNavLabel(text)) return false;
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  const re = eventPatterns();
+  const rr = weekRangePatterns();
+  if (!rr.range.test(t)) return false;
+  return re.dateish.test(t) || rr.dotted.test(t);
+}
+
+// WOHER kam der gelesene Wochenwert? Diese Herkunft entscheidet, ob er als
+// Wochen-Nachweis gilt (isHeaderReadVerified) — ein aus Prev/Next-Buttons
+// ABGELEITETER Wert ist eine Ableitung, keine Anzeige.
+export const WEEK_READ_SOURCES = {
+  // Datumsbereich aus einem Knoten der Header-Region gelesen.
+  displayed: 'displayed-header',
+  // Aus einem Tages-Spaltenkopf abgeleitet (Montag der Woche).
+  column: 'day-column',
+  // Aus den Prev/Next-Buttons abgeleitet (Mitte zwischen beiden) — GESCHAETZT.
+  navDerived: 'nav-derivation',
+  // Einzel-Datum mit Monatsnamen abgeleitet — GESCHAETZT.
+  singleDate: 'single-date',
+  // Numerischer Tageskopf abgeleitet — GESCHAETZT.
+  numericDay: 'numeric-day'
+};
+
+// Nur diese beiden Herkuenfte belegen den ANGEZEIGTEN Wochen-Header. Die
+// uebrigen sind Ableitungen und duerfen keine 'weekVerified' erkaufen.
+export function isDisplayedWeekSource(source) {
+  return source === WEEK_READ_SOURCES.displayed || source === WEEK_READ_SOURCES.column;
 }
 
 // Sichtbarkeits-Prädikat (Spiegel der Browser-Logik in collectCalendarCandidates).
@@ -799,8 +950,23 @@ export function resolveWeekFromNavButtons(navTexts = [], now = new Date()) {
 // Header-Kandidaten, Tageskopf-Kandidaten (inkl. Body-Text-Heuristik) und ein
 // ARIA-Label-Sample zurück.
 export async function collectCalendarCandidates(page) {
-  return page.evaluate(() => {
+  return page.evaluate((navPatterns) => {
+    // FIX 1: dieselbe Navigations-Erkennung wie auf der Node-Seite
+    // (WEEK_NAV_LABEL_PATTERNS). Sie wird als ARGUMENT ueber die
+    // evaluate-Grenze gereicht — eine nackte Modul-Referenz waere dort ein
+    // ReferenceError (siehe collectError unten).
+    const navRes = [];
+    for (const p of (navPatterns || [])) navRes.push(new RegExp(p, 'i'));
+    const isNavLabel = (text) => {
+      const t = String(text || '').replace(/\s+/g, ' ').trim();
+      if (!t) return false;
+      for (const re of navRes) if (re.test(t)) return true;
+      return false;
+    };
     const cap = (arr, n) => arr.slice(0, n);
+    // Ein Navigations-Label ist NIE ein Header-Kandidat: es nennt die Woche,
+    // die der Button ANSTEUERN wuerde, nicht die ANGEZEIGTE.
+    const pushHeader = (arr, t) => { if (!isNavLabel(t)) push(arr, t); };
     const push = (arr, t) => {
       const s = String(t || '').replace(/\s+/g, ' ').trim();
       if (s && arr.indexOf(s) === -1) arr.push(s);
@@ -841,7 +1007,7 @@ export async function collectCalendarCandidates(page) {
       if (!isVisible(el)) continue;
       const text = el.getAttribute('aria-label') || el.innerText;
       if (isEventLabel(text)) continue;
-      push(headerTexts, text);
+      pushHeader(headerTexts, text);
     }
     // 2) Toolbar-/Button-Elemente mit Datums-Label: OWA rendert den Wochenbereich als
     //    klickbaren Datums-Button. Der Ansichtsumschalter ("Work week"/"Arbeitswoche")
@@ -851,24 +1017,27 @@ export async function collectCalendarCandidates(page) {
     )) {
       if (!isVisible(el)) continue;
       const label = el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '';
-      if (dateish.test(label) && !timeRe.test(label) && !isEventLabel(label)) push(headerTexts, label);
+      if (dateish.test(label) && !timeRe.test(label) && !isEventLabel(label)) pushHeader(headerTexts, label);
     }
     // 3) Alle aria-labels mit Datums-/Monatsmuster, aber OHNE Uhrzeit (z.B. der
     //    Datumsauswahl-Button). Zeitmuster-/Event-Labels sind Event-Elemente, keine Header.
+    //    FIX 1: die Prev/Next-Buttons fallen hier durch — genau hier stand in
+    //    Lauf 5 "Go to next week 28 September – 4 October, 2026" und wurde als
+    //    gerenderte Woche gemeldet.
     for (const el of document.querySelectorAll('[aria-label]')) {
       if (!isVisible(el)) continue;
       const label = el.getAttribute('aria-label') || '';
-      if (dateish.test(label) && !timeRe.test(label) && label.length <= 120 && !isEventLabel(label)) push(headerTexts, label);
+      if (dateish.test(label) && !timeRe.test(label) && label.length <= 120 && !isEventLabel(label)) pushHeader(headerTexts, label);
     }
-    // 3b) Prev/Next-Wochen-Buttons (belastbarer Fallback für die Wochen-Ableitung):
-    //     "Go to previous week 21–27 September, 2026 (Week 39)" / "… (Week 41)".
+    // 3b) Prev/Next-Wochen-Buttons. FIX 1: die alte Bedingung verlangte ZUSAETZLICH
+    //     eine Wochennummer ("(Week 39)"). Der Live-Button vom 26.09. hatte aber
+    //     KEINE — "Go to next week 28 September – 4 October, 2026" fiel deshalb
+    //     durch und blieb ein Header-Kandidat. Jetzt entscheidet allein die
+    //     Navigations-Absicht (identisch zu isWeekNavLabel auf der Node-Seite).
     for (const el of document.querySelectorAll('[aria-label], [title]')) {
       if (!isVisible(el)) continue;
       const label = el.getAttribute('aria-label') || el.getAttribute('title') || '';
-      if (/(previous|next|vorherige|nächste|nächsten)\s+week|week\s+(previous|next)|woche/i.test(label) &&
-          /(week|kw)\s*\d{1,2}/i.test(label)) {
-        push(navTexts, label);
-      }
+      if (isNavLabel(label)) push(navTexts, label);
     }
     // 4) Tages-Spaltenköpfe der Woche — mehrere Selektor-Varianten (OWA nutzt je nach
     //    Build role="columnheader", th-Elemente oder Grid-Köpfe)
@@ -878,7 +1047,7 @@ export async function collectCalendarCandidates(page) {
       if (!isVisible(el)) continue;
       const text = el.getAttribute('aria-label') || el.innerText;
       if (isEventLabel(text)) continue;
-      push(dayHeaderTexts, text);
+      pushHeader(dayHeaderTexts, text);
     }
     // 5) Body-Text-Heuristik: Zeilen mit Wochentag + Datum ("Montag, 28. September",
     //    "Montag 28.9.") ODER Wochen-Range-Muster — Fallback, falls die Spaltenköpfe
@@ -893,7 +1062,7 @@ export async function collectCalendarCandidates(page) {
         const s = line.trim();
         if (!s || s.length > 60) continue;
         if (isEventLabel(s)) continue;
-        if ((weekdayRe.test(s) && lineDateRe.test(s)) || rangeRe.test(s)) push(dayHeaderTexts, s);
+        if ((weekdayRe.test(s) && lineDateRe.test(s)) || rangeRe.test(s)) pushHeader(dayHeaderTexts, s);
         if (dayHeaderTexts.length >= 12) break;
       }
     } catch (e) { /* bewusst ignorieren */ }
@@ -915,7 +1084,7 @@ export async function collectCalendarCandidates(page) {
       ariaButtonCount: buttons.length,
       ariaLabelSample
     };
-  }).catch((e) => ({
+  }, WEEK_NAV_LABEL_PATTERNS).catch((e) => ({
     // BUG 5 (Diagnose, Runde 4): Der frueher nackte `catch` lieferte exakt die
     // Form "nichts gefunden". Damit waren zwei voellig verschiedene Ursachen NICHT
     // unterscheidbar:
@@ -987,9 +1156,30 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
   let collectError = null;
   try {
     const res = await page.evaluate(
-      ({ pats, plan, clockStrict, weekStart, fastMode, maxElements, maxCensusNodes, maxStructureNodes, loadPats, loadingSelector }) => {
+      ({ pats, plan, clockStrict, weekStart, fastMode, maxElements, maxCensusNodes, maxStructureNodes, loadPats, loadingSelector, navPats, rangePats }) => {
         const re = {};
         for (const k of Object.keys(pats)) re[k] = new RegExp(pats[k], 'i');
+        // FIX 1: Wochen-Header- vs. Navigations-Erkennung. Beide Pattern-Sätze
+        // sind serialisierbare Strings und werden als ARGUMENT gereicht — eine
+        // nackte Modul-Referenz waere ueber die evaluate-Grenze ein
+        // ReferenceError (vgl. collectError unten). Die Definition selbst ist
+        // dieselbe wie auf der Node-Seite (WEEK_NAV_LABEL_PATTERNS /
+        // WEEK_RANGE_PATTERNS).
+        const nre = (navPats || []).map((p) => new RegExp(p, 'i'));
+        const rre = {};
+        for (const k of Object.keys(rangePats || {})) rre[k] = new RegExp(rangePats[k], 'i');
+        const isNavLabel = (t) => {
+          for (let i = 0; i < nre.length; i++) if (nre[i].test(t)) return true;
+          return false;
+        };
+        // Sieht der Text aus wie ein Wochen-Header? Positiv: Datumsbereich MIT
+        // Datumsanker UND keine Navigations-Absicht. Spiegel von
+        // isWeekHeaderShaped auf der Node-Seite.
+        const isWeekHeaderShaped = (t) => {
+          if (!t || isNavLabel(t)) return false;
+          if (!rre.range || !rre.range.test(t)) return false;
+          return re.dateish.test(t) || (rre.dotted ? rre.dotted.test(t) : false);
+        };
         // Lade-Indikator-Muster kommen als ARGUMENT ueber die evaluate-Grenze
         // (Modul-Referenzen sind hier ein ReferenceError, siehe collectError).
         const lre = {};
@@ -1073,6 +1263,12 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         const reasonOf = (t) => {
           if (re.gridBlocker.test(t)) return 'clock-indicator';
           if (re.nonEvent.test(t)) return 'work-location';
+          // FIX 1 (Live-Lauf 5): der angezeigte Wochen-Header wurde an dieser
+          // Stelle als 'header-misclassified' VERWORFEN — "21–27 September,
+          // 2026 (Week 39)". Er ist der Wochen-Header, kein Muell. Erkannt
+          // wird er ueber den BEREICH (starkes Kriterium) und die Abwesenheit
+          // einer Navigations-Absicht — nicht ueber eine Text-Heuristik.
+          if (isWeekHeaderShaped(t)) return 'displayed-week-header';
           if (re.dateish.test(t) && t.length <= 160) return 'header-misclassified';
           return null;
         };
@@ -1186,6 +1382,7 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         }
 
         const headerLike = [];
+        const weekHeaderLike = [];
         const nonEventLabels = [];
         const candidates = [];
         const allLabels = [];
@@ -1219,6 +1416,11 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
             } else {
               const r = reasonOf(t);
               if (r === 'header-misclassified') headerLike.push(t);
+              // FIX 1: der angezeigte Wochen-Header ist kein 'header-misclassified'.
+              // Er wird als eigener, benannter Beleg gefuehrt — damit die
+              // Diagnostik zeigt, dass der Header GEFUNDEN wurde (und nicht,
+              // wie vorher, als Muell verworfen).
+              else if (r === 'displayed-week-header') weekHeaderLike.push(t);
               else if (r) nonEventLabels.push({ label: t, reason: r });
             }
           }
@@ -1280,6 +1482,9 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
           sourceTried,
           hiddenCount,
           headerLikeLabels: cap(dedupe(headerLike), 20),
+          // FIX 1: der angezeigte Wochen-Header, vom Kollektor als eigener
+          // Grund benannt (nicht als 'header-misclassified' verworfen).
+          weekHeaderLabels: cap(dedupe(weekHeaderLike), 10),
           nonEventLabels: cap(dedupeReasons(nonEventLabels), 20),
           candidates: cap(candidates, 20),
           // Signatur ohne Datum: sichtbar, aber kein verwertbares Label.
@@ -1320,7 +1525,10 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
         // Lade-Indikator-Muster + Selektor als Argument (Single Source of
         // Truth ist LOAD_INDICATOR_PATTERNS weiter oben im Modul).
         loadPats: LOAD_INDICATOR_PATTERNS,
-        loadingSelector: LOAD_INDICATOR_SELECTOR
+        loadingSelector: LOAD_INDICATOR_SELECTOR,
+        // FIX 1: Header- vs. Navigations-Erkennung (siehe WEEK_NAV_LABEL_PATTERNS).
+        navPats: WEEK_NAV_LABEL_PATTERNS,
+        rangePats: WEEK_RANGE_PATTERNS
       }
     );
     // GEOMETRIE-Pfad (Node-seitig, gleiche Prueflogik wie der Rest):
@@ -1383,7 +1591,7 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
     }
     return {
       labels: [], eventElementsFound: 0, selectorUsed: 'error', sourceUsed: null,
-      sourceTried: [], hiddenCount: 0, headerLikeLabels: [], nonEventLabels: [],
+      sourceTried: [], hiddenCount: 0, headerLikeLabels: [], weekHeaderLabels: [], nonEventLabels: [],
       candidates: [], collectError, loading: false, loadingIndicators: [],
       census: { scannedCount: 0, truncated: false, dayColumns: [], clockRuler: [], structureNodes: 0, loadingNodes: 0, scanned: [] }
     };
@@ -1403,12 +1611,12 @@ export async function collectCalendarEventLabels(page, { preferSelector = null, 
 // stale All-Day-Event "Urlaub … September 23" wurde fälschlich als Header gelesen).
 export function resolveRenderedWeekFromCandidates({ headerTexts = [], dayHeaderTexts = [], navTexts = [] } = {}, now = new Date()) {
   // Aus einem Einzel-Datum die OWA-Wochenansicht (Montag–Sonntag) ableiten.
-  const deriveWeek = (dateIso, text) => {
+  const deriveWeek = (dateIso, text, source) => {
     const d = new Date(dateIso + 'T00:00:00');
     const offsetToMonday = d.getDay() === 0 ? -6 : 1 - d.getDay();
     const monday = new Date(d.getTime() + offsetToMonday * 86400000);
     const sunday = new Date(monday.getTime() + 6 * 86400000);
-    return { text: String(text).slice(0, 200), startDate: toIsoDate(monday), endDate: toIsoDate(sunday), weekNumber: null };
+    return { text: String(text).slice(0, 200), startDate: toIsoDate(monday), endDate: toIsoDate(sunday), weekNumber: null, source, readError: 'no-displayed-header' };
   };
   const currentYear = now.getFullYear();
 
@@ -1417,54 +1625,102 @@ export function resolveRenderedWeekFromCandidates({ headerTexts = [], dayHeaderT
   const headers = filterCalendarHeaderCandidates(headerTexts);
   const dayHeaders = filterCalendarHeaderCandidates(dayHeaderTexts);
 
+  // FIX 1 (Live-Lauf 5): Navigations-Labels sind NIE der angezeigte Header.
+  // Ihr Datumsbereich ist das Klickziel, nicht die Ansicht — in Lauf 5 hat
+  // der erste parsebare Nav-Kandidat die Zielwoche zweimal kapert: einmal
+  // mitten in der RICHTIGEN Woche (Falschabbruch nach 6 Klicks, 'max-clicks')
+  // und einmal als Falschpass (weekVerified:true, View blieb auf KW 39).
+  const displayedHeaders = headers.filter((t) => !isWeekNavLabel(t));
+  const dayHeadersOnly = dayHeaders.filter((t) => !isWeekNavLabel(t));
+
   // 1) Wochen-Range-Header (Header-Bereich zuerst, dann Tageskopf-/Body-Kandidaten)
-  for (const text of headers) {
+  //    POSITIV-KRITERIUM: der Text muss einen ableitbaren DATUMSBEREICH
+  //    liefern (parseWeekHeaderText). Diese Bereich-Pruefung steht VOR jeder
+  //    Text-/Nummern-Heuristik — sie ist das staerkste Kriterium.
+  for (const text of displayedHeaders) {
     const parsed = parseWeekHeaderText(text, now);
-    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate, weekNumber: null };
+    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate, weekNumber: null, source: WEEK_READ_SOURCES.displayed };
   }
-  for (const text of dayHeaders) {
+  for (const text of dayHeadersOnly) {
     const parsed = parseWeekHeaderText(text, now);
-    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate, weekNumber: null };
+    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate, weekNumber: null, source: WEEK_READ_SOURCES.column };
   }
-  // 2) Prev/Next-Button-Ableitung (belastbarer Fallback, Runde-4-Forderung 2)
+  // 2) Prev/Next-Button-Ableitung (belastbarer Fallback, Runde-4-Forderung 2).
+  //    Das ist eine ABLEITUNG (Mitte zwischen prev und next), keine Anzeige.
+  //    FIX 1.4: Sie ersetzt den angezeigten Header NICHT — sie wird als
+  //    readError gemeldet und zaehlt nicht als Wochen-Nachweis
+  //    (isHeaderReadVerified), damit aus einer Schätzung keine Zertifizierung
+  //    wird. Nur der next-Button-Text als SOLCHE (sein Klickziel) wird nie
+  //    zur gerenderten Woche.
   const nav = resolveWeekFromNavButtons(navTexts, now);
   if (nav && nav.startDate) {
-    return { text: nav.text, startDate: nav.startDate, endDate: nav.endDate, weekNumber: nav.weekNumber };
+    return {
+      text: nav.text, startDate: nav.startDate, endDate: nav.endDate, weekNumber: nav.weekNumber,
+      source: WEEK_READ_SOURCES.navDerived,
+      readError: 'no-displayed-header',
+      derivedFrom: 'nav-buttons',
+      navOnlyCandidates: headers.concat(navTexts).filter((t) => isWeekNavLabel(t)).slice(0, 5)
+    };
   }
   // 3) Einzel-Datum mit Monatsnamen
-  for (const text of headers) {
+  for (const text of displayedHeaders) {
     const slot = parseEventLabel(text, currentYear);
-    if (slot && slot.date) return deriveWeek(slot.date, text);
+    if (slot && slot.date) return deriveWeek(slot.date, text, WEEK_READ_SOURCES.singleDate);
   }
-  for (const text of dayHeaders) {
+  for (const text of dayHeadersOnly) {
     const slot = parseEventLabel(text, currentYear);
-    if (slot && slot.date) return deriveWeek(slot.date, text);
+    if (slot && slot.date) return deriveWeek(slot.date, text, WEEK_READ_SOURCES.singleDate);
   }
   // 4) Numerische Tagesangaben (Spaltenköpfe + kurze Header-Texte)
-  for (const text of dayHeaders) {
+  for (const text of dayHeadersOnly) {
     const dateIso = parseNumericDayHeaderText(text, now);
-    if (dateIso) return deriveWeek(dateIso, text);
+    if (dateIso) return deriveWeek(dateIso, text, WEEK_READ_SOURCES.numericDay);
   }
-  for (const text of headers) {
+  for (const text of displayedHeaders) {
     if (String(text).length > 60) continue; // lange Texte nur mit stärkerem Muster akzeptieren
     const dateIso = parseNumericDayHeaderText(text, now);
-    if (dateIso) return deriveWeek(dateIso, text);
+    if (dateIso) return deriveWeek(dateIso, text, WEEK_READ_SOURCES.numericDay);
   }
 
   // Nichts Datierbares gefunden -> bewusst NULL zurückgeben (kein "Work week"-Fehlgreifer).
-  return { text: null, startDate: null, endDate: null, weekNumber: null };
+  return {
+    text: null, startDate: null, endDate: null, weekNumber: null,
+    source: null,
+    // FIX 1: der Grund wird BENANNT. "Kein angezeigter Header lesbar" und
+    // "Header-Auswertung fehlgeschlagen" (collectError) sind sonst nicht
+    // unterscheidbar — und der Aufrufer MUSS daraus headerReadError machen
+    // statt ersatzweise den Button-Text zu nehmen.
+    readError: 'no-displayed-header',
+    navOnlyCandidates: headers.concat(navTexts).filter((t) => isWeekNavLabel(t)).slice(0, 5)
+  };
 }
 
 // Liest die gerenderte Kalenderwoche aus der OWA-Wochenansicht aus.
-// Rückgabe: { text, startDate, endDate } — startDate/endDate als ISO-Strings
-// 'YYYY-MM-DD', alles null wenn der Header nicht gefunden oder nicht parsebar war.
-// `readError` ist nur gesetzt, wenn das evaluate selbst fehlschlug: "Header noch
-// nicht gerendert" und "Auswertung fehlgeschlagen" sind sonst nicht unterscheidbar
-// (BUG 5, Live-Runde 4).
+// Rückgabe: { text, startDate, endDate, source, readError } — startDate/endDate
+// als ISO-Strings 'YYYY-MM-DD', alles null wenn der Header nicht gefunden oder
+// nicht parsebar war.
+// `readError` unterscheidet die drei Nicht-Fälle:
+//   - collectError:            das evaluate selbst ist fehlschlug (Code-Defekt)
+//   - 'no-displayed-header':   gerendert, aber kein ANGEZEIGTER Header lesbar
+//   - null:                    ein Header wurde gelesen
+// (BUG 5, Live-Runde 4: vorher waren "Header noch nicht gerendert" und
+// "Auswertung fehlgeschlagen" nicht unterscheidbar.)
+// FIX 1 (Live-Lauf 5): `source` sagt, WOHER der Wert stammt. Nur
+// 'displayed-header'/'day-column' sind ein gelesener Wochen-Header.
 export async function readRenderedCalendarWeek(page) {
   const collected = await collectCalendarCandidates(page);
   const week = resolveRenderedWeekFromCandidates(collected);
   return collected && collected.collectError ? { ...week, readError: collected.collectError } : week;
+}
+
+// FIX 1: Ist der Wochenwert ein GELESENER angezeigter Header — oder eine
+// Ableitung? Nur die erste Art ist ein Wochen-Nachweis. Aus Prev/Next-Buttons
+// abgeleitete, aus Einzel-Datum geschätzte oder numerisch geschätzte Werte
+// sind Schätzungen und dürfen kein 'weekVerified' erkaufen.
+export function isHeaderReadVerified(rendered) {
+  return Boolean(
+    rendered && rendered.startDate && rendered.endDate && isDisplayedWeekSource(rendered.source)
+  );
 }
 
 // Sammelt reiche Diagnostik für Fehlerfälle und unverified-Responses (Kernforderung
@@ -2516,7 +2772,7 @@ export function classifyButtonFailure({ foundAny = false, clickedAny = false } =
 // (Runde-4-Forderung B): Der frühe Snapshot (direkt nach Navigation erhoben)
 // bleibt immer erhalten, auch wenn das Budget für eine frische Erhebung nicht
 // mehr reicht. Klick-Protokoll, Abbruchgrund und Budget-Report kommen hinzu.
-export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null, waitedForEventsMs = null, eventWaitOutcome = null, eventWaitAbortReason = null, eventWaitLoadingPolls = null, loadingIndicators = null } = {}) {
+export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null, eventElementsFound = null, selectorUsed = null, rawEventLabels = null, rejectionReasons = null, waitedForEventsMs = null, eventWaitOutcome = null, eventWaitAbortReason = null, eventWaitLoadingPolls = null, loadingIndicators = null, headerReadError = null } = {}) {
   const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], weekNavCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
   const out = {
     ...base,
@@ -2525,6 +2781,10 @@ export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekBu
   };
   if (early && early.url) out.urlAfterNavigation = early.url;
   if (budget) out.budget = budget;
+  // FIX 1: "kein angezeigter Header lesbar" ist ein eigener, benannter Grund
+  // und wird auch in den FRUEHEN Abbruchpfaden sichtbar — sonst waere dort die
+  // Diagnose "nichts gefunden" (und die Versuchung, den Button-Text zu nehmen).
+  if (headerReadError) out.headerReadError = headerReadError;
   // Runde-5-Kernlücke: Slot-Extraktions-Diagnostik auch im Erfolgsfall (status ok),
   // damit ein echter Free-Tag von einem Extraktions-Miss unterscheidbar ist.
   if (eventElementsFound !== null) out.eventElementsFound = eventElementsFound;
@@ -3497,6 +3757,9 @@ export class OwaClient {
     // Restbudget; Eskalationsstufen (frische Navigation, Fernsprung) nur, wenn
     // das Budget sie noch trägt — sonst Abbruch mit dem, was da ist.
     const MAX_BUTTON_CLICKS = FREEBUSY_MAX_BUTTON_CLICKS;
+    // FIX 1: der Grund, warum kein angezeigter Header gelesen werden konnte
+    // (null = Header gelesen). Wird unabhaengig vom Abbruch-Pfad berichtet.
+    let headerReadError = null;
     let gotoRetryDone = false;
     let farJumpDone = false;
     // BUG 5: 1x harter Reload der startdate-URL als Notfallweg fuer Zustand 1.
@@ -3651,7 +3914,8 @@ export class OwaClient {
         early: earlyDiagnostics,
         weekButtonProbe,
         abortReason: abortReason !== 'none' ? abortReason : 'week-mismatch',
-        budget: freeBusyBudgetReport()
+        budget: freeBusyBudgetReport(),
+        headerReadError
       });
       return errorResult(
         `Kalender-Wochenansicht zeigt nicht die angefragte Woche: angefragt ab ${rangeStartDate}, ` +
@@ -3673,6 +3937,7 @@ export class OwaClient {
         weekButtonProbe,
         abortReason: abortReason !== 'none' ? abortReason : 'not-rendered',
         budget: freeBusyBudgetReport(),
+        headerReadError,
         waitedForEventsMs: 0,
         eventWaitOutcome: 'not-rendered'
       });
@@ -3689,10 +3954,19 @@ export class OwaClient {
       );
     }
 
-    // Wochen-Nachweis (unabhaengig von den Events). Der Header-/Header-Datum-
-    // Pfad funktioniert und bleibt unveraendert — nur die BEDEUTUNG von
-    // dataQuality wird ehrlich (siehe resolveDataQuality weiter unten).
-    const weekVerified = Boolean(rendered.startDate && rendered.endDate);
+    // Wochen-Nachweis (unabhaengig von den Events). FIX 1: der Nachweis
+    // verlangt einen GELESENEN angezeigten Header, nicht irgendeine Ableitung.
+    // Ein aus Prev/Next-Buttons abgeleiteter Wert (source:'nav-derivation') ist
+    // eine Schaetzung und traegt keine 'weekVerified' — in Lauf 5 stand
+    // weekVerified:true bei View auf KW 39, weil der next-Button-Label die
+    // Zielwoche nannte.
+    const weekVerified = isHeaderReadVerified(rendered);
+    if (!weekVerified && rendered.readError) {
+      // FIX 1: kein lesbarer angezeigter Header -> der Grund wird als
+      // headerReadError berichtet und der Nav-Button-Text NICHT ersatzweise
+      // genommen (der Button-Text steht in navOnlyCandidates/headerCandidates).
+      headerReadError = rendered.readError;
+    }
 
     // ECHTE Event-Wartephase (Bug 3, Live-Befund 25.09.2026): Nach bestaetigter
     // Wochen-Verifikation wird GEZIELT auf echte Event-Knoten gepollt. Budget:
@@ -3802,6 +4076,10 @@ export class OwaClient {
     // Header-artige Labels (Datum ohne Zeit) hat der Kollektor als Event-Kandidaten
     // verworfen -> als 'header-misclassified' ausweisen.
     for (const label of eventCollection.headerLikeLabels) reject(label, 'header-misclassified');
+    // FIX 1: der ANGEZEIGTE Wochen-Header ist kein 'header-misclassified'. Er
+    // wird nicht verworfen, sondern als Header belegt ausgewiesen — vorher hat
+    // das Werkzeug seinen eigenen Beleg gefunden und weggeschmissen.
+    const weekHeaderLabels = eventCollection.weekHeaderLabels || [];
     // Iteration 7: Labels mit EXPLIZITEM Ablehnungsgrund. Runde 6 lieferte 12x
     // 'header-misclassified' für "calendar view, current time: Fri 22:31" — das
     // Rauschen verdeckte die eigentliche Ursache. Jetzt: 'clock-indicator' bzw.
@@ -3838,8 +4116,10 @@ export class OwaClient {
     let note = 'Busy-Slots aus ARIA-Labels der Kalender-Event-Elemente der Wochenansicht extrahiert ' +
       '(Datum/Zeit strukturiert geparst, Work-Location-Pseudo-Slots entfernt, Zeit-Duplikate zusammengeführt, ' +
       'per Wortliste klassifiziert, auf den angefragten Zeitraum gefiltert). ' +
-      'Navigation: startdate-Param ist Primärsignal — bestätigt der sichtbare Wochen-Header (Range oder ' +
-      'Prev/Next-Ableitung) die Zielwoche, sind KEINE Button-Klicks nötig; Buttons nur bei Abweichung.';
+      'Navigation: der angezeigte Wochen-Header ist der EINZIGE Nachweis fuer die Zielwoche; ' +
+      'der startdate-Parameter der URL ist ein VERSUCH (der Client-Store kann ihn ueberschreiben — ' +
+      'belegt im Lauf vom 26.09.: korrekte URL, View unveraendert) und begruendet keine Daten. ' +
+      'Buttons werden nur bei belegter Abweichung und gerichteter Differenz geklickt.';
     if (dataQuality === 'unverified') {
       note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
     }
@@ -3931,6 +4211,7 @@ export class OwaClient {
       // BUG 5: 'Header noch nicht gerendert' und 'Header-Auswertung fehlgeschlagen'
       // waren in Runde 4 nicht unterscheidbar (beide: leere Kandidatenlisten).
       if (rendered.readError) diag.headerReadError = rendered.readError;
+      if (headerReadError) diag.headerReadError = headerReadError;
       if (eventWait.weekHeader && eventWait.weekHeader.readError) {
         diag.headerReadError = eventWait.weekHeader.readError;
       }
@@ -3941,6 +4222,7 @@ export class OwaClient {
       if (eventCollection.dateMissingLabels && eventCollection.dateMissingLabels.length) {
         diag.dateMissingLabels = eventCollection.dateMissingLabels;
       }
+      if (weekHeaderLabels.length) diag.weekHeaderLabels = weekHeaderLabels;
       const warnings = [
         slotExtractionWarning(eventElementsFound, busySlots.length),
         eventWaitWarning({ outcome: eventWait.outcome, waitedMs: eventWait.waitedMs, budgetMs: eventWaitBudget, abortReason: eventWait.abortReason })
