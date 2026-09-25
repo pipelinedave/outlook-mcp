@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -1533,5 +1533,441 @@ describe('assembleFreeBusyDiagnostics - Event-Wartephase in der Diagnostik (Iter
     const d = assembleFreeBusyDiagnostics({ abortReason: 'none' });
     assert.equal('waitedForEventsMs' in d, false);
     assert.equal('eventWaitOutcome' in d, false);
+  });
+});
+
+// ===========================================================================
+// Defekt-Fix KW 40 (Live-Smoke-Test 2026-09-25, Commit 0c4cfee):
+//   Defekt 1  Selektor `[aria-label]` trifft NUR Chrome-/Nav-Knoten
+//             (ariaButtonCount=9, 12 Labels, alle header/nav/clock).
+//             Es wird eine echte Grid-/Struktur-Suche noetig.
+//   Defekt 2  dataQuality:'verified' bei eventElementsFound=0 = Falschaussage.
+//   Defekt 3  eventWaitOutcome:'found' bei waitedForEventsMs:0 = Widerspruch.
+//
+// Messbare Ziele dieser Tests:
+//   - eine LEITER unabhaengiger Event-Quellen statt eines geratenen Selektors
+//   - Label-Ableitung auch OHNE aria-label (title / data-* / Text+Geometrie)
+//   - offsetParent===null ist kein Hard-K.O., Sichtbarkeit ueber boundingRect
+//   - ehrliche dataQuality-Werte und an die BEobachtUNG gekoppelter Wait-Ausgang
+// ===========================================================================
+
+describe('CALENDAR_EVENT_SOURCES - Quellen-Leiter statt geratenem Selektor (Defekt 1)', () => {
+  test('die Leiter enthaelt mindestens eine Quelle OHNE aria-label', () => {
+    // Runde 7 hat bewiesen: [aria-label] trifft im Tenant KEINE Event-Chips.
+    // Eine Leiter, die nur aria-label-Varianten kennt, waere blind.
+    const nonAria = CALENDAR_EVENT_SOURCES.filter((s) => s.source !== 'aria-label');
+    assert.ok(nonAria.length >= 2, 'es braucht mindestens 2 Quellen jenseits von aria-label');
+  });
+
+  test('die historisch bewaesste Quelle steht weiterhin vorn (Rueckwaertskompatibilitaet)', () => {
+    assert.equal(CALENDAR_EVENT_SOURCES[0].selector, '[role="button"][aria-label]');
+    assert.equal(CALENDAR_EVENT_SOURCES[0].source, 'aria-label');
+  });
+
+  test('Struktur-Quellen (selector null) sind als solche markiert', () => {
+    for (const s of CALENDAR_EVENT_SOURCES) {
+      if (s.selector === null) assert.equal(typeof s.scope, 'string', `${s.id} braucht einen scope`);
+      else assert.equal(typeof s.selector, 'string');
+      assert.equal(typeof s.id, 'string');
+      assert.equal(typeof s.source, 'string');
+    }
+  });
+
+  test('jede Quellen-ID ist eindeutig (Diagnostik muss zuordenbar bleiben)', () => {
+    const ids = CALENDAR_EVENT_SOURCES.map((s) => s.id);
+    assert.equal(new Set(ids).size, ids.length);
+  });
+
+  test('eventSourcePlan stellt den gemerkten Selektor voran (Selektor-Memory)', () => {
+    const plan = eventSourcePlan('[role="gridcell"][aria-label]');
+    assert.equal(plan[0].id, 'remembered');
+    assert.equal(plan[0].selector, '[role="gridcell"][aria-label]');
+    // danach die regulaere Leiter, ohne Duplikate
+    const rest = plan.slice(1).map((s) => s.selector);
+    assert.equal(rest.includes('[role="gridcell"][aria-label]'), false);
+    assert.equal(rest[0], '[role="button"][aria-label]');
+  });
+
+  test('ohne Memory ist die Leiter unveraendert', () => {
+    assert.equal(eventSourcePlan(null)[0].id, 'aria-role-button');
+    assert.equal(eventSourcePlan(undefined).length, CALENDAR_EVENT_SOURCES.length);
+  });
+});
+
+describe('normalizeClockTime - Uhrzeit-Raster lesbar machen (Defekt 1, Geometrie)', () => {
+  test('24h-Format', () => {
+    assert.equal(normalizeClockTime('08:00'), '08:00');
+    assert.equal(normalizeClockTime('8:00'), '08:00');
+    assert.equal(normalizeClockTime('17:30'), '17:30');
+  });
+
+  test('12h-Format mit AM/PM', () => {
+    assert.equal(normalizeClockTime('8 AM'), '08:00');
+    assert.equal(normalizeClockTime('8:30 am'), '08:30');
+    assert.equal(normalizeClockTime('1 PM'), '13:00');
+    assert.equal(normalizeClockTime('12 PM'), '12:00');
+    assert.equal(normalizeClockTime('12 AM'), '00:00');
+  });
+
+  test('Text drumherum wird toleriert', () => {
+    assert.equal(normalizeClockTime('  09:00  '), '09:00');
+    assert.equal(normalizeClockTime('Uhrzeit 14:00'), '14:00');
+  });
+
+  test('MEHRDEUTIGES wird verworfen statt geraten (keine erfundenen Zeiten)', () => {
+    // Eine nackte "8" koennte 08:00 ODER 20:00 sein -> nicht ableitbar.
+    assert.equal(normalizeClockTime('8'), null);
+    assert.equal(normalizeClockTime(''), null);
+    assert.equal(normalizeClockTime(null), null);
+    assert.equal(normalizeClockTime('Work week'), null);
+    assert.equal(normalizeClockTime('25:99'), null);
+  });
+});
+
+describe('mapXToDayColumn - Chip x-Position -> Wochentag (Defekt 1, Geometrie)', () => {
+  // 5 Spalten a 100px: Mo 100-200, Di 200-300, Mi 300-400, Do 400-500, Fr 500-600
+  const columns = [100, 200, 300, 400, 500].map((left) => ({ left, width: 100 }));
+
+  test('Treffer in der Spalte', () => {
+    assert.equal(mapXToDayColumn(columns, 150), 0);
+    assert.equal(mapXToDayColumn(columns, 250), 1);
+    assert.equal(mapXToDayColumn(columns, 550), 4);
+  });
+
+  test('Randfall exakt auf der Kante', () => {
+    assert.equal(mapXToDayColumn(columns, 200), 0);
+  });
+
+  test('schmaler Spaltenkopf -> naechste Spalte, solange der Abstand passt', () => {
+    // OWA rendert den Tageskopf oft SCHMALER als die Spalte (nur die Zahl).
+    assert.equal(mapXToDayColumn([{ left: 145, width: 10 }].concat(columns.slice(1)), 160), 0);
+  });
+
+  test('weit ausserhalb -> -1 (KEINE Zuordnung raten)', () => {
+    assert.equal(mapXToDayColumn(columns, 5000), -1);
+    assert.equal(mapXToDayColumn(columns, 10), -1);
+  });
+
+  test('ohne brauchbare Spalten -> -1', () => {
+    assert.equal(mapXToDayColumn([], 150), -1);
+    assert.equal(mapXToDayColumn(null, 150), -1);
+    assert.equal(mapXToDayColumn([{ left: 100, width: 0 }], 150), -1);
+  });
+});
+
+describe('mapYToClockTime - Chip y-Position -> Startzeit (Defekt 1, Geometrie)', () => {
+  // Stundenraster 8-17 Uhr, 60px je Stunde, Oberkante bei top=200
+  const ruler = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((h, i) => ({
+    time: `${String(h).padStart(2, '0')}:00`,
+    top: 200 + i * 60
+  }));
+
+  test('Chip kurz nach einer Rasterlinie -> diese Stunde', () => {
+    assert.equal(mapYToClockTime(ruler, 205), '08:00');
+    assert.equal(mapYToClockTime(ruler, 320), '10:00');
+  });
+
+  test('Chip auf halber Stunde -> die Stunde darunter (Start, nicht Mitte)', () => {
+    assert.equal(mapYToClockTime(ruler, 250), '09:00');
+  });
+
+  test('oberhalb des Rasters -> keine Zuordnung', () => {
+    assert.equal(mapYToClockTime(ruler, 100), null);
+  });
+
+  test('leeres/ungueltiges Raster -> null statt Rateversuch', () => {
+    assert.equal(mapYToClockTime([], 300), null);
+    assert.equal(mapYToClockTime(null, 300), null);
+    assert.equal(mapYToClockTime([{ time: 'kaputt', top: 200 }], 300), null);
+  });
+});
+
+describe('estimateHourPx - Stundenhöhe aus dem Raster (Endezeit)', () => {
+  test('regelmaessiges Raster -> 60px', () => {
+    const ruler = [8, 9, 10, 11].map((h, i) => ({ time: `${String(h).padStart(2, '0')}:00`, top: i * 60 }));
+    assert.equal(estimateHourPx(ruler), 60);
+  });
+
+  test('Rauschen wird ueber Mehrheitsabstand geglaettet', () => {
+    const ruler = [
+      { time: '08:00', top: 0 }, { time: '09:00', top: 60 },
+      { time: '10:00', top: 121 }, { time: '11:00', top: 180 }
+    ];
+    const px = estimateHourPx(ruler);
+    assert.ok(px >= 55 && px <= 65, `erwartet ~60, war ${px}`);
+  });
+
+  test('zu wenige Stufen -> 0 (keine Endezeit erfinden)', () => {
+    assert.equal(estimateHourPx([{ time: '08:00', top: 0 }, { time: '09:00', top: 60 }]), 60);
+    assert.equal(estimateHourPx([{ time: '08:00', top: 0 }]), 0);
+    assert.equal(estimateHourPx([]), 0);
+    assert.equal(estimateHourPx(null), 0);
+  });
+});
+
+describe('buildGeometryEventLabel - Label im Parser-Format aus Geometrie', () => {
+  test('zeitbasiertes Event mit Datum aus der Spalte', () => {
+    const l = buildGeometryEventLabel({ title: 'Block', start: '13:00', end: '18:30', dateIso: '2026-09-30' });
+    assert.equal(l, 'Block, 13:00 to 18:30, Wednesday, September 30, 2026');
+  });
+
+  test('Ganztag', () => {
+    const l = buildGeometryEventLabel({ title: 'Urlaub', allDay: true, dateIso: '2026-09-30' });
+    assert.equal(l, 'Urlaub, all day event, Wednesday, September 30, 2026');
+  });
+
+  test('deutsches Datum wird ebenfalls gebaut (Locale robust)', () => {
+    const l = buildGeometryEventLabel({ title: 'Termin', start: '09:00', end: '10:00', dateIso: '2026-09-28' });
+    assert.ok(l.includes('Monday, September 28, 2026'), l);
+  });
+
+  test('ohne brauchbare Angaben -> null (KEIN Phantom-Label)', () => {
+    assert.equal(buildGeometryEventLabel({ title: 'Block', start: '13:00', end: '18:30' }), null);
+    assert.equal(buildGeometryEventLabel({ title: 'Block', dateIso: '2026-09-30' }), null);
+    assert.equal(buildGeometryEventLabel({ start: '13:00', end: '14:00', dateIso: '2026-09-30' }), null);
+    assert.equal(buildGeometryEventLabel({ title: 'Block', start: '13:00', end: '14:00', dateIso: 'kein-datum' }), null);
+  });
+
+  test('der gebaute Label ist vom echten Parser lesbar (End-to-End)', () => {
+    const l = buildGeometryEventLabel({ title: 'Block', start: '13:00', end: '18:30', dateIso: '2026-09-30' });
+    const slot = parseEventLabel(l, 2026);
+    assert.ok(slot);
+    assert.equal(slot.date, '2026-09-30');
+    assert.equal(slot.start, '13:00');
+    assert.equal(slot.end, '18:30');
+    assert.equal(slot.title, 'Block');
+  });
+});
+
+describe('deriveEventLabelFromNode - Label aus einem beliebigen Grid-Knoten', () => {
+  const pats = EVENT_LABEL_PATTERNS;
+  const columns = [100, 200, 300].map((left) => ({ left, width: 100 }));
+  const ruler = [8, 9, 10, 11, 12, 13].map((h, i) => ({ time: `${String(h).padStart(2, '0')}:00`, top: 200 + i * 60 }));
+  const geo = { columns, ruler, weekStartIso: '2026-09-28' };
+  const node = (over = {}) => ({
+    tag: 'DIV', role: null, cls: 'ms-Cal-event',
+    ariaLabel: '', title: '', text: '', data: null,
+    rect: { left: 250, top: 620, width: 90, height: 150, x: 250, y: 620 },
+    area: true, offsetParentNull: true, ...over
+  });
+
+  test('1) vollstaendiges aria-Label bleibt erste Wahl (timeSource: label)', () => {
+    const r = deriveEventLabelFromNode(node({ ariaLabel: 'Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy' }), { pats });
+    assert.equal(r.label, 'Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy');
+    assert.equal(r.reason, null);
+    assert.equal(r.source, 'aria-label');
+    assert.equal(r.timeSource, 'label');
+  });
+
+  test('2) title-Attribut traegt das Label, wenn aria-label fehlt', () => {
+    const r = deriveEventLabelFromNode(node({ title: 'Urlaub, all day event, Wednesday, September 30, 2026, Busy' }), { pats });
+    assert.equal(r.source, 'title');
+    assert.ok(r.label);
+    assert.equal(r.reason, null);
+  });
+
+  test('3) data-Attribut traegt das Label (OWA-typisch)', () => {
+    const r = deriveEventLabelFromNode(node({ data: { 'data-event-aria-label': 'Block, 13:00 to 18:30, Wednesday, September 30, 2026, Busy' } }), { pats });
+    assert.equal(r.source, 'data-attr');
+    assert.ok(r.label);
+  });
+
+  test('4) reiner Text MIT Zeit UND Datum ist ein vollwertiges Label', () => {
+    const r = deriveEventLabelFromNode(node({ text: 'Austausch Mathis:David:Alex\n14:00 to 15:00\nMonday, September 28, 2026' }), { pats });
+    assert.equal(r.source, 'text');
+    assert.equal(r.reason, null);
+    assert.equal(r.timeSource, 'label');
+  });
+
+  test('5) NUR Titel im Text -> Zeit+Datum werden aus der Geometrie abgeleitet', () => {
+    // Chip ohne JEDE Beschriftung ausser dem Titel — der Defekt-1-Fall.
+    const r = deriveEventLabelFromNode(node({ text: 'Block' }), { pats, ...geo });
+    assert.equal(r.reason, null);
+    assert.equal(r.source, 'text');
+    assert.equal(r.timeSource, 'geometry');
+    // Spalte 250px -> Index 1 = Dienstag 29.09.; top 620px -> 13:00
+    assert.equal(r.label, 'Block, 13:00 to 15:00, Tuesday, September 29, 2026');
+  });
+
+  test('6) OHNE Geometrie wird NICHT geraten -> reason no-time-source', () => {
+    const r = deriveEventLabelFromNode(node({ text: 'Block' }), { pats });
+    assert.equal(r.label, null);
+    assert.equal(r.reason, 'no-time-source');
+  });
+
+  test('7) Uhrzeit-Indikator bleibt ausgeschlossen', () => {
+    const r = deriveEventLabelFromNode(node({ ariaLabel: 'calendar view, current time: Fri 22:31' }), { pats, ...geo });
+    assert.equal(r.reason, 'clock-indicator');
+    assert.equal(r.label, null);
+  });
+
+  test('8) Arbeitsort-Banner bleibt ausgeschlossen', () => {
+    const r = deriveEventLabelFromNode(node({ text: 'Arbeitsort\n09:00 to 17:00' }), { pats, ...geo });
+    assert.equal(r.reason, 'work-location');
+  });
+
+  test('9) reines Rauschen wird verworfen', () => {
+    assert.equal(deriveEventLabelFromNode(node({ text: 'Work week' }), { pats, ...geo }).reason, 'no-event-signature');
+    assert.equal(deriveEventLabelFromNode(node({}), { pats, ...geo }).reason, 'no-event-signature');
+  });
+
+  test('10) Element OHNE Flaeche wird nie zum Event (rect>0 als Sichtbarkeits-Beweis)', () => {
+    const r = deriveEventLabelFromNode(
+      node({ ariaLabel: 'Block, 13:00 to 18:30, Wednesday, September 30, 2026', area: false, rect: { left: 0, top: 0, width: 0, height: 0 } }),
+      { pats, ...geo }
+    );
+    assert.equal(r.reason, 'no-area');
+  });
+
+  test('11) offsetParent===null ist KEIN Hard-K.O. (Virtualisierung)', () => {
+    const r = deriveEventLabelFromNode(
+      node({ ariaLabel: 'Block, 13:00 to 18:30, Wednesday, September 30, 2026', offsetParentNull: true, area: true }),
+      { pats }
+    );
+    assert.equal(r.reason, null);
+    assert.ok(r.label);
+  });
+});
+
+describe('resolveDataQuality - ehrliche Verifikationsangabe (Defekt 2)', () => {
+  test('verified NUR wenn Woche UND echte Event-Knoten bestaetigt sind', () => {
+    assert.equal(resolveDataQuality({ weekVerified: true, eventElementsFound: 6 }), 'verified');
+  });
+
+  test('Woche ok, aber 0 Event-Knoten -> unverified-empty (KEIN "frei")', () => {
+    // Genau der Smoke-Test-Befund: dataQuality:'verified' bei
+    // eventElementsFound:0 war eine Falschaussage.
+    assert.equal(resolveDataQuality({ weekVerified: true, eventElementsFound: 0 }), 'unverified-empty');
+  });
+
+  test('Woche nicht lesbar -> unverified (unabhaengig von den Events)', () => {
+    assert.equal(resolveDataQuality({ weekVerified: false, eventElementsFound: 6 }), 'unverified');
+    assert.equal(resolveDataQuality({ weekVerified: false, eventElementsFound: 0 }), 'unverified');
+  });
+
+  test('negativ/fehlende Event-Zahl gilt als 0 (nicht als "hat Events")', () => {
+    assert.equal(resolveDataQuality({ weekVerified: true, eventElementsFound: -1 }), 'unverified-empty');
+    assert.equal(resolveDataQuality({ weekVerified: true, eventElementsFound: null }), 'unverified-empty');
+    assert.equal(resolveDataQuality({ weekVerified: true }), 'unverified-empty');
+  });
+
+  test('das dokumentierte Werte-Trio ist geschlossen', () => {
+    assert.deepEqual(DATA_QUALITY_VALUES, ['verified', 'unverified-empty', 'unverified']);
+  });
+
+  test('nur "verified" gilt als belastbare Belegungsaussage', () => {
+    const reliable = (dq) => dq === 'verified';
+    assert.equal(reliable(resolveDataQuality({ weekVerified: true, eventElementsFound: 3 })), true);
+    assert.equal(reliable(resolveDataQuality({ weekVerified: true, eventElementsFound: 0 })), false);
+    assert.equal(reliable(resolveDataQuality({ weekVerified: false, eventElementsFound: 3 })), false);
+  });
+});
+
+describe('resolveEventWaitOutcome - Ausgang an die BEOBACHTUNG koppeln (Defekt 3)', () => {
+  test('Event-Knoten gesehen -> found ( unabhaengig von der Wartezeit)', () => {
+    assert.equal(resolveEventWaitOutcome({ polls: 1, eventElementsFound: 6, waitBudgetMs: 20000 }), 'found');
+  });
+
+  test('0 Event-Knoten NIE "found" — auch nicht bei polls 0 (Smoke-Test-Befund)', () => {
+    // Live-Befund: eventWaitOutcome:"found" bei waitedForEventsMs:0 und
+    // eventElementsFound:0. Genau das darf nicht mehr passieren.
+    assert.notEqual(resolveEventWaitOutcome({ polls: 0, eventElementsFound: 0, waitBudgetMs: 20000 }), 'found');
+    assert.equal(resolveEventWaitOutcome({ polls: 0, eventElementsFound: 0, waitBudgetMs: 20000 }), 'not-found');
+  });
+
+  test('0 Polls + 0 Events -> not-found (Wartephase lief gar nicht)', () => {
+    assert.equal(resolveEventWaitOutcome({ polls: 0, eventElementsFound: 0, waitBudgetMs: 0 }), 'not-found');
+    assert.equal(resolveEventWaitOutcome({ polls: 0, eventElementsFound: 0, waitBudgetMs: null }), 'not-found');
+  });
+
+  test('Polls ohne Treffer -> not-found, das Budget wird getrennt berichtet', () => {
+    assert.equal(resolveEventWaitOutcome({ polls: 40, eventElementsFound: 0, waitBudgetMs: 20000 }), 'not-found');
+  });
+
+  test('Ausgaenge sind genau die dokumentierten Werte', () => {
+    assert.deepEqual(EVENT_WAIT_OUTCOMES, ['found', 'not-found', 'budget-exhausted', 'not-rendered']);
+  });
+
+  test('die Warte-Warnung erklaert not-found genauso deutlich wie budget-exhausted', () => {
+    const w = eventWaitWarning({ outcome: 'not-found', waitedMs: 20000, budgetMs: 20000 });
+    assert.ok(w);
+    assert.ok(/leerer Kalender/.test(w), w);
+  });
+});
+
+describe('collectCalendarEventLabels - Quellen-Leiter + Struktur-Census (Defekt 1)', () => {
+  const fakePage = { evaluate: async (fn, arg) => fn(arg) };
+  const withFakeDocument = async (doc, fn) => {
+    const prev = globalThis.document;
+    globalThis.document = doc;
+    try { return await fn(); } finally { globalThis.document = prev; }
+  };
+  // Minimaler Knoten: der Kollektor darf NICHTS voraussetzen, was ein
+  // unit-test-Fake nicht liefert (tagName/className/innerText/attributes...).
+  const chip = (over = {}) => ({
+    tagName: 'DIV',
+    getAttribute: (n) => (over.attrs && over.attrs[n] !== undefined ? over.attrs[n] : null),
+    getBoundingClientRect: () => over.rect || { left: 0, top: 0, width: 120, height: 24, x: 0, y: 0 },
+    offsetParent: null,
+    innerText: over.text || '',
+    className: over.className || '',
+    attributes: Object.entries(over.attrs || {}).map(([name, value]) => ({ name, value })),
+    childElementCount: 0,
+    children: [],
+    ...over.extra
+  });
+  const emptyDoc = (chips = []) => ({
+    querySelectorAll: (sel) => (sel === null || sel === '*' ? chips : []),
+    querySelector: () => null,
+    body: null
+  });
+
+  test('Event im TITLE statt aria-label wird jetzt gefunden (vorher: 0 Slots)', () => {
+    const doc = emptyDoc([chip({ attrs: { title: 'Urlaub, all day event, Wednesday, September 30, 2026, Busy' } })]);
+    return withFakeDocument(doc, async () => {
+      const res = await collectCalendarEventLabels(fakePage);
+      assert.equal(res.eventElementsFound, 1);
+      assert.equal(res.sourceUsed, 'title');
+      assert.ok(res.labels[0].includes('Urlaub'));
+    });
+  });
+
+  test('Struktur-Census wird IMMER geliefert (auch bei 0 Events) — das ist die Bodenwahrheit', () => {
+    const doc = emptyDoc([]);
+    return withFakeDocument(doc, async () => {
+      const res = await collectCalendarEventLabels(fakePage);
+      assert.ok(Array.isArray(res.sourceTried), 'sourceTried fehlt');
+      assert.ok(res.sourceTried.length >= 2, 'die Leiter muss protokolliert sein');
+      assert.ok(res.census, 'census fehlt');
+      assert.ok(Array.isArray(res.census.scanned), 'census.scanned fehlt');
+    });
+  });
+
+  test('alle Quellen der Leiter werden protokolliert, nicht nur der Gewinner', () => {
+    const doc = emptyDoc([]);
+    return withFakeDocument(doc, async () => {
+      const res = await collectCalendarEventLabels(fakePage);
+      const ids = res.sourceTried.map((s) => s.source || s.id);
+      assert.ok(ids.includes('title'), 'title-Quelle wurde nicht probiert');
+      assert.ok(ids.includes('data-attr'), 'data-attr-Quelle wurde nicht probiert');
+      assert.ok(ids.includes('text'), 'text-Quelle wurde nicht probiert');
+    });
+  });
+
+  test('0 Events -> eventElementsFound 0 und KEIN phantom-found', () => {
+    const doc = emptyDoc([chip({ attrs: { 'aria-label': 'Work week' } })]);
+    return withFakeDocument(doc, async () => {
+      const res = await collectCalendarEventLabels(fakePage);
+      assert.equal(res.eventElementsFound, 0);
+      assert.equal(res.labels.length, 0);
+    });
+  });
+
+  test('evaluate-Fehlschlag liefert eine ehrliche 0-Struktur (kein Absturz, kein false found)', async () => {
+    const brokenPage = { evaluate: async () => { throw new Error('Execution context was destroyed'); } };
+    const res = await collectCalendarEventLabels(brokenPage);
+    assert.equal(res.eventElementsFound, 0);
+    assert.equal(res.labels.length, 0);
+    assert.equal(res.collectError, 'Execution context was destroyed');
   });
 });
