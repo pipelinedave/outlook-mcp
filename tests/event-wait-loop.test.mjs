@@ -494,12 +494,37 @@ describe('Bug 3 — Verdrahtung: getFreeBusy pollt bedingungslos', () => {
     assert.ok(/defaultYear/.test(wiring), 'Labels ohne Jahr brauchen das Fallback-Jahr');
   });
 
+  // MUTATIONSNACHWEIS fuer diesen Draht: mit targetStart: null bleibt die
+  // Testsuite GRUEN (die Funktionen sind dann korrekt, aber der Aufrufer
+  // weekenblind — genau die Konfiguration, die 'wait-target-unknown'
+  // ausloest). Dieser Test schliesst diese Luecke.
   test('BUG 4: die Wartephase bekommt die Zielwoche durchgereicht', () => {
     const i = src.indexOf('const eventWait = await waitForCalendarEvents({');
     assert.ok(i > 0, 'die Wartephase wird gestartet');
     const call = src.slice(i, src.indexOf('});', i) + 3);
     assert.ok(/targetStart: rangeStartDate/.test(call),
       'ohne targetStart meldet die Wartephase wait-target-unknown statt found');
+    // Auch indirekt: ein umbenanntes/verschobenes rangeStartDate darf nicht
+    // unbemerkt durchrutschen.
+    assert.ok(call.includes('targetStart:'), 'der Schluessel selbst muss vorhanden sein');
+    assert.ok(!/targetStart:\s*(null|undefined|0|''|"")/.test(call),
+      'und er darf nicht leer sein — das waere der weekenblinde Aufruf');
+  });
+
+  test('BUG 4: die Wartephase wird mit konfiguriertem Ziel auch wirklich genutzt', async () => {
+    // Fuehrt den ECHTEN Aufrufweg mit dem Ziel nach — der Kern des
+    // Kontrolllaufs. Ohne Ziel: 'wait-target-unknown'. Mit Ziel: datums-
+    // qualifiziertes found.
+    // EVENT_CHIP traegt "Monday, September 28, 2026" -> liegt im Test-Range.
+    const doc = mutableDoc([node(EVENT_CHIP)]);
+    const withTarget = await runWait(doc, { clock: virtualClock() });
+    assert.equal(withTarget.abortReason, null, 'mit Ziel wird belegt');
+    assert.equal(withTarget.dateQualified, true);
+
+    const withoutTarget = await runWait(doc, { clock: virtualClock(), targetStart: null, range: null });
+    assert.equal(withoutTarget.abortReason, EVENT_WAIT_ABORT_REASONS.targetUnknown,
+      'ohne Ziel wird der Konfigurationsfehler benannt, nicht still gepollt');
+    assert.equal(withoutTarget.dateQualified, false);
   });
 
   test('BUG 4: die Range-Werte werden VOR der Wartephase berechnet (keine TDZ)', () => {
