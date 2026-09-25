@@ -184,6 +184,25 @@ export function parseWeekHeaderText(text, now = new Date()) {
     }
   }
 
+  // EN-Tages-zuerst-Muster (OWA-Live-Format Runde 4): "28 September – 4 October, 2026"
+  // bzw. "28 September – 4 October 2026". Der ECHTE sichtbare Wochen-Header von
+  // outlook.cloud.microsoft ist TAGES-zuerst und OHNE Punkt nach dem Tag — weder das
+  // DE- noch das EN- noch das numerische Muster griffen hier. Root Cause Runde 4:
+  // Dadurch fiel die Erkennung auf ein (stale) Event-Label zurück.
+  const enDayFirst = t.match(/(\d{1,2})\s+([A-Za-zäöüÄÖÜß]{3,})\.?(?:,?\s*(\d{4}))?\s*[–—-]\s*(\d{1,2})\s+([A-Za-zäöüÄÖÜß]{3,})\.?(?:,?\s*(\d{4}))?/);
+  if (enDayFirst) {
+    const startMonth = MONTH_NAMES[enDayFirst[2].toLowerCase()];
+    const endMonth = MONTH_NAMES[enDayFirst[5].toLowerCase()];
+    if (startMonth !== undefined && endMonth !== undefined) {
+      const y1 = enDayFirst[3] ? parseInt(enDayFirst[3], 10) : (enDayFirst[6] ? parseInt(enDayFirst[6], 10) : currentYear);
+      const y2 = enDayFirst[6] ? parseInt(enDayFirst[6], 10) : y1;
+      let s = new Date(y1, startMonth, parseInt(enDayFirst[1], 10));
+      let e = new Date(y2, endMonth, parseInt(enDayFirst[4], 10));
+      if (e < s) e = new Date(y2 + 1, endMonth, parseInt(enDayFirst[4], 10));
+      return { startDate: toIsoDate(s), endDate: toIsoDate(e) };
+    }
+  }
+
   // Numerisches Muster: "28.9. – 4.10.2026" / "28.9. - 4.10." (OWA rendert den
   // Wochen-Header je nach Locale/Build numerisch statt mit Monatsnamen).
   const num = t.match(/(\d{1,2})\.(\d{1,2})\.?(?:(\d{4}))?\s*[–—-]\s*(\d{1,2})\.(\d{1,2})\.?(?:(\d{4}))?/);
@@ -224,6 +243,114 @@ export function parseNumericDayHeaderText(text, now = new Date()) {
   return `${year}-${pad(month)}-${pad(day)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Strikte Header-/Event-Trennung (Iteration 5, Live-Befund Runde 4 vom 25.09.):
+// Die Header-Erkennung griff ein stale/hidden All-Day-Event-Label ("Urlaub …
+// September 23") statt des sichtbaren Wochen-Headers. Event-Labels tragen
+// Event-Signaturen (Zeitfenster, Ganztag, Statuswort+Datum) und dürfen NIE als
+// Wochen-Header akzeptiert werden.
+// ---------------------------------------------------------------------------
+
+// Erkennt Event-Signaturen in einem ARIA-Label/Text. Reine Funktion (unit-testbar).
+//  - Zeitfenster: "09:00 to 12:00" / "14:00 bis 15:00" / "9:00 AM - 10:00 AM"
+//  - Ganztag: "all day event" / "all-day" / "ganztägig" / "ganztages"
+//  - Statuswort (Busy|Tentative|Free|Besetzt|Vorbehalt|Frei) ZUSAMMEN mit einem Datum
+export function isCalendarEventLabel(text) {
+  if (!text) return false;
+  const t = String(text);
+  const timeRangeRe = /\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:to|bis|[–—-])\s*\d{1,2}:\d{2}/i;
+  if (timeRangeRe.test(t)) return true;
+  const allDayRe = /all[- ]?day|ganztägig|ganztages/i;
+  if (allDayRe.test(t)) return true;
+  const statusRe = /\b(busy|tentative|free|besetzt|vorbehalt|frei)\b/i;
+  const dateRe = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})|(\d{1,2}\s+[A-Za-zäöüÄÖÜß]{3,})/;
+  return statusRe.test(t) && dateRe.test(t);
+}
+
+// Filtert Event-Labels aus einer Kandidatenliste (Header dürfen keine Events sein).
+export function filterCalendarHeaderCandidates(texts = []) {
+  return (texts || []).filter((t) => !isCalendarEventLabel(t));
+}
+
+// Sichtbarkeits-Prädikat (Spiegel der Browser-Logik in collectCalendarCandidates).
+// offsetParent === null bedeutet hidden — AUSSER bei position:fixed (dort ist
+// offsetParent per Spezifikation null, das Element kann aber sichtbar sein).
+// Zusätzlich muss die Bounding-Box echte Fläche haben (Breite/Höhe > 0).
+export function isVisibleCalendarElement({ offsetParent = null, position = 'static', rect = null } = {}) {
+  if (offsetParent === null && position !== 'fixed') return false;
+  return Boolean(rect && rect.width > 0 && rect.height > 0);
+}
+
+// Parst die Wochennummer aus einem Prev/Next-Button-Label ("… (Week 39)" / "(KW 39)").
+export function parseWeekNumberFromNav(text) {
+  if (!text) return null;
+  const m = String(text).match(/\((?:Week|KW)\s*(\d{1,2})\)/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return n >= 1 && n <= 53 ? n : null;
+}
+
+// Parst den Datumsbereich eines Prev/Next-Button-Labels ("21–27 September, 2026").
+export function parseNavWeekRange(text, now = new Date()) {
+  if (!text) return null;
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  const m = t.match(/(\d{1,2})\s*[–—-]\s*(\d{1,2})\s+([A-Za-zäöüÄÖÜß]{3,})\.?(?:,?\s*(\d{4}))?/);
+  if (!m) return null;
+  const month = MONTH_NAMES[m[3].toLowerCase()];
+  if (month === undefined) return null;
+  const year = m[4] ? parseInt(m[4], 10) : now.getFullYear();
+  const start = new Date(year, month, parseInt(m[1], 10));
+  const end = new Date(year, month, parseInt(m[2], 10));
+  if (end < start) end.setFullYear(year + 1);
+  return { startDate: toIsoDate(start), endDate: toIsoDate(end) };
+}
+
+// Montag der ISO-Woche (für den Fall, dass nur "(Week NN)" ohne Datumsbereich vorliegt).
+export function isoWeekMonday(week, year) {
+  const jan4 = new Date(year, 0, 4);
+  const jan4Day = jan4.getDay() || 7; // Mo=1 … So=7
+  const week1Monday = new Date(jan4.getTime() - (jan4Day - 1) * 86400000);
+  return new Date(week1Monday.getTime() + (week - 1) * 7 * 86400000);
+}
+
+// Leitet die ANGEZEIGTE Woche aus den Prev/Next-Button-Labels ab (belastbarer
+// Fallback, Runde-4-Forderung 2): Die angezeigte Woche liegt ZWISCHEN prev und
+// next. Bevorzugt werden die Datumsbereiche (Montag = Tag nach prev.endDate,
+// Sonntag = Tag vor next.startDate); die "(Week NN)"-Angabe dient als Signal
+// und als alleinige Quelle, wenn keine Datumsbereiche lesbar sind.
+export function resolveWeekFromNavButtons(navTexts = [], now = new Date()) {
+  const list = (navTexts || []).filter(Boolean);
+  const prevText = list.find((t) => /previous|vorherige|zurück|prev\b/i.test(t));
+  const nextText = list.find((t) => /\bnext\b|nächste|nächsten/i.test(t));
+
+  let weekNumber = null;
+  const prevNum = parseWeekNumberFromNav(prevText);
+  const nextNum = parseWeekNumberFromNav(nextText);
+  if (prevNum != null) weekNumber = prevNum + 1;
+  else if (nextNum != null) weekNumber = nextNum - 1;
+
+  let startDate = null;
+  let endDate = null;
+  const prevRange = parseNavWeekRange(prevText, now);
+  const nextRange = parseNavWeekRange(nextText, now);
+  if (prevRange) startDate = toIsoDate(new Date(new Date(prevRange.endDate + 'T00:00:00').getTime() + 86400000));
+  if (nextRange) endDate = toIsoDate(new Date(new Date(nextRange.startDate + 'T00:00:00').getTime() - 86400000));
+  if (!startDate && endDate) startDate = toIsoDate(new Date(new Date(endDate + 'T00:00:00').getTime() - 6 * 86400000));
+  if (startDate && !endDate) endDate = toIsoDate(new Date(new Date(startDate + 'T00:00:00').getTime() + 6 * 86400000));
+  if (!startDate && weekNumber != null) {
+    const monday = isoWeekMonday(weekNumber, now.getFullYear());
+    startDate = toIsoDate(monday);
+    endDate = toIsoDate(new Date(monday.getTime() + 6 * 86400000));
+  }
+  if (!startDate && weekNumber == null) return null;
+  return {
+    text: (prevText || nextText || '').slice(0, 200),
+    startDate,
+    endDate,
+    weekNumber
+  };
+}
+
 // Sammelt rohe Kandidaten-Texte und Diagnostik-Rohdaten aus der gerenderten
 // Kalenderansicht (Browser-seitig, OHNE Interpretation). Die Wochen-Erkennung
 // passiert deterministisch in resolveRenderedWeekFromCandidates.
@@ -239,15 +366,43 @@ export async function collectCalendarCandidates(page) {
       const s = String(t || '').replace(/\s+/g, ' ').trim();
       if (s && arr.indexOf(s) === -1) arr.push(s);
     };
+    // Sichtbarkeit (Runde-4-Root-Cause): stale/virtualisierte Elemente (z.B. der
+    // alte September-23-Header) sind hidden oder haben keine Fläche und dürfen
+    // NICHT als Header gewertet werden. Spiegel von isVisibleCalendarElement().
+    const isVisible = (el) => {
+      if (!el) return false;
+      try {
+        const cs = window.getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+        if (el.offsetParent === null && cs.position !== 'fixed') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      } catch (e) { return false; }
+    };
+    // Event-Signaturen (Runde-4-Root-Cause): Zeitfenster, Ganztag oder
+    // Statuswort+Datum -> Event, KEIN Header. Spiegel von isCalendarEventLabel().
+    const isEventLabel = (text) => {
+      const t = String(text || '');
+      if (/\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:to|bis|[–—-])\s*\d{1,2}:\d{2}/i.test(t)) return true;
+      if (/all[- ]?day|ganztägig|ganztages/i.test(t)) return true;
+      const statusRe = /\b(busy|tentative|free|besetzt|vorbehalt|frei)\b/i;
+      const dateRe = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})|(\d{1,2}\s+[A-Za-zäöüÄÖÜß]{3,})/;
+      return statusRe.test(t) && dateRe.test(t);
+    };
     const headerTexts = [];
     const dayHeaderTexts = [];
-    // Datums-/Monatsmuster (DE + EN): "28. September" bzw. "September 28"
-    const dateish = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})/;
+    const navTexts = [];
+    // Datums-/Monatsmuster (DE + EN + Tages-zuerst): "28. September", "September 28",
+    // "28 September" (OWA-Live-Format Runde 4).
+    const dateish = /(\d{1,2}\.\s*[A-Za-zäöüÄÖÜß]{3,})|([A-Za-zäöüÄÖÜß]{3,}\.?\s+\d{1,2})|(\d{1,2}\s+[A-Za-zäöüÄÖÜß]{3,})/;
     const timeRe = /\d{1,2}:\d{2}/;
 
-    // 1) Klassische Header-Rollen (Banner/Überschriften)
+    // 1) Klassische Header-Rollen (Banner/Überschriften) — nur sichtbare, keine Events
     for (const el of document.querySelectorAll('[role="banner"], [role="heading"], h1, h2')) {
-      push(headerTexts, el.getAttribute('aria-label') || el.innerText);
+      if (!isVisible(el)) continue;
+      const text = el.getAttribute('aria-label') || el.innerText;
+      if (isEventLabel(text)) continue;
+      push(headerTexts, text);
     }
     // 2) Toolbar-/Button-Elemente mit Datums-Label: OWA rendert den Wochenbereich als
     //    klickbaren Datums-Button. Der Ansichtsumschalter ("Work week"/"Arbeitswoche")
@@ -255,21 +410,36 @@ export async function collectCalendarCandidates(page) {
     for (const el of document.querySelectorAll(
       '[role="banner"] button, [role="banner"] [role="button"], header button, [role="toolbar"] button, [role="toolbar"] [role="button"]'
     )) {
+      if (!isVisible(el)) continue;
       const label = el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '';
-      if (dateish.test(label) && !timeRe.test(label)) push(headerTexts, label);
+      if (dateish.test(label) && !timeRe.test(label) && !isEventLabel(label)) push(headerTexts, label);
     }
     // 3) Alle aria-labels mit Datums-/Monatsmuster, aber OHNE Uhrzeit (z.B. der
-    //    Datumsauswahl-Button). Zeitmuster-Labels sind Event-Elemente, keine Header.
+    //    Datumsauswahl-Button). Zeitmuster-/Event-Labels sind Event-Elemente, keine Header.
     for (const el of document.querySelectorAll('[aria-label]')) {
+      if (!isVisible(el)) continue;
       const label = el.getAttribute('aria-label') || '';
-      if (dateish.test(label) && !timeRe.test(label) && label.length <= 120) push(headerTexts, label);
+      if (dateish.test(label) && !timeRe.test(label) && label.length <= 120 && !isEventLabel(label)) push(headerTexts, label);
+    }
+    // 3b) Prev/Next-Wochen-Buttons (belastbarer Fallback für die Wochen-Ableitung):
+    //     "Go to previous week 21–27 September, 2026 (Week 39)" / "… (Week 41)".
+    for (const el of document.querySelectorAll('[aria-label], [title]')) {
+      if (!isVisible(el)) continue;
+      const label = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+      if (/(previous|next|vorherige|nächste|nächsten)\s+week|week\s+(previous|next)|woche/i.test(label) &&
+          /(week|kw)\s*\d{1,2}/i.test(label)) {
+        push(navTexts, label);
+      }
     }
     // 4) Tages-Spaltenköpfe der Woche — mehrere Selektor-Varianten (OWA nutzt je nach
     //    Build role="columnheader", th-Elemente oder Grid-Köpfe)
     for (const el of document.querySelectorAll(
       '[role="columnheader"], [role="grid"] [role="columnheader"], th, [role="grid"] th'
     )) {
-      push(dayHeaderTexts, el.getAttribute('aria-label') || el.innerText);
+      if (!isVisible(el)) continue;
+      const text = el.getAttribute('aria-label') || el.innerText;
+      if (isEventLabel(text)) continue;
+      push(dayHeaderTexts, text);
     }
     // 5) Body-Text-Heuristik: Zeilen mit Wochentag + Datum ("Montag, 28. September",
     //    "Montag 28.9.") ODER Wochen-Range-Muster — Fallback, falls die Spaltenköpfe
@@ -283,6 +453,7 @@ export async function collectCalendarCandidates(page) {
       for (const line of lines) {
         const s = line.trim();
         if (!s || s.length > 60) continue;
+        if (isEventLabel(s)) continue;
         if ((weekdayRe.test(s) && lineDateRe.test(s)) || rangeRe.test(s)) push(dayHeaderTexts, s);
         if (dayHeaderTexts.length >= 12) break;
       }
@@ -301,63 +472,76 @@ export async function collectCalendarCandidates(page) {
     return {
       headerTexts: cap(headerTexts, 20),
       dayHeaderTexts: cap(dayHeaderTexts, 20),
+      navTexts: cap(navTexts, 10),
       ariaButtonCount: buttons.length,
       ariaLabelSample
     };
-  }).catch(() => ({ headerTexts: [], dayHeaderTexts: [], ariaButtonCount: 0, ariaLabelSample: [] }));
+  }).catch(() => ({ headerTexts: [], dayHeaderTexts: [], navTexts: [], ariaButtonCount: 0, ariaLabelSample: [] }));
 }
 
 // Löst aus den gesammelten Kandidaten-Texten die gerenderte Kalenderwoche auf.
 // Reine Funktion (unit-testbar). Erkennungs-Reihenfolge (spezifisch zuerst):
 //  1. Wochen-Range-Header mit Monatsnamen ODER numerisch ("28. September – 4. Oktober",
-//     "28.9. – 4.10.2026")
-//  2. Einzel-Datum mit Monatsnamen (Toolbar-Datumsbutton, "Montag, 28. September")
-//  3. Numerische Tagesangaben ("Montag 28.9." / "28.9.2026")
-// Rückgabe: { text, startDate, endDate } — bei NICHTS Datierbarem sind alle Felder null.
-// Der Ansichtsumschalter ("Work week") hat kein Datums-/Monatsmuster und kann daher NIE
-// als gerenderte Woche durchkommen (Live-Fail 24.09.2026).
-export function resolveRenderedWeekFromCandidates({ headerTexts = [], dayHeaderTexts = [] } = {}, now = new Date()) {
+//     "28 September – 4 October, 2026", "28.9. – 4.10.2026")
+//  2. Prev/Next-Button-Ableitung ("… (Week 39)" / "… (Week 41)" -> Woche 40)
+//  3. Einzel-Datum mit Monatsnamen (Toolbar-Datumsbutton, "Montag, 28. September")
+//  4. Numerische Tagesangaben ("Montag 28.9." / "28.9.2026")
+// Rückgabe: { text, startDate, endDate, weekNumber } — bei NICHTS Datierbarem sind
+// alle Felder null. Event-Labels (Zeitfenster/Ganztag/Statuswort+Datum) werden strikt
+// ausgefiltert und können NIE als gerenderte Woche durchkommen (Live-Fail Runde 4:
+// stale All-Day-Event "Urlaub … September 23" wurde fälschlich als Header gelesen).
+export function resolveRenderedWeekFromCandidates({ headerTexts = [], dayHeaderTexts = [], navTexts = [] } = {}, now = new Date()) {
   // Aus einem Einzel-Datum die OWA-Wochenansicht (Montag–Sonntag) ableiten.
   const deriveWeek = (dateIso, text) => {
     const d = new Date(dateIso + 'T00:00:00');
     const offsetToMonday = d.getDay() === 0 ? -6 : 1 - d.getDay();
     const monday = new Date(d.getTime() + offsetToMonday * 86400000);
     const sunday = new Date(monday.getTime() + 6 * 86400000);
-    return { text: String(text).slice(0, 200), startDate: toIsoDate(monday), endDate: toIsoDate(sunday) };
+    return { text: String(text).slice(0, 200), startDate: toIsoDate(monday), endDate: toIsoDate(sunday), weekNumber: null };
   };
   const currentYear = now.getFullYear();
 
+  // Event-Labels strikt ausschließen (Runde-4-Root-Cause): Ein All-Day-Event
+  // ("Urlaub … September 23") darf NIE als Wochen-Header durchkommen.
+  const headers = filterCalendarHeaderCandidates(headerTexts);
+  const dayHeaders = filterCalendarHeaderCandidates(dayHeaderTexts);
+
   // 1) Wochen-Range-Header (Header-Bereich zuerst, dann Tageskopf-/Body-Kandidaten)
-  for (const text of headerTexts) {
+  for (const text of headers) {
     const parsed = parseWeekHeaderText(text, now);
-    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate };
+    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate, weekNumber: null };
   }
-  for (const text of dayHeaderTexts) {
+  for (const text of dayHeaders) {
     const parsed = parseWeekHeaderText(text, now);
-    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate };
+    if (parsed) return { text: text.slice(0, 200), startDate: parsed.startDate, endDate: parsed.endDate, weekNumber: null };
   }
-  // 2) Einzel-Datum mit Monatsnamen
-  for (const text of headerTexts) {
+  // 2) Prev/Next-Button-Ableitung (belastbarer Fallback, Runde-4-Forderung 2)
+  const nav = resolveWeekFromNavButtons(navTexts, now);
+  if (nav && nav.startDate) {
+    return { text: nav.text, startDate: nav.startDate, endDate: nav.endDate, weekNumber: nav.weekNumber };
+  }
+  // 3) Einzel-Datum mit Monatsnamen
+  for (const text of headers) {
     const slot = parseEventLabel(text, currentYear);
     if (slot && slot.date) return deriveWeek(slot.date, text);
   }
-  for (const text of dayHeaderTexts) {
+  for (const text of dayHeaders) {
     const slot = parseEventLabel(text, currentYear);
     if (slot && slot.date) return deriveWeek(slot.date, text);
   }
-  // 3) Numerische Tagesangaben (Spaltenköpfe + kurze Header-Texte)
-  for (const text of dayHeaderTexts) {
+  // 4) Numerische Tagesangaben (Spaltenköpfe + kurze Header-Texte)
+  for (const text of dayHeaders) {
     const dateIso = parseNumericDayHeaderText(text, now);
     if (dateIso) return deriveWeek(dateIso, text);
   }
-  for (const text of headerTexts) {
+  for (const text of headers) {
     if (String(text).length > 60) continue; // lange Texte nur mit stärkerem Muster akzeptieren
     const dateIso = parseNumericDayHeaderText(text, now);
     if (dateIso) return deriveWeek(dateIso, text);
   }
 
   // Nichts Datierbares gefunden -> bewusst NULL zurückgeben (kein "Work week"-Fehlgreifer).
-  return { text: null, startDate: null, endDate: null };
+  return { text: null, startDate: null, endDate: null, weekNumber: null };
 }
 
 // Liest die gerenderte Kalenderwoche aus der OWA-Wochenansicht aus.
@@ -380,6 +564,7 @@ export async function collectCalendarDiagnostics(page) {
     url,
     headerCandidates: collected.headerTexts,
     dayHeaderCandidates: collected.dayHeaderTexts,
+    weekNavCandidates: collected.navTexts,
     ariaButtonCount: collected.ariaButtonCount,
     ariaLabelSample: collected.ariaLabelSample
   };
@@ -395,6 +580,7 @@ export function formatCalendarDiagnostics(diag) {
     `URL: ${diag.url || 'unbekannt'}`,
     `Header-Kandidaten: ${fmtList(diag.headerCandidates, 8)}`,
     `Tageskopf-Kandidaten: ${fmtList(diag.dayHeaderCandidates, 8)}`,
+    `Wochen-Nav-Kandidaten: ${fmtList(diag.weekNavCandidates, 4)}`,
     `ARIA-Buttons gesamt: ${diag.ariaButtonCount ?? '?'}`,
     `ARIA-Label-Sample: ${fmtList(diag.ariaLabelSample, 15)}`
   ].join('\n');
@@ -488,12 +674,20 @@ export function shouldTryNextCandidate(verified) {
   return verified === 'unchanged';
 }
 
+// Präzise Abbruch-Ursache nach erfolgloser Button-Navigation (Runde-4-Forderung 3):
+// Wurde überhaupt ein Button gefunden/geklickt, aber der Header blieb unverändert,
+// ist es 'button-ineffective' — NICHT 'no-week-button' (der Button existierte ja).
+// Nur wenn KEIN Kandidat gefunden wurde, ist es 'no-week-button'.
+export function classifyButtonFailure({ foundAny = false, clickedAny = false } = {}) {
+  return (foundAny || clickedAny) ? 'button-ineffective' : 'no-week-button';
+}
+
 // Assembliert die FreeBusy-Diagnostik für Fehler-/unverified-Responses
 // (Runde-4-Forderung B): Der frühe Snapshot (direkt nach Navigation erhoben)
 // bleibt immer erhalten, auch wenn das Budget für eine frische Erhebung nicht
 // mehr reicht. Klick-Protokoll, Abbruchgrund und Budget-Report kommen hinzu.
 export function assembleFreeBusyDiagnostics({ fresh = null, early = null, weekButtonProbe = [], abortReason = 'none', budget = null } = {}) {
-  const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
+  const base = fresh || early || { url: '', headerCandidates: [], dayHeaderCandidates: [], weekNavCandidates: [], ariaButtonCount: 0, ariaLabelSample: [] };
   const out = {
     ...base,
     weekButtonProbe,
@@ -1198,6 +1392,8 @@ export class OwaClient {
     // der nächste Kandidat versucht; bei 'unverified' nie (Doppel-Klick-Gefahr,
     // falls der erste Klick doch gewirkt hat).
     const clickWeekButton = async (direction, prevStart) => {
+      let foundAny = false;
+      let clickedAny = false;
       for (const cand of weekButtonCandidates(direction)) {
         if (remaining() < CLICK_COST_MS) {
           weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: null, clicked: false, note: 'Budget aufgebraucht' });
@@ -1213,18 +1409,20 @@ export class OwaClient {
           weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: false, clicked: false });
           continue;
         }
+        foundAny = true;
         try {
           await loc.click({ timeout: Math.min(2000, Math.max(100, remaining())) });
         } catch (e) {
           weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: false, clickError: String((e && e.message) || e).slice(0, 120) });
           continue;
         }
+        clickedAny = true;
         const r = await waitRenderAfterClick(prevStart, phase(FREEBUSY_CLICK_RENDER_WAIT_MS));
         weekButtonProbe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified });
         if (shouldTryNextCandidate(r.verified)) continue; // wirkungslos -> nächster Kandidat
-        return { clicked: true, week: r.week, verified: r.verified };
+        return { clicked: true, week: r.week, verified: r.verified, foundAny, clickedAny };
       }
-      return { clicked: false, week: null, verified: 'not-found' };
+      return { clicked: false, week: null, verified: 'not-found', foundAny, clickedAny };
     };
 
     // Wartet nach einem Button-Klick auf das Re-Render und BEWERTET die Änderung
@@ -1378,7 +1576,9 @@ export class OwaClient {
           hasEvents = hasEvents || retry.hasEvents;
           continue;
         }
-        abortReason = 'no-week-button';
+        // Präzise Ursache (Runde-4-Forderung 3): Button gefunden/geklickt, aber
+        // Header unverändert -> 'button-ineffective'; gar kein Button -> 'no-week-button'.
+        abortReason = classifyButtonFailure(r);
         break;
       }
       buttonClicks++;
@@ -1396,7 +1596,7 @@ export class OwaClient {
         fresh: await freshDiag(),
         early: earlyDiagnostics,
         weekButtonProbe,
-        abortReason: abortReason !== 'none' ? abortReason : 'wrong-week',
+        abortReason: abortReason !== 'none' ? abortReason : 'week-mismatch',
         budget: freeBusyBudgetReport()
       });
       return errorResult(
@@ -1502,7 +1702,8 @@ export class OwaClient {
     let note = 'Busy-Slots aus ARIA-Labels der Kalender-Event-Elemente der Wochenansicht extrahiert ' +
       '(Datum/Zeit strukturiert geparst, Work-Location-Pseudo-Slots entfernt, Zeit-Duplikate zusammengeführt, ' +
       'per Wortliste klassifiziert, auf den angefragten Zeitraum gefiltert). ' +
-      'Navigation: startdate-Param nur als Optimierung, Zielwoche wird per Button-Navigation angesteuert und verifiziert.';
+      'Navigation: startdate-Param ist Primärsignal — bestätigt der sichtbare Wochen-Header (Range oder ' +
+      'Prev/Next-Ableitung) die Zielwoche, sind KEINE Button-Klicks nötig; Buttons nur bei Abweichung.';
     if (dataQuality === 'unverified') {
       note += ' WARNUNG: Wochen-Header konnte nicht verifiziert werden — Daten ggf. unvollständig oder aus der falschen Woche.';
     }
