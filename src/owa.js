@@ -4460,6 +4460,301 @@ export class OwaClient {
     return result;
   }
 
+  // ===========================================================================
+  // READ-ONLY Kalender-LESE-Tool (gbrain #5916 / otto Termin-Briefings):
+  // outlook_list_calendar_events.
+  //
+  // Liste ALLER Termine (nicht nur Busy-Slots) im angefragten Zeitraum —
+  // Titel, Datum, Start/Ende, Ganztag-Flag, Status. Bewusst READ-ONLY: es
+  // wird nur navigiert/gelesen, nichts angelegt, geaendert oder geloescht.
+  //
+  // Implementierung: nutzt die SELBEN verifizierten Navigations-Primitive wie
+  // getFreeBusy (weekViewState/waitForWeekViewReady/runWeekButtonClick), aber
+  // mit einem schlankeren, aufs Lesen zugeschnittenen Pfad. Im Gegensatz zu
+  // getFreeBusy werden ALLE Event-Knoten zurueckgegeben (busy, free,
+  // tentative, Ganztag) statt nur die Busy-Slots.
+  //
+  // Ehrlichkeits-Garantien (im Stil der restlichen Kalender-Tools):
+  //  - Die Zielwoche wird ausschliesslich am ANGEZEIGTEN Wochen-Header
+  //    verifiziert (renderedWeekContains). Falsche Wochen liefern KEINE Daten.
+  //  - dataQuality 'verified' nur, wenn die Woche verifiziert UND Event-Knoten
+  //    gelesen wurden; sonst wird das ehrlich als unzuverlaessig ausgewiesen.
+  //  - Pseudo-Slots (Arbeitsort, "(ohne Titel)", URLs) werden entfernt.
+  //  - timespanText nennt den angefragten Zeitraum als Vorlage fuer Briefings.
+  // ===========================================================================
+  async listCalendarEvents({ start, end } = {}) {
+    if (!start || !end) {
+      throw new Error('Parameter "start" und "end" sind erforderlich.');
+    }
+
+    const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
+    this.lastPage = page;
+
+    const startDt = normalizeCalendarDate(start) || start;
+    const endDt = normalizeCalendarDate(end) || end;
+    const rangeStartDate = String(startDt).slice(0, 10);
+    const rangeEndDate = String(endDt).slice(0, 10);
+    const defaultYear = parseInt(rangeStartDate.slice(0, 4), 10);
+
+    // Zielwoche: Montag der Woche, die das Startdatum enthaelt (OWA beginnt montags).
+    const startDateObj = new Date(rangeStartDate + 'T00:00:00');
+    const weekday = startDateObj.getDay(); // 0 = Sonntag
+    const offsetToMonday = weekday === 0 ? -6 : 1 - weekday;
+    const mondayIso = toIsoDate(new Date(startDateObj.getTime() + offsetToMonday * 86400000));
+
+    const optimizedUrl = buildCalendarWeekUrl(this.realm, mondayIso);
+    const provenUrl = this.realm
+      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+      : 'https://outlook.office.com/calendar/view/week';
+
+    // Hartes Gesamtbudget (sicher unter dem MCP-Client-Timeout), analog getFreeBusy.
+    const budgetStart = Date.now();
+    const deadline = budgetStart + 45000;
+    const remaining = () => deadline - Date.now();
+    const phase = (capMs) => phaseBudgetMs(remaining(), capMs);
+    const CLICK_COST_MS = 1500 + FREEBUSY_CLICK_RENDER_WAIT_MS;
+
+    const waitOnCalendarUrl = async (budgetMs) => {
+      const urlDeadline = Date.now() + budgetMs;
+      while (Date.now() < urlDeadline) {
+        if ((page.url() || '').includes('/calendar')) return true;
+        if (Date.now() + 500 > urlDeadline) break;
+        await page.waitForTimeout(500);
+      }
+      return (page.url() || '').includes('/calendar');
+    };
+    const gotoCalendar = async (url) => {
+      const gotoBudget = phase(12000);
+      if (gotoBudget <= 0) return false;
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: gotoBudget }).catch(() => null);
+      return waitOnCalendarUrl(phase(4000));
+    };
+
+    let onCalendar = await gotoCalendar(optimizedUrl);
+    if (!onCalendar) onCalendar = await gotoCalendar(provenUrl);
+    if (!onCalendar) {
+      throw new Error(`Kalender-Tab konnte nicht erreicht werden (URL: ${page.url() || 'unbekannt'}). ` +
+        'Möglicherweise ist die Session abgelaufen — bitte outlook_login erneut ausführen.');
+    }
+
+    let rendered = { text: null, startDate: null, endDate: null };
+    // Zustandswarten auf gerenderten Wochen-Header/Event-Grid (500ms Poll).
+    const EVENT_GRACE_MS = 2500;
+    const waitForCalendarRendered = async (budgetMs) => {
+      const waitDeadline = Date.now() + Math.min(budgetMs, Math.max(0, remaining()));
+      let headerSeenAt = null;
+      let eventsSeenAt = null;
+      let events = false;
+      while (Date.now() < waitDeadline) {
+        const week = await readRenderedCalendarWeek(page);
+        const probe = await collectCalendarEventLabels(page, {
+          preferSelector: null, weekStartIso: mondayIso, fast: true
+        });
+        events = probe.eventElementsFound > 0;
+        if (week.startDate) {
+          if (!headerSeenAt) headerSeenAt = Date.now();
+          if (events || Date.now() - headerSeenAt >= EVENT_GRACE_MS) {
+            rendered = week;
+            return { rendered: week, hasEvents: events };
+          }
+        } else if (events) {
+          if (!eventsSeenAt) eventsSeenAt = Date.now();
+          if (Date.now() - eventsSeenAt >= EVENT_GRACE_MS) {
+            rendered = week;
+            return { rendered: week, hasEvents: events };
+          }
+        }
+        if (Date.now() + 500 > waitDeadline) break;
+        await page.waitForTimeout(500);
+      }
+      rendered = await readRenderedCalendarWeek(page);
+      return { rendered, hasEvents: events };
+    };
+
+    await waitForCalendarRendered(phase(8000));
+
+    let hasEvents = Boolean(rendered.startDate);
+    const weekButtonProbe = [];
+    let viewWaitMsSpent = 0;
+    const waitForReady = async () => {
+      const w = await waitForWeekViewReady({
+        readWeek: () => readRenderedCalendarWeek(page),
+        readEvents: () => collectCalendarEventLabels(page, { weekStartIso: mondayIso, fast: true })
+          .then((r) => ({ loading: r.loading === true })),
+        budgetMs: phase(FREEBUSY_VIEW_WAIT_BUDGET_MS),
+        pollMs: FREEBUSY_EVENT_WAIT_POLL_MS,
+        settleMs: FREEBUSY_EVENT_WAIT_SETTLE_MS,
+        targetStart: rangeStartDate,
+        sleep: (ms) => page.waitForTimeout(ms)
+      });
+      viewWaitMsSpent += Math.round(w.waitedMs || 0);
+      rendered = w.rendered || rendered;
+      hasEvents = hasEvents || w.state === WEEK_VIEW_STATES.targetWeek;
+      return w;
+    };
+    const waitRenderAfterClick = async (prevStart) => {
+      const waitDeadline = Date.now() + Math.min(FREEBUSY_CLICK_RENDER_WAIT_MS, Math.max(0, remaining()));
+      let week = { text: null, startDate: null, endDate: null };
+      while (Date.now() < waitDeadline) {
+        week = await readRenderedCalendarWeek(page);
+        if (week.startDate) break;
+        if (Date.now() + 500 > waitDeadline) break;
+        await page.waitForTimeout(500);
+      }
+      return { week, verified: evaluateClickVerification(prevStart, week) };
+    };
+
+    // Gerichtete, verifizierte, begrenzte Wochen-Navigation (max. 2 Klicks).
+    let abortReason = 'none';
+    let lastClickDirection = null;
+    let weekConfirmedAfterClick = false;
+    const MAX_BUTTON_CLICKS = 2;
+    let buttonClicks = 0;
+    for (let step = 0; step < 30; step++) {
+      const view = weekViewState({ rendered, targetStart: rangeStartDate });
+      if (view.state === WEEK_VIEW_STATES.targetWeek) break;
+      if (remaining() <= 0) { abortReason = 'budget'; break; }
+      if (view.state === WEEK_VIEW_STATES.notReady) {
+        await waitForReady();
+        if (weekViewState({ rendered, targetStart: rangeStartDate }).state === WEEK_VIEW_STATES.targetWeek) break;
+        abortReason = 'view-not-ready';
+        break;
+      }
+      const deltaWeeks = Math.round(
+        (new Date(mondayIso + 'T00:00:00') - new Date(rendered.startDate + 'T00:00:00')) / (7 * 86400000)
+      );
+      if (deltaWeeks === 0) break;
+      if (buttonClicks >= MAX_BUTTON_CLICKS) { abortReason = 'max-clicks'; break; }
+      if (Math.abs(deltaWeeks) > MAX_BUTTON_CLICKS) { abortReason = 'too-far'; break; }
+      if (remaining() < CLICK_COST_MS) { abortReason = 'budget'; break; }
+      const direction = Math.sign(deltaWeeks);
+      if (!canClickSameDirection({ lastClickDirection, direction, weekConfirmedAfterClick })) {
+        abortReason = 'same-direction-unconfirmed';
+        break;
+      }
+      const r = await runWeekButtonClick({
+        direction,
+        prevStart: rendered.startDate,
+        targetStart: rangeStartDate,
+        page,
+        probe: weekButtonProbe,
+        readWeek: () => readRenderedCalendarWeek(page),
+        afterClick: (prev) => waitRenderAfterClick(prev),
+        clickWaitMs: FREEBUSY_CLICK_RENDER_WAIT_MS,
+        clickCostMs: CLICK_COST_MS,
+        remainingMs: remaining,
+        waitForReady
+      });
+      if (r.guard === WEEK_CLICK_GUARD_REASONS.viewNotReady) {
+        rendered = r.week || rendered;
+        continue;
+      }
+      if (r.targetReached) { rendered = r.week; break; }
+      if (r.clicked && r.effect === CLICK_EFFECTS.overshoot) { abortReason = 'week-overshoot'; break; }
+      if (r.clicked && r.effect === CLICK_EFFECTS.unverified) { abortReason = 'click-unverified'; break; }
+      if (!r.clicked) { abortReason = 'button-ineffective'; break; }
+      buttonClicks++;
+      rendered = r.week;
+      lastClickDirection = direction;
+      weekConfirmedAfterClick = Boolean(r.week && r.week.startDate);
+    }
+
+    // GUARD 1: falsche Woche -> keine Daten statt falscher Daten.
+    if (rendered.startDate && !renderedWeekContains(rendered, rangeStartDate)) {
+      throw new Error(
+        `Kalender-Wochenansicht zeigt nicht die angefragte Woche: angefragt ab ${rangeStartDate}, ` +
+        `gerendert ${rendered.startDate} – ${rendered.endDate || '?'}. Es werden bewusst keine Daten ` +
+        `der falschen Woche zurueckgegeben.`
+      );
+    }
+    const weekVerified = isHeaderReadVerified(rendered);
+
+    // Event-Knoten sammeln und alle parsen (nicht nur Busy — fuer Briefings).
+    const eventCollection = await collectCalendarEventLabels(page, { weekStartIso: rendered.startDate || mondayIso });
+    const eventElementsFound = eventCollection.eventElementsFound;
+    const dataQuality = resolveDataQuality({ weekVerified, eventElementsFound });
+
+    const seen = new Set();
+    const parsed = [];
+    for (const label of eventCollection.labels) {
+      if (seen.has(label)) continue;
+      seen.add(label);
+      const slot = parseEventLabel(label, defaultYear);
+      if (!slot) continue;
+      if (isWorkLocationPseudoSlot(slot.title)) continue;
+      slot.status = classifyEventStatus(label);
+      parsed.push(slot);
+    }
+    const deduped = dedupeBusySlots(parsed);
+
+    // Alle Events im angefragten Zeitraum behalten (auch 'free'/Ganztag):
+    // partitionSlotsByRange verwirft 'free' — fuer die reine Liste bleiben wir
+    // daher bei einer eigenen, status-unabhaengigen Range-Filterung.
+    const rangeStartMs = new Date(String(startDt).includes('T') ? startDt : `${rangeStartDate}T00:00:00`).getTime();
+    const rangeEndMs = new Date(String(endDt).includes('T') ? endDt : `${rangeEndDate}T23:59:59`).getTime();
+    const events = deduped.filter((slot) => {
+      const dayStartMs = new Date(`${slot.date}T00:00:00`).getTime();
+      const s = slot.allDay ? dayStartMs : new Date(`${slot.date}T${slot.start}:00`).getTime();
+      const e = slot.allDay ? dayStartMs + 86400000 : new Date(`${slot.date}T${slot.end}:00`).getTime();
+      return s < rangeEndMs && e > rangeStartMs;
+    });
+
+    // Stabil nach Datum und Beginn sortieren.
+    events.sort((a, b) =>
+      `${a.date}T${a.start || '00:00'}`.localeCompare(`${b.date}T${b.start || '00:00'}`)
+    );
+
+    const result = {
+      status: 'ok',
+      calendar: 'Firmenkalender (Outlook Web)',
+      timespanText: `${rangeStartDate} bis ${rangeEndDate}`,
+      renderedWeek: {
+        text: rendered.text,
+        startDate: rendered.startDate,
+        endDate: rendered.endDate
+      },
+      weekVerified,
+      dataQuality,
+      events,
+      count: events.length,
+      note: `READ-ONLY Liste aller Termine (busy/free/tentative/Ganztag) aus der OWA-Wochenansicht ` +
+        `für ${rangeStartDate} bis ${rangeEndDate}. Pseudo-Slots (Arbeitsort, ohne Titel, URLs) entfernt, ` +
+        `Duplikate zusammengeführt, nach Woche sortiert.`
+    };
+    if (dataQuality !== 'verified') {
+      result.note += ' WARNUNG: Woche/Event-Grid nicht vollständig verifizierbar — Liste ggf. unvollständig.';
+    }
+    if (abortReason !== 'none') {
+      result.note += ` HINWEIS: Navigation vorzeitig beendet (${abortReason}).`;
+    }
+    if (eventElementsFound > 0 && events.length === 0) {
+      result.note += ` HINWEIS: ${eventElementsFound} Event-Knoten gelesen, aber keine im angefragten Zeitraum.`;
+    }
+    return result;
+  }
+
+  // READ-ONLY Detail-Lesen eines Kalender-Events fuer Termin-Briefings:
+  // outlook_get_calendar_event. Findet das Event per Titel-Fragment in der
+  // Wochenansicht (openCalendarEventByQuery) und liefert den Detail-Text des
+  // Reading-Panels zurueck. BEWUSST KEINE Schreiboperation: es wird nur ein
+  // Doppelklick zum Oeffnen des (lesenden) Detail-Panels ausgefuehrt.
+  //
+  // Rueckgabe: { status, query, titleMatched, detailText } oder wirft.
+  async getCalendarEvent({ query } = {}) {
+    if (!query || typeof query !== 'string' || query.trim().length === 0) {
+      throw new Error('Parameter "query" (Suchbegriff/Titel-Fragment) ist erforderlich.');
+    }
+    const { page, titleMatched, detailText } = await this.openCalendarEventByQuery(query);
+    return {
+      status: 'ok',
+      calendar: 'Firmenkalender (Outlook Web)',
+      query,
+      titleMatched,
+      detailText,
+      note: 'READ-ONLY Detail-Ansicht aus dem OWA-Reading-Panel. Es wurde nichts geaendert.'
+    };
+  }
+
   // Lokalisiert ein Kalender-Event im OWA-Firmenkalender und öffnet dessen Detail-Panel.
   // Suchbegriff = Titel-Fragment. Geht über die Wochenansicht (für den Zieltext), da die
   // Kalender-Suche in OWA keine zuverlässigen klickbaren Ergebnisse liefert. Der Klick

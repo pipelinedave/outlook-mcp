@@ -19,7 +19,7 @@ neue E-Mail-Entwürfe sicher anlegen.
 
 ## Features
 
-- **14 leistungsfähige MCP-Tools**:
+- **22 leistungsfähige MCP-Tools**:
   - `outlook_status`: Prüft Verbindungs- und Anmeldestatus von Outlook Web.
   - `outlook_login`: Öffnet ein sichtbares Browserfenster für den einmaligen interaktiven Login (inkl. SSO / MFA).
   - `outlook_search`: Volltextsuche über das OWA-Suchfeld (nach Kunden, Tickets, Absendern, Stichwörtern).
@@ -38,6 +38,8 @@ neue E-Mail-Entwürfe sicher anlegen.
 - **Firmenkalender-Tools** (für Blocker & Fokuszeiten im Outlook-Firmenkalender):
   - `outlook_create_calendar_event`: Legt einen Kalender-Eintrag (Standard `transparency: busy`) per OWA DeepLink an. Termin-Zeiten werden korrekt als Berlin-Lokalzeit interpretiert (keine UTC-Verschiebung).
   - `outlook_get_freebusy`: Fragt die Belegung des Firmenkalenders in einem Zeitfenster ab (Busy-Slots aus ARIA-Labels), zur Kollisionsprüfung vor dem Anlegen eines Blockers.
+  - `outlook_list_calendar_events`: **READ-ONLY** – listet ALLE Termine (Titel, Datum, Start/Ende, Ganztag, Status) des Firmenkalenders in einem Zeitraum. Basis für Termin-Briefings. Es wird nur gelesen, nichts verändert.
+  - `outlook_get_calendar_event`: **READ-ONLY** – liest die Detail-Ansicht (Reading-Panel) eines Kalender-Events anhand seines Titels. Liefert den vollständigen Detail-Text für Termin-Briefings.
   - `outlook_delete_calendar_event`: Löscht ein Kalender-Event anhand seines Titels/Suchbegriffs (über die Wochenansicht + echten Playwright-Klick). Entfernt einzelne Events, verhindert versehentliches Löschen ganzer Serien.
   - `outlook_update_calendar_event`: Bearbeitet einen bestehenden Kalender-Eintrag (Titel/Zeit/Beschreibung) anhand seines Suchbegriffs.
 - **Sicherheits-Konzept (Draft-First)**: Es gibt kein Blindversenden von Mails. Der Server legt Entwürfe an, sodass der Anwender die Nachricht vor dem Absenden in Outlook sichten und freigeben kann.
@@ -155,6 +157,56 @@ Nützlich, um Fokusblöcke/Abwesenheiten anzulegen, Kollisionen zu prüfen und B
 > **Zeitzonen-Hinweis**: Zeiten ohne Offset (z.B. `2026-09-15T08:00:00`) werden als
 > **Europe/Berlin-Lokalzeit** interpretiert (OWA interpretiert `startdt` ohne Offset als
 > lokale Browserzeit). Ein expliziter Offset (`+02:00`) bzw. `Z` wird nach UTC-ISO normalisiert.
+
+---
+
+## READ-ONLY Kalender-Lese-Tools (Termin-Briefings)
+
+Für den `otto`-Agenten stehen zwei **strikt lesende** Tools zur Verfügung, um
+Termin-Briefings aus dem Outlook-Firmenkalender zu bauen. Sie verändern nichts –
+es wird nur navigiert und gelesen.
+
+```jsonc
+// 1) Alle Termine eines Zeitraums listen (Titel, Datum, Start/Ende, Ganztag, Status)
+{
+  "name": "outlook_list_calendar_events",
+  "arguments": { "start": "2026-10-02", "end": "2026-10-09" }
+}
+// -> { status, timespanText, weekVerified, dataQuality, events: [...], count }
+
+// 2) Detail-Ansicht (Reading-Panel) eines einzelnen Events lesen
+{
+  "name": "outlook_get_calendar_event",
+  "arguments": { "query": "Amt Kellinghusen Citrix Add-In" }
+}
+// -> { status, query, titleMatched, detailText }
+```
+
+Ehrlichkeits-Garantien:
+- Die Zielwoche wird ausschließlich am **angezeigten Wochen-Header** verifiziert;
+  falsche Wochen liefern bewusst keine Daten (`renderedWeekContains`).
+- `dataQuality` ist nur `'verified'`, wenn die Woche verifiziert **und**
+  Event-Knoten gelesen wurden – sonst wird die Liste ehrlich als unvollständig
+  ausgewiesen.
+- Pseudo-Slots (Arbeitsort, „(ohne Titel)“, URLs) und Duplikate werden entfernt.
+- `outlook_get_calendar_event` öffnet das Event per Doppelklick im lesenden
+  Reading-Panel – keine Schreiboperation.
+
+### Anbindung an den `otto`-Agenten (otto.md)
+
+Der `otto`-Agent hat in seiner Agent-Definition (`agents/otto.md`) bereits die
+Permissive `outlook_*: allow` und erhält die neuen Tools damit **automatisch**,
+sobald dieser Server bei ihm gemountet ist. Für Termin-Briefings sind die
+Tool-Namen so zu ergänzen (analog `outlook_outlook_get_freebusy`):
+
+```md
+- `outlook_outlook_list_calendar_events` (READ-ONLY: alle Termine eines Zeitraums listen — Basis für Termin-Briefings)
+- `outlook_outlook_get_calendar_event` (READ-ONLY: Detail-Ansicht eines Events per Titel lesen)
+```
+
+Ablauf für ein Briefing: `outlook_list_calendar_events(start, end)` liefert die
+Terminübersicht, dann `outlook_get_calendar_event(query)` die Details zu den
+relevanten Terminen. Beide sind strikt lesend – sie verändern den Kalender nie.
 
 ---
 

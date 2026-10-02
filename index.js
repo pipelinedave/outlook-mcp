@@ -291,6 +291,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'outlook_list_calendar_events',
+        description: 'READ-ONLY: Listet ALLE Termine (Titel, Datum, Start/Ende, Ganztag, Status) des Outlook-FIRMENKALENDERS in einem Zeitraum. Basis für Termin-Briefings. Es wird nur gelesen/navigiert, nichts verändert.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            start: { type: 'string', description: 'Start ISO, z.B. "2026-09-15" oder "2026-09-15T09:30:00"' },
+            end: { type: 'string', description: 'Ende ISO, z.B. "2026-10-04" oder "2026-10-04T18:00:00"' }
+          },
+          required: ['start', 'end']
+        }
+      },
+      {
+        name: 'outlook_get_calendar_event',
+        description: 'READ-ONLY: Liest die Detail-Ansicht (Reading-Panel) eines Kalender-Event im Outlook-FIRMENKALENDER anhand seines Titels/Suchbegriffs. Liefert den vollständigen Detail-Text für Termin-Briefings. Es wird nur gelesen, nichts verändert.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des Events, z.B. "MKK Nachbereitung"' }
+          },
+          required: ['query']
+        }
+      },
+      {
         name: 'outlook_delete_calendar_event',
         description: 'Löscht einen Eintrag aus dem Outlook-FIRMENKALENDER anhand seines Titels/Suchbegriffs (bzw. einer ID). Verwendet die OWA-Kalender-Suche zum Auffinden und entfernt das Event. Nützlich, um versehentlich angelegte Blocker/Test-Einträge zu bereinigen.',
         inputSchema: {
@@ -495,6 +518,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'outlook_get_freebusy': {
         const res = await owaClient.getFreeBusy({ start: args.start, end: args.end });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_list_calendar_events': {
+        const res = await owaClient.listCalendarEvents({ start: args.start, end: args.end });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_get_calendar_event': {
+        const res = await owaClient.getCalendarEvent({ query: args.query });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 
