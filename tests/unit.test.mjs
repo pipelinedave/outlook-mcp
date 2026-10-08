@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -176,6 +176,139 @@ describe('owaClient - replyDraft Validierung', () => {
       },
       /Parameter "body" ist erforderlich/
     );
+  });
+});
+
+describe('verifyBodyInserted - Reply-Draft Body-Serialisierung (Problem 1, Playwright)', () => {
+  test('Erste nicht-leere Zeile im Editor-Text nachweisbar -> true', () => {
+    assert.equal(verifyBodyInserted('Hallo Welt!\nRest der Antwort', 'Hallo Welt!'), true);
+  });
+
+  test('Body-Zeile an beliebiger Editor-Position (nicht nur Anfang) -> true', () => {
+    // Der Body kann nach Signatur/Zitat im innerText auftauchen.
+    assert.equal(verifyBodyInserted('-- Signatur\n\nHallo Kollege,\n\nwie besprochen', 'Hallo Kollege'), true);
+  });
+
+  test('Leere/schwache Eingaben -> false', () => {
+    assert.equal(verifyBodyInserted('', 'Hallo'), false);
+    assert.equal(verifyBodyInserted('Anderer Text', 'Hallo'), false);
+    assert.equal(verifyBodyInserted('Hallo', ''), false);
+    assert.equal(verifyBodyInserted(null, 'Hallo'), false);
+    assert.equal(verifyBodyInserted('Hallo', null), false);
+  });
+
+  test('Mehrzeiliger Body: match über der ERSTEN nicht-leeren Zeile', () => {
+    // Vor dem Fix wurde nur der sample(80)-Anfang geprüft; mehrzeilige Bodys
+    // verloren die matchende Zeile, wenn sie nicht im Präfix lag.
+    assert.equal(verifyBodyInserted('Intro\n\nHauptpunkt\n\nGruß', '\n\nHauptpunkt\n\nGruß'), true);
+  });
+
+  test('Whitespace-robust: führende/trailing Leerzeichen stören nicht', () => {
+    assert.equal(verifyBodyInserted('  Hallo Welt  ', 'Hallo Welt'), true);
+  });
+});
+
+describe('isWritableEditor - ContentEditable-Prüfung (Reply-Draft)', () => {
+  test('contenteditable=true oder null -> schreibbar', () => {
+    assert.equal(isWritableEditor('true'), true);
+    assert.equal(isWritableEditor(''), true);
+    assert.equal(isWritableEditor(null), true);
+    assert.equal(isWritableEditor(undefined), true);
+  });
+
+  test('contenteditable=false -> NICHT schreibbar (reiner Anzeige-Knoten)', () => {
+    assert.equal(isWritableEditor('false'), false);
+  });
+});
+
+describe('resolveBodyInserted - Gesamturteil über die Insertions-Verifikation', () => {
+  test('Text nachweislich + schreibbarer Editor -> true', () => {
+    assert.equal(resolveBodyInserted({ text: 'Hallo Welt', expectedBody: 'Hallo Welt', contentEditable: 'true' }), true);
+  });
+
+  test('Text fehlt, Editor schreibbar -> false (Fallback nötig)', () => {
+    assert.equal(resolveBodyInserted({ text: '', expectedBody: 'Hallo', contentEditable: 'true' }), false);
+    assert.equal(resolveBodyInserted({ text: 'anderer', expectedBody: 'Hallo', contentEditable: 'true' }), false);
+  });
+
+  test('Editor NICHT schreibbar (contenteditable=false) -> false, selbst wenn Text drin wäre', () => {
+    // root cause Fall: Ein reiner Anzeige-Knoten trägt zwar innerText, kann die
+    // Insertion aber nicht übernehmen -> muss den Tastatur-Fallback auslösen.
+    assert.equal(resolveBodyInserted({ text: 'Hallo Welt', expectedBody: 'Hallo Welt', contentEditable: 'false' }), false);
+  });
+
+  test('Defensiv ohne Argumente -> false', () => {
+    assert.equal(resolveBodyInserted(), false);
+    assert.equal(resolveBodyInserted({}), false);
+  });
+});
+
+describe('isHistoryPreserved - Unversehrtheits-Beweis für den Tastatur-Fallback', () => {
+  test('Bestand ist nach dem Tippen noch vollständig vorhanden -> true', () => {
+    const before = 'AM: Markus\nAW: Vertrag\n\nHallo David,\n\nAnbei der Vertrag.\n\n-- David Hallmann\nd-velop AG';
+    const after = 'Hallo David,\n\nanbei der Vertrag.\n\n' + before;
+    assert.equal(isHistoryPreserved(before, after), true);
+  });
+
+  test('Bestand wurde überschrieben (Verlauf weg) -> false', () => {
+    const before = 'AM: Markus\nAW: Vertrag\n-- David Hallmann';
+    const after = 'Nur mein neuer Text ohne jeden Verlauf';
+    assert.equal(isHistoryPreserved(before, after), false);
+  });
+
+  test('Typen am ANFANG lässt den Bestand am ENDE intakt -> true', () => {
+    const before = 'AM: Markus\n-- Signatur';
+    assert.equal(isHistoryPreserved(before, 'Neuer Text\n' + before), true);
+  });
+
+  test('Leerer Bestand (frisches Compose) -> true (nichts zu verlieren)', () => {
+    assert.equal(isHistoryPreserved('', 'Neuer Text'), true);
+    assert.equal(isHistoryPreserved(null, 'Neuer Text'), true);
+    assert.equal(isHistoryPreserved(undefined, undefined), true);
+  });
+
+  test('Leerer NACH-Zustand bei vorhandenem Bestand -> false', () => {
+    assert.equal(isHistoryPreserved('AM: Markus', ''), false);
+  });
+
+  test('Präfix-Vergleich: langer Bestand wird über die ersten 200 Zeichen geprüft', () => {
+    const long = 'X'.repeat(500);
+    const after = 'Y\n' + long + '\nEnde';
+    assert.equal(isHistoryPreserved(long, after), true);
+    // Der Bestand ist weg -> Präfix fehlt ebenfalls
+    assert.equal(isHistoryPreserved(long, 'komplett anderer Text'), false);
+  });
+});
+
+describe('config - Pro-Realm-Profil (Multi-Tenant, Problem 2)', () => {
+  test('Default-Realm behält das Basisprofil (kein Suffix)', () => {
+    const base = config.profileDir;
+    const forDefault = config.getProfileDirForRealm(config.defaultRealm);
+    assert.equal(forDefault, base);
+  });
+
+  test('Abweichender Realm erhält "-<realm>"-Suffix', () => {
+    const other = config.getProfileDirForRealm('adesso.de');
+    assert.ok(other.endsWith('-adesso.de'));
+    assert.notEqual(other, config.profileDir);
+  });
+
+  test('Realm-Suffix wird für Dateisystem-Sicherheit bereinigt', () => {
+    // Steuer-/Pfadzeichen werden ersetzt. Der Pfad-TRENNER ist damit weg — das
+    // Suffix kann nicht mehr aus dem Basisverzeichnis ausbrechen. Punkte bleiben
+    // erlaubt (Realms wie "d-velop.de" brauchen sie), und der Bindestrich vor dem
+    // Suffix macht ".." zu einem normalen Verzeichnisnamen.
+    const safe = config.getProfileDirForRealm('d-velop.de/../boot');
+    assert.ok(safe.startsWith(config.profileDir));
+    const suffix = safe.slice(config.profileDir.length);
+    assert.ok(!suffix.includes('/'), 'Suffix darf keinen Pfad-Trenner enthalten');
+    assert.equal(suffix, '-d-velop.de_.._boot');
+  });
+
+  test('Realm-Wechsel liefert unterschiedliche Profile (Trennung der Mailbox-Sessions)', () => {
+    const a = config.getProfileDirForRealm('d-velop.de');
+    const b = config.getProfileDirForRealm('adesso.de');
+    assert.notEqual(a, b);
   });
 });
 

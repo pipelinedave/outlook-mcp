@@ -22,6 +22,7 @@ neue E-Mail-Entwürfe sicher anlegen.
 - **22 leistungsfähige MCP-Tools**:
   - `outlook_status`: Prüft Verbindungs- und Anmeldestatus von Outlook Web.
   - `outlook_login`: Öffnet ein sichtbares Browserfenster für den einmaligen interaktiven Login (inkl. SSO / MFA).
+  - `outlook_set_realm`: Schaltet den aktiven Tenant/Realm um (Multi-Tenant, z.B. `d-velop.de` ↔ `adesso.de`). Jeder Realm nutzt ein eigenes persistentes Browser-Profil, damit die Mailbox-Sessions nicht vermischt werden.
   - `outlook_search`: Volltextsuche über das OWA-Suchfeld (nach Kunden, Tickets, Absendern, Stichwörtern).
   - `outlook_get_email`: Liest eine E-Mail vollständig im Lesebereich aus (konvertiert in Markdown, extrahiert Teams-Links und Metadaten).
   - `outlook_list_recent`: Schnelle Übersicht über die neuesten E-Mails im Posteingang.
@@ -43,6 +44,8 @@ neue E-Mail-Entwürfe sicher anlegen.
   - `outlook_delete_calendar_event`: Löscht ein Kalender-Event anhand seines Titels/Suchbegriffs (über die Wochenansicht + echten Playwright-Klick). Entfernt einzelne Events, verhindert versehentliches Löschen ganzer Serien.
   - `outlook_update_calendar_event`: Bearbeitet einen bestehenden Kalender-Eintrag (Titel/Zeit/Beschreibung) anhand seines Suchbegriffs.
 - **Sicherheits-Konzept (Draft-First)**: Es gibt kein Blindversenden von Mails. Der Server legt Entwürfe an, sodass der Anwender die Nachricht vor dem Absenden in Outlook sichten und freigeben kann.
+- **Verifizierte Reply-Textübernahme**: `outlook_reply_draft` prüft nach dem Einfügen des Textes nachweislich, dass er im Editor angekommen ist (`innerText`), und speichert erst danach. Greift die DOM-Insertion nicht (Editor hängt an Tastatur-Input), wird der Text additiv nachgetippt — **ohne** den Verlauf zu überschreiben. Ein Unversehrtheits-Vorher/Nachher-Vergleich bricht ab, falls Verlauf oder Signatur dabei verloren gehen, statt einen verfälschten Entwurf zu speichern. Das Ergebnis meldet `bodyInsertSource` (`dom-insertion` oder `keyboard-fallback`).
+- **Multi-Tenant (Realm pro Tool)**: Jedes Tool akzeptiert einen optionalen `realm`-Parameter (z.B. `adesso.de`, `d-velop.de`), um gezielt das Konto zu wechseln. Ohne Angabe gilt der zuletzt gesetzte bzw. der Default-Realm.
 - **Auto-Erkennung von Browsern**: Findet automatisch Chromium/Chrome/Edge unter Linux, WSL, macOS und Windows (oder via `OUTLOOK_MCP_CHROME_PATH`).
 - **Persistentes lokales Profil**: Anmeldedaten und MFA-Tokens verbleiben sicher im lokalen Profil (`~/.outlook-browser-profile`).
 

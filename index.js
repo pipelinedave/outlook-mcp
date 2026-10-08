@@ -30,7 +30,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Prüft den Status der Outlook Web Verbindung und ob du eingeloggt bist.',
         inputSchema: {
           type: 'object',
-          properties: {}
+          properties: {
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
+          }
+        }
+      },
+      {
+        name: 'outlook_set_realm',
+        description: `Schaltet den aktiven Tenant/Realm der Bridge um (Multi-Tenant). Wechselt bei Bedarf das persistentes Browser-Profil (pro Realm ein eigenes Profil, damit die Mailbox-Sessions nicht vermischt werden). Bekannte Realms: Standard "${config.defaultRealm}", z.B. adesso.de oder d-velop.de. Nach dem Wechsel outlook_status aufrufen, um die Mailbox-Zuordnung zu prüfen.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            realm: {
+              type: 'string',
+              description: `Tenant/Domain (Standard: ${config.defaultRealm}, z.B. adesso.de oder d-velop.de)`
+            }
+          },
+          required: ['realm']
         }
       },
       {
@@ -61,7 +77,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'number',
               description: 'Maximale Anzahl an Ergebnissen (Standard: 10)',
               default: 10
-            }
+            },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de") für den gezielten Kontenwechsel.' }
           },
           required: ['query']
         }
@@ -80,7 +97,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             id: {
               type: 'string',
               description: 'Optionale ID oder Conversation-ID der E-Mail'
-            }
+            },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
         }
       },
@@ -94,7 +112,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'number',
               description: 'Anzahl der E-Mails (Standard: 10)',
               default: 10
-            }
+            },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
         }
       },
@@ -119,7 +138,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             cc: {
               type: 'string',
               description: 'Optionale CC-Empfänger-Adresse(n)'
-            }
+            },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['to', 'subject', 'body']
         }
@@ -158,7 +178,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             folder: {
               type: 'string',
               description: 'Optional: Ordner, in dem gesucht werden soll (Standard: inbox).'
-            }
+            },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['body']
         }
@@ -181,7 +202,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Navigiert in einen Mail-Ordner (inbox|sentitems|archive|deleteditems|drafts|newsletter).',
         inputSchema: {
           type: 'object',
-          properties: { folder: { type: 'string', description: 'Ordnerpfad (inbox, sentitems, archive, ...)' } },
+          properties: {
+            folder: { type: 'string', description: 'Ordnerpfad (inbox, sentitems, archive, ...)' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
+          },
           required: ['folder']
         }
       },
@@ -192,7 +216,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             folder: { type: 'string', description: 'inbox|sentitems|archive|deleteditems|drafts|newsletter' },
-            maxScrolls: { type: 'number', description: 'Maximale Scroll-Iterationen (Standard 140)' }
+            maxScrolls: { type: 'number', description: 'Maximale Scroll-Iterationen (Standard 140)' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['folder']
         }
@@ -205,7 +230,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             id: { type: 'string', description: 'conversation-ID (data-convid)' },
             folder: { type: 'string', description: 'Optional: Ordner, aus dem gelesen werden soll (inbox|sentitems|archive|...)' },
-            query: { type: 'string', description: 'Optional: Suchbegriff (Betreff/Absender) für den automatischen Recovery-Retry, falls die conversation-ID nicht gefunden wird. Ohne query wird die ID selbst als Suchbegriff verwendet.' }
+            query: { type: 'string', description: 'Optional: Suchbegriff (Betreff/Absender) für den automatischen Recovery-Retry, falls die conversation-ID nicht gefunden wird. Ohne query wird die ID selbst als Suchbegriff verwendet.' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['id']
         }
@@ -217,7 +243,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             id: { type: 'string', description: 'conversation-ID (data-convid)' },
-            folder: { type: 'string', description: 'Optional: Ordner (Standard: flagged)' }
+            folder: { type: 'string', description: 'Optional: Ordner (Standard: flagged)' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['id']
         }
@@ -229,7 +256,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             id: { type: 'string', description: 'conversation-ID (data-convid)' },
-            folder: { type: 'string', description: 'Optional: Ordner (Standard: inbox)' }
+            folder: { type: 'string', description: 'Optional: Ordner (Standard: inbox)' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['id']
         }
@@ -242,7 +270,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             id: { type: 'string', description: 'conversation-ID (data-convid) des Entwurfs' },
             query: { type: 'string', description: 'Betreff-Fragment zum Finden des Entwurfs (falls keine ID bekannt)' },
-            folder: { type: 'string', description: 'Optional: Ordner (Standard: drafts/Entwürfe)' }
+            folder: { type: 'string', description: 'Optional: Ordner (Standard: drafts/Entwürfe)' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
         }
       },
@@ -257,7 +286,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             query: { type: 'string', description: 'Optionaler Suchbegriff oder Betreff zum Finden der Einladung (z.B. "CMIS Schnittstelle").' },
             subject: { type: 'string', description: 'Alias für query (Betreff der Einladung).' },
             folder: { type: 'string', description: 'Optional: Ordner, in dem gesucht werden soll (Standard: inbox).' },
-            send_response: { type: 'boolean', description: 'True (Standard): Antwortsendung an die Gegenseite. False: ohne Antwortübermittlung annehmen.', default: true }
+            send_response: { type: 'boolean', description: 'True (Standard): Antwortsendung an die Gegenseite. False: ohne Antwortübermittlung annehmen.', default: true },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
         }
       },
@@ -273,7 +303,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             body: { type: 'string', description: 'Optionale Beschreibung/Notizen' },
             is_all_day: { type: 'boolean', description: 'Ganztägig? (Standard: false)', default: false },
             timezone: { type: 'string', description: 'Optional, Default Europe/Berlin', default: 'Europe/Berlin' },
-            transparency: { type: 'string', description: 'busy (nicht verfügbar, Standard) oder free', enum: ['busy', 'free'], default: 'busy' }
+            transparency: { type: 'string', description: 'busy (nicht verfügbar, Standard) oder free', enum: ['busy', 'free'], default: 'busy' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['subject', 'start', 'end']
         }
@@ -285,7 +316,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             start: { type: 'string', description: 'Start ISO, z.B. "2026-09-15T09:30:00"' },
-            end: { type: 'string', description: 'Ende ISO, z.B. "2026-09-15T11:00:00"' }
+            end: { type: 'string', description: 'Ende ISO, z.B. "2026-09-15T11:00:00"' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['start', 'end']
         }
@@ -297,7 +329,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             start: { type: 'string', description: 'Start ISO, z.B. "2026-09-15" oder "2026-09-15T09:30:00"' },
-            end: { type: 'string', description: 'Ende ISO, z.B. "2026-10-04" oder "2026-10-04T18:00:00"' }
+            end: { type: 'string', description: 'Ende ISO, z.B. "2026-10-04" oder "2026-10-04T18:00:00"' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['start', 'end']
         }
@@ -308,7 +341,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des Events, z.B. "MKK Nachbereitung"' }
+            query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des Events, z.B. "MKK Nachbereitung"' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['query']
         }
@@ -320,7 +354,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des zu löschenden Kalender-Events' },
-            id: { type: 'string', description: 'Alternative: Kalender-Event-ID (falls bekannt)' }
+            id: { type: 'string', description: 'Alternative: Kalender-Event-ID (falls bekannt)' },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
         }
       },
@@ -338,7 +373,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             body: { type: 'string', description: 'Neue Beschreibung' },
             is_all_day: { type: 'boolean', description: 'Ganztägig? (Standard: false)' },
             timezone: { type: 'string', description: 'Optional, Default Europe/Berlin' },
-            transparency: { type: 'string', description: 'busy oder free', enum: ['busy', 'free'] }
+            transparency: { type: 'string', description: 'busy oder free', enum: ['busy', 'free'] },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
         }
       }
@@ -349,12 +385,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
+  // Multi-Tenant (Problem 2): Jedes Tool kann optional einen 'realm' übergeben,
+  // um gezielt zwischen d-velop.de und adesso.de zu wechseln. Ein globaler
+  // owaClient-Singleton trägt den aktuellen Realm; setRealm() lässt den
+  // Browser-Kontext über ensureContext() ggf. auf das Pro-Realm-Profil wechseln
+  // (config.getProfileDirForRealm). Ohne 'realm' bleibt der letzte/Default-Realm.
+  if (args && typeof args.realm === 'string' && args.realm.trim()) {
+    const realm = args.realm.trim();
+    // Sanitärer Guard: kein Pfad-/Steuerzeichen, damit der Realm nur eine
+    // plausible Tenancy-Domain steuert (Profilpfad-Sicherheit, vgl. config).
+    if (!/^[a-zA-Z0-9.-]{3,}$/.test(realm)) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Ungültiger realm-Wert "${realm}". Bitte eine Domäne wie "d-velop.de" oder "adesso.de" angeben.` }]
+      };
+    }
+    owaClient.setRealm(realm);
+  }
+
   try {
     switch (name) {
       case 'outlook_status': {
         const status = await owaClient.checkStatus();
         return {
           content: [{ type: 'text', text: JSON.stringify(status, null, 2) }]
+        };
+      }
+
+      case 'outlook_set_realm': {
+        // Der Realm wurde oben bereits global gesetzt und validiert.
+        const realm = owaClient.realm;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Aktiver Tenant/Realm ist jetzt "${realm}". Browser-Profil: ${config.getProfileDirForRealm(realm)}. ` +
+                `Hinweis: Beim ersten Wechsel muss die Mailbox in diesem Profil einmalig angemeldet sein (outlook_login mit realm="${realm}"). ` +
+                `Mit outlook_status lässt sich prüfen, ob die aktive Mailbox zum Realm passt.`
+            }
+          ]
         };
       }
 
