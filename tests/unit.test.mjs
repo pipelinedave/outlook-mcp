@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -277,6 +277,35 @@ describe('isHistoryPreserved - Unversehrtheits-Beweis für den Tastatur-Fallback
     assert.equal(isHistoryPreserved(long, after), true);
     // Der Bestand ist weg -> Präfix fehlt ebenfalls
     assert.equal(isHistoryPreserved(long, 'komplett anderer Text'), false);
+  });
+});
+
+describe('isRealComposeEditor - echter Editor vs. Wrapper (Live-Befund 09.10.2026)', () => {
+  test('contenteditable=true -> echter Editor', () => {
+    assert.equal(isRealComposeEditor({ contentEditable: 'true', role: '' }), true);
+    assert.equal(isRealComposeEditor({ contentEditable: 'true', role: 'textbox' }), true);
+  });
+
+  test('role=textbox -> echter Editor (auch ohne contenteditable-Attribut)', () => {
+    assert.equal(isRealComposeEditor({ contentEditable: null, role: 'textbox' }), true);
+  });
+
+  test('WRAPPER ohne contenteditable und ohne role -> KEIN Editor (der Fehlpass-Fall)', () => {
+    // Genau dieser Knoten lieferte im Live-Lauf CSS-Quelltext statt
+    // Nachrichtentext und machte die Verifikation wertlos.
+    assert.equal(isRealComposeEditor({ contentEditable: null, role: '' }), false);
+    assert.equal(isRealComposeEditor({}), false);
+  });
+
+  test('contenteditable=false -> KEIN Editor (reiner Anzeige-Knoten)', () => {
+    assert.equal(isRealComposeEditor({ contentEditable: 'false', role: '' }), false);
+    // role=textbox wuerde aber greifen - hier zaehlt die harte Ablehnung
+    assert.equal(isRealComposeEditor({ contentEditable: 'false', role: 'textbox' }), true);
+  });
+
+  test('contenteditable="inherit"/leer sind kein gueltiger Editor-Zustand', () => {
+    assert.equal(isRealComposeEditor({ contentEditable: 'inherit', role: '' }), false);
+    assert.equal(isRealComposeEditor({ contentEditable: '', role: '' }), false);
   });
 });
 

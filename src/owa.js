@@ -61,6 +61,16 @@ export function isWritableEditor(contentEditable) {
   return String(contentEditable) !== 'false';
 }
 
+// Echte-Editor-Prüfung (Live-Befund 09.10.2026): Im OWA-Compose-Fenner gibt
+// es MEHRERE Knoten mit aria-label "Message body" — einen echten Editor
+// (role="textbox" / contenteditable="true") und einen Wrapper ohne
+// contenteditable. Ein Wrapper liefert innerText mit CSS-Quelltext statt
+// Nachrichtentext; jede darauf gestützte Verifikation ist wertlos.
+// Der Editor wird deshalb als ECHTE EIGENSCHAFT bestimmt, nicht über sein Label.
+export function isRealComposeEditor({ contentEditable = null, role = '' } = {}) {
+  return contentEditable === 'true' || String(role) === 'textbox';
+}
+
 // Unversehrtheits-Prüfung für den Tastatur-Fallback: Der VORHER vorhandene
 // Inhalt (E-Mail-Verlauf, Signatur) muss nach dem Tippen noch nachweisbar sein.
 // Fehlt er, hat das Tippen den Bestand überschrieben — das Entwurfs-Ergebnis
@@ -6000,8 +6010,26 @@ export class OwaClient {
     this.lastPage = activePage;
 
     // 5. Find editor
+    //
+    // LEBT-BEFUND 09.10.2026: Es gibt im Compose-Fenner MEHRERE Kandidaten mit
+    // aria-label "Message body": einen echten Editor
+    // (role="textbox" + contenteditable="true") und einen Wrapper ohne
+    // contenteditable. Ein selektor, der zuerst `div[aria-label="Message body"]`
+    // trifft, landet auf dem Wrapper - dort ist innerText CSS-Text statt
+    // Nachrichtentext, und jede Verifikation ist wertlos.
+    //
+    // Deshalb wird der Editor als ECHTE EIGENSCHAFT bestimmt: role="textbox"
+    // ODER contenteditable="true", jeweils mit Message-body-/Nachrichtentext-
+    // Label. Der Wrapper faellt dadurch durch.
     const editor = await activePage.waitForSelector(
-      'div[role="textbox"][aria-label*="Message body" i], div[role="textbox"][aria-label*="Nachrichtentext" i], div[aria-label="Message body"], div[aria-label="Nachrichtentext"]',
+      'div[role="textbox"][contenteditable="true"][aria-label*="Message body" i], ' +
+      'div[role="textbox"][contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
+      '[contenteditable="true"][aria-label*="Message body" i], ' +
+      '[contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
+      'div[role="textbox"][aria-label*="Message body" i], ' +
+      'div[role="textbox"][aria-label*="Nachrichtentext" i], ' +
+      'div[aria-label="Message body"][contenteditable="true"], ' +
+      'div[aria-label="Nachrichtentext"][contenteditable="true"]',
       { timeout: 15000 }
     ).catch(() => null);
 
@@ -6009,126 +6037,111 @@ export class OwaClient {
       throw new Error('Compose-Editor für den Antwort-Entwurf konnte nicht gefunden werden.');
     }
 
-    // 6. Safe DOM insertion: Prepend body paragraphs directly into editor before signature
-    await editor.evaluate((el, bodyText) => {
-      const lines = bodyText.split('\n');
-      const fragment = document.createDocumentFragment();
-      for (const line of lines) {
-        const p = document.createElement('p');
-        if (line.trim().length === 0) {
-          p.appendChild(document.createElement('br'));
-        } else {
-          p.textContent = line;
-        }
-        fragment.appendChild(p);
-      }
-      const spacer = document.createElement('p');
-      spacer.appendChild(document.createElement('br'));
-      fragment.appendChild(spacer);
+    // EIGENSCHAFTS-PRUEFUNG: Der Editor MUSS ein echter contenteditable-Knoten
+    // sein. Ein Wrapper wuerde jede Textpruefung verfaelschen - deshalb wird
+    // hier hart abgebrochen statt einen unbrauchbaren Knoten zu verwenden.
+    const editorKind = await editor.evaluate((el) => ({
+      contentEditable: el.getAttribute && el.getAttribute('contenteditable'),
+      role: (el.getAttribute && el.getAttribute('role')) || '',
+      tag: el.tagName
+    }));
+    if (!isRealComposeEditor(editorKind)) {
+      throw new Error(
+        `Gefundener Compose-Knoten ist kein echter Editor ` +
+        `(contenteditable="${editorKind.contentEditable}", role="${editorKind.role}"). ` +
+        `Eine Textpruefung waere wertlos - es wird nichts getippt und nichts gespeichert.`
+      );
+    }
 
-      el.insertBefore(fragment, el.firstChild);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-    }, body);
-
-    // 6a. VERIFIKATION (Playwright-Serialisierungs-Fix): Sicherstellen, dass der
-    // Textkoerper wirklich im Editor angekommen ist, BEVOR gespeichert wird.
-    // OWA/ContentEditable-Editoren hängen teils auf Tastatur-/Clipboard-Input statt
-    // auf DOM-Mutationen — die reine insertBefore-Mutation kann dann verlorengehen
-    // (Fehlerbild: Entwurf wird angelegt, aber der Koerper bleibt leer).
-    // Lesbarer Nachweis ist innerText (Textansicht) ODER textContent (HTML-Rohdom);
-    // contenteditable=false würde bedeuten, dass der Knoten kein echter Editor ist.
-    // Entscheidung über resolveBodyInserted (reine Funktionen, unit-getestet).
-    const insertionVerification = await editor.evaluate((el) => {
-      return {
-        textLength: (el.innerText || el.textContent || '').length,
-        sample: (el.innerText || el.textContent || '').trim().slice(0, 80),
-        contentEditable: el.getAttribute && el.getAttribute('contenteditable'),
-        targetTag: el.tagName
-      };
-    });
-
-    // Text-Inhalt des Editors VOR der Mutation merken. Dient im Fallback als
-    // Unversehrtheits-Beweis fuer Verlauf/Signatur (dort wird per Tastatur
-    // getippt, und eine Fehl-Positionierung wuerde sonst still den Thread
-    // ueberschreiben).
+    // 6. TEXTUEBERNAHME (Problem 1, Playwright-Serialisierung) — LEBT-BEFUND
+    // 09.10.2026: Die frueher hier eingesetzte reine DOM-Mutation
+    // (insertBefore + dispatchEvent('input')) fuehrt bei OWA NICHT zur
+    // Serialisierung. Live-Beweis: Draft wurde gespeichert, der gespeicherte
+    // Koerper enthielt nur den zitierten Thread, der eingefuegte Text fehlte
+    // vollstaendig. Grund: OWA serialisiert aus dem internen Editor-Zustand
+    // (eigenes contenteditable-Modell), nicht aus dem DOM. Ein
+    // DOM-insertBefore ist fuer dieses Modell unsichtbar — der anschliessende
+    // innerText-Check bestaetigte deshalb nur die eigene Mutation und meldete
+    // faelschlich Erfolg ("dom-insertion").
+    //
+    // KORREKTER WEG: Der Text wird per echter Tastatureingabe getippt. Das
+    // erzeugt genau die Input-Events, die das OWA-Editor-Modell verarbeitet,
+    // und ist damit serialisierbar. Die Verifikation liest den Editor NACH dem
+    // Tippen; der entscheidende Nachweis ist aber das Wiederoeffnen des
+    // gespeicherten Entwurfs (Schritt 8) — erst der persistierte Zustand gilt
+    // als Beleg, nicht der flüchtige Editor.
+    //
+    // REIHENFOLGE (bewusst, verhaltnis-richtig):
+    //   a) Inhalt VOR dem Tippen merken (Beweis fuer die Unversehrtheit von
+    //      Verlauf/Signatur),
+    //   b) Cursor an den Anfang des Editors setzen (additiv, KEIN Control+A —
+    //      das wuerde Verlauf und Signatur markieren und beim Tippen
+    //      ueberschreiben, also genau das zerstoeren, was ein Reply bewahrt),
+    //   c) Text tippen,
+    //   d) Verifikation: (i) Text im Editor, (ii) Bestand noch vorhanden.
     const preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
 
-    const editorText = insertionVerification && insertionVerification.textLength
-      ? await editor.evaluate((el) => (el.innerText || el.textContent || '').trim())
-      : '';
+    const insertionVerification = await editor.evaluate((el) => ({
+      contentEditable: el.getAttribute && el.getAttribute('contenteditable'),
+      role: el.getAttribute && el.getAttribute('role'),
+      targetTag: el.tagName,
+      preLength: (el.innerText || el.textContent || '').length
+    }));
 
+    // Caret an den Anfang des Editor-Inhalts setzen (rein additiv, keine
+    // Selektion, kein Loeschen des Bestands).
+    const caretPlaced = await editor.evaluate((el) => {
+      try {
+        const target = el.firstChild || el;
+        const range = document.createRange();
+        range.setStart(target, 0);
+        range.collapse(true);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        el.focus();
+        return true;
+      } catch (e) {
+        return false;
+      }
+    });
+    if (!caretPlaced) {
+      throw new Error(
+        `Antwort-Text konnte nicht in den Editor übernommen werden: der Cursor ` +
+        `konnte nicht gesetzt werden. Es wurde nichts gespeichert und nichts überschrieben.`
+      );
+    }
+
+    await activePage.keyboard.type(body, { delay: 5 });
+    await activePage.waitForTimeout(600);
+
+    // Verifikation NACH dem Tippen (flüchtig — der starke Beleg folgt in Schritt 8
+    // durch Wiederoeffnen des gespeicherten Entwurfs).
+    const editorText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
     const bodyVerified = resolveBodyInserted({
       text: editorText,
       expectedBody: body,
       contentEditable: insertionVerification && insertionVerification.contentEditable
     });
 
-    // 6b. FALLBACK: Entweder fehlt der DOM-Beweis, oder der Editor ist KEIN
-    // contenteditable (dann hat die Mutation vermutlich nicht gegriffen). Dann
-    // wird der Text per Tastatur nachgetippt.
-    //
-    // SICHERHEIT (wichtig): Es wird KEIN "alles auswählen + überschreiben"
-    // verwendet. Control+A wuerde den kompletten Verlauf und die Signatur
-    // markieren; ein nachfolgendes Typing ueberschreibt sie und der Entwurf
-    // verliert genau das, was ein Reply bewahren soll. Stattdessen wird der
-    // Cursor per Doppelklick-freiem Caret-Setzen auf die ERSTE Zeile des Editors
-    // gesetzt (DOM-Range auf das erste Kind) — der Bestand wird nur ergaenzt.
     if (!bodyVerified) {
-      await editor.focus();
-      await activePage.waitForTimeout(200);
+      throw new Error(
+        `Antwort-Text ist nach dem Tippen NICHT im Editor nachweisbar — es wird ` +
+        `nicht gespeichert, um keinen leeren Entwurf anzulegen. ` +
+        `Diagnostik: ${JSON.stringify(insertionVerification)} ` +
+        `Editor-Text-Länge: ${editorText.length} sample="${editorText.slice(0, 80)}".`
+      );
+    }
 
-      // Caret an den Anfang des Editor-Inhalts setzen (rein additiv, keine
-      // Selektion, kein Löschen des Bestands).
-      const caretPlaced = await editor.evaluate((el) => {
-        try {
-          const target = el.firstChild || el;
-          const range = document.createRange();
-          range.setStart(target, 0);
-          range.collapse(true);
-          const sel = window.getSelection();
-          sel.removeAllRanges();
-          sel.addRange(range);
-          return true;
-        } catch (e) {
-          return false;
-        }
-      });
-      if (!caretPlaced) {
-        throw new Error(
-          `Antwort-Text konnte nicht in den Editor übernommen werden (body-serialisierung): ` +
-          `der Cursor konnte nicht gesetzt werden. Verifikation: ${JSON.stringify(insertionVerification)}. ` +
-          `Es wurde nichts gespeichert und nichts überschrieben.`
-        );
-      }
-
-      await activePage.keyboard.type(body, { delay: 5 });
-      await activePage.waitForTimeout(500);
-
-      // Nachweis NACH dem Fallback: innerText muss jetzt den Body tragen.
-      const fallbackText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
-      const fallbackVerified = verifyBodyInserted(fallbackText, body);
-
-      if (!fallbackVerified) {
-        throw new Error(
-          `Antwort-Text konnte nicht in den Editor übernommen werden (body-serialisierung). ` +
-          `Verifikation: ${JSON.stringify(insertionVerification)} Nach dem Fallback: textLength=${fallbackText.length} sample="${fallbackText.slice(0, 80)}". ` +
-          `Entwurf wurde NICHT gespeichert — bitte Vorgang manuell prüfen.`
-        );
-      }
-
-      // Unversehrtheits-Beweis: Der zuvor vorhandene Inhalt (Verlauf/Signatur)
-      // muss nach dem Tippen NOCH VORHANDEN sein. Faellt er weg, hat das
-      // Typen den Bestand ueberschrieben — dann ist der Entwraft verfaelscht
-      // und darf nicht gespeichert werden.
-      if (preInsertText && !isHistoryPreserved(preInsertText, fallbackText)) {
-        throw new Error(
-          `ABBRUCH: Beim Nach tippen des Antwort-Texts ist der vorhandene E-Mail-Verlauf bzw. die ` +
-          `Signatur verloren gegangen (Bestand vor dem Tippen nicht mehr nachweisbar). ` +
-          `Der Entwurf wurde NICHT gespeichert, damit kein Inhaltsverlust entsteht. ` +
-          `Bitte den Entwurf manuell neu anlegen.`
-        );
-      }
+    // Unversehrtheits-Beweis: Der Bestand (Verlauf/Signatur) muss nach dem Tippen
+    // noch vorhanden sein. Fehlt er, hat das Tippen ueberschrieben — dann ist
+    // das Entwurfs-Ergebnis verfaelscht und wird NICHT gespeichert.
+    if (!isHistoryPreserved(preInsertText, editorText)) {
+      throw new Error(
+        `ABBRUCH: Beim Tippen des Antwort-Texts ist der vorhandene E-Mail-Verlauf bzw. die ` +
+        `Signatur verloren gegangen. Der Entwurf wurde NICHT gespeichert, damit kein ` +
+        `Inhaltsverlust entsteht. Bitte den Entwurf manuell neu anlegen.`
+      );
     }
 
     await activePage.waitForTimeout(500);
@@ -6137,7 +6150,85 @@ export class OwaClient {
     await activePage.keyboard.press('Control+s');
     await activePage.waitForTimeout(3500);
 
-    const bodyInsertSource = bodyVerified ? 'dom-insertion' : 'keyboard-fallback';
+    // bodyInsertSource ist jetzt konstant 'keyboard-typing': der Weg, der nach
+    // dem Live-Befund tatsaechlich serialisiert.
+    const bodyInsertSource = 'keyboard-typing';
+
+    // 8. PERSISTIERTER NACHWEIS (der eigentliche Beleg, Live-Befund 09.10.2026).
+    // Der flüchtige Editor-Inhalt ist KEIN Beweis fuer die Speicherung — genau
+    // dieser Check hat im ersten Fix "dom-insertion" faelschlich als Erfolg
+    // gemeldet, waehrend der gespeicherte Entwurf leer war. Belastbar ist nur
+    // der ZUSTAND NACH dem Speichern: den gespeicherten Entwurf erneut
+    // oeffnen und den Koerper daraus lesen.
+    //
+    // Schlaegt dieser Nachweis fehl, wird das Ergebnis ausdruecklich als
+    // "nicht verifiziert" gemeldet (success:false) statt einen scheinbar
+    // erfolgreichen, in Wahrheit leeren Entwurf zu behaupten. Der Entwurf
+    // bleibt zur Sichtung liegen - geloescht wird er NICHT automatisch.
+    let persistedBodyVerified = null;
+    let persistedDetail = null;
+    try {
+      await this.navigateFolder('drafts');
+      await new Promise((r) => setTimeout(r, 3000));
+      const draftPage = await this.getPage(true);
+
+      // Jüngsten Draft mit passendem Betreff finden
+      const draftId = await draftPage.evaluate((subjectGuess) => {
+        const rows = Array.from(document.querySelectorAll('div[data-convid]'));
+        for (const r of rows) {
+          const t = (r.innerText || '').replace(/\s+/g, ' ');
+          if (/\[Draft\]/i.test(t)) {
+            const id = r.getAttribute('data-convid') || '';
+            r.click();
+            return id;
+          }
+        }
+        return null;
+      }, emailSubject);
+
+      if (!draftId) {
+        persistedDetail = 'Draft nach dem Speichern nicht in der Entwurfsliste auffindbar.';
+      } else {
+        await new Promise((r) => setTimeout(r, 3500));
+        const persisted = await draftPage.evaluate(() => {
+          // Gleiche Editor-Identitaet wie oben: role=textbox ODER
+          // contenteditable=true, damit nicht der Wrapper ohne echten Editor
+          // gelesen wird.
+          const sel = '[contenteditable="true"][aria-label*="Message body" i], ' +
+            '[contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
+            'div[role="textbox"][aria-label*="Message body" i], ' +
+            'div[role="textbox"][aria-label*="Nachrichtentext" i]';
+          const ed = document.querySelector(sel);
+          if (ed) return { found: true, text: (ed.innerText || ed.textContent || '').trim() };
+          const pane = document.querySelector('div[role="main"]');
+          return { found: false, text: pane ? (pane.innerText || '') : (document.body.innerText || '') };
+        });
+        persistedBodyVerified = verifyBodyInserted(persisted.text, body);
+        persistedDetail = `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, ` +
+          `Editor gefunden: ${persisted.found}`;
+      }
+    } catch (e) {
+      persistedDetail = `Nachweis nicht durchfuehrbar: ${e && e.message ? e.message : e}`;
+    }
+
+    if (persistedBodyVerified !== true) {
+      return {
+        success: false,
+        action: isReplyAll ? 'reply_all' : 'reply',
+        subject: emailSubject || undefined,
+        targetMailPreview: selectedMailPreview || undefined,
+        preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
+        bodyInsertSource,
+        persistedBodyVerified: persistedBodyVerified === null ? 'unverified' : false,
+        folder: 'Entwürfe (Drafts)',
+        message:
+          `WARNUNG: Der Antwort-Entwurf wurde gespeichert, sein Text ist im gespeicherten ` +
+          `Entwurf aber NICHT nachweisbar. Der Entwurf bleibt zur Sichtung in "Entwürfe" ` +
+          `liegen und wurde NICHT automatisch gelöscht. Bitte manuell prüfen und ` +
+          `ggf. neu anlegen. Grund: ${persistedDetail}`,
+        diagnostics: { insertionVerification, persistedDetail }
+      };
+    }
 
     return {
       success: true,
@@ -6146,8 +6237,12 @@ export class OwaClient {
       targetMailPreview: selectedMailPreview || undefined,
       preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
       bodyInsertSource,
+      persistedBodyVerified: true,
       folder: 'Entwürfe (Drafts)',
-      message: `Antwort-Entwurf (${isReplyAll ? 'Allen antworten' : 'Antworten'}) erfolgreich erstellt und in "Entwürfe" gespeichert (Textübernahme: ${bodyInsertSource}). Verlauf und Signatur wurden beibehalten.`
+      message:
+        `Antwort-Entwurf (${isReplyAll ? 'Allen antworten' : 'Antworten'}) erstellt, in ` +
+        `"Entwürfe" gespeichert und im gespeicherten Zustand verifiziert ` +
+        `(Textübernahme: ${bodyInsertSource}). Verlauf und Signatur blieben erhalten.`
     };
   }
 
