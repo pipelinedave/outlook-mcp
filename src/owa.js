@@ -1,14 +1,6 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import TurndownService from 'turndown';
 import { browserManager } from './browser.js';
 import { config } from './config.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const sigPath = path.join(__dirname, 'default_signature.html');
-const DEFAULT_SIGNATURE_HTML = fs.existsSync(sigPath) ? fs.readFileSync(sigPath, 'utf8') : '';
 
 const turndown = new TurndownService({
   headingStyle: 'atx',
@@ -3424,66 +3416,162 @@ export class OwaClient {
   }
 
   async createDraft({ to, subject, body, cc }) {
+    if (!body || typeof body !== 'string' || body.trim().length === 0) {
+      throw new Error('Parameter "body" ist erforderlich und darf nicht leer sein.');
+    }
+
     const page = await this.getPage(true);
 
     const toStr = Array.isArray(to) ? to.join('; ') : (to || '');
     const ccStr = Array.isArray(cc) ? cc.join('; ') : (cc || '');
     const subjectStr = subject || '';
-    const bodyStr = body || '';
+    const bodyStr = body;
 
     // Important: Do not pass body in URL params, as that forces OWA into plain-text and strips the default signature!
     const composeUrl = buildComposeUrl(this.realm, { to, subject, cc });
 
+    // Der Compose-DeepLink kann einen NEUEN Tab oeffnen (gleiche Faehigkeit wie
+    // beim Kalender-DeepLink) — Tabliste vorher merken.
+    const context = browserManager.context;
+    const pagesBefore = context ? context.pages().length : 0;
+
     await page.goto(composeUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(5000);
 
-    const editor = await page.waitForSelector(
-      'div[role="textbox"][aria-label*="Message body" i], div[role="textbox"][aria-label*="Nachrichtentext" i], div[aria-label="Message body"], div[aria-label="Nachrichtentext"]',
-      { timeout: 15000 }
-    ).catch(() => null);
-
-    if (editor) {
-      await editor.click();
-      await page.waitForTimeout(300);
-
-      // Check if signature already in DOM
-      const hasSignature = await editor.evaluate(el => el.innerHTML.includes('id="Signature"') || el.innerHTML.includes('David Hallmann'));
-
-      if (!hasSignature) {
-        // Inject rich signature if not present in new compose window
-        await editor.evaluate((el, sig) => {
-          el.innerHTML = `<p><br></p><p><br></p>${sig}`;
-        }, DEFAULT_SIGNATURE_HTML);
-        await page.waitForTimeout(300);
+    // Falls ein neuer Tab geoeffnet wurde: auf diesen wechseln
+    let activePage = page;
+    if (context) {
+      const pagesAfter = context.pages();
+      if (pagesAfter.length > pagesBefore) {
+        activePage = pagesAfter[pagesAfter.length - 1];
+        this.lastPage = activePage;
       }
+    }
 
-      // Prepend body lines before signature via safe DOM insertion
-      await editor.evaluate((el, text) => {
-        const lines = text.split('\n');
-        const fragment = document.createDocumentFragment();
-        for (const line of lines) {
-          const p = document.createElement('p');
-          if (line.trim().length === 0) {
-            p.appendChild(document.createElement('br'));
-          } else {
-            p.textContent = line;
-          }
-          fragment.appendChild(p);
-        }
-        const spacer = document.createElement('p');
-        spacer.appendChild(document.createElement('br'));
-        fragment.appendChild(spacer);
+    // ECHTER EDITOR (gleicher Standard wie replyDraft, Live-Befund 09.10.2026):
+    // Es gibt MEHRERE Knoten mit aria-label "Message body" — den echten Editor
+    // (role=textbox / contenteditable=true) und einen Wrapper ohne
+    // contenteditable. Der Wrapper liefert CSS-Quelltext statt Nachrichtentext,
+    // deshalb wird er abgewiesen statt stillschweigend verwendet.
+    //
+    // ROBUSTHEIT (Live-Befund 09.10.2026, adesso-Realm): Direkt nach einem
+    // Realm-Wechsel kann OWA den Compose-DeepLink verschlucken (Redirect auf
+    // /mail/, App noch im Ladeuebergang). Der Editor ist dann nicht da, obwohl
+    // Selektor und Profil korrekt sind. Deshalb: URL pruefen und GENAU EINMAL
+    // erneut navigieren, bevor abgebrochen wird.
+    const EDITOR_SEL =
+      'div[role="textbox"][contenteditable="true"][aria-label*="Message body" i], ' +
+      'div[role="textbox"][contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
+      '[contenteditable="true"][aria-label*="Message body" i], ' +
+      '[contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
+      'div[role="textbox"][aria-label*="Message body" i], ' +
+      'div[role="textbox"][aria-label*="Nachrichtentext" i]';
 
-        el.insertBefore(fragment, el.firstChild);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      }, bodyStr);
+    let editor = await activePage.waitForSelector(EDITOR_SEL, { timeout: 15000 }).catch(() => null);
 
-      await page.waitForTimeout(500);
+    if (!editor) {
+      const urlAfterFirstTry = activePage.url();
+      // GENAU EIN Recovery-Versuch: frisch navigieren (kein Loop).
+      await activePage.goto(composeUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(6000);
+      editor = await activePage.waitForSelector(EDITOR_SEL, { timeout: 15000 }).catch(() => null);
+      if (!editor) {
+        throw new Error(
+          `Compose-Editor für den Entwurf konnte nicht gefunden werden. Es wurde nichts gespeichert. ` +
+          `Diagnostik: URL nach dem 1. Versuch: ${urlAfterFirstTry} | URL jetzt: ${activePage.url()} | ` +
+          `Tabs: ${(context ? context.pages().length : 1)} (vorher ${pagesBefore}).`
+        );
+      }
+    }
 
-      // Save draft
-      await page.keyboard.press('Control+s');
-      await page.waitForTimeout(3000);
+    const editorKind = await editor.evaluate((el) => ({
+      contentEditable: el.getAttribute && el.getAttribute('contenteditable'),
+      role: (el.getAttribute && el.getAttribute('role')) || '',
+      tag: el.tagName
+    }));
+    if (!isRealComposeEditor(editorKind)) {
+      throw new Error(
+        `Gefundener Compose-Knoten ist kein echter Editor ` +
+        `(contenteditable="${editorKind.contentEditable}", role="${editorKind.role}"). ` +
+        `Eine Textpruefung waere wertlos - es wird nichts getippt und nichts gespeichert.`
+      );
+    }
+
+    // Bestand vor dem Tippen merken (Unversehrtheits-Beweis fuer die
+    // OWA-Account-Signatur, die OWA beim Oeffnen automatisch einsetzt).
+    const preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
+
+    // TEXTUEBERNAHME PER TASTATUR — derselbe Serialisierungs-Weg wie bei
+    // replyDraft. Die fruehere reine DOM-Insertion (insertBefore + dispatchEvent)
+    // wurde von OWA NICHT serialisiert (Live-Befund 09.10.2026: Entwurf
+    // gespeichert, Koerper leer). Ein DOM-Eingriff ist fuer das interne
+    // Editor-Modell unsichtbar.
+    //
+    // SICHERHEIT: Caret per DOM-Range an den Inhaltsanfang, KEIN Control+A —
+    // das wuerde eine vorhandene Signatur markieren und beim Tippen
+    // ueberschreiben.
+    await editor.click();
+    await activePage.waitForTimeout(300);
+
+    const caretPlaced = await editor.evaluate((el) => {
+      try {
+        const target = el.firstChild || el;
+        const range = document.createRange();
+        range.setStart(target, 0);
+        range.collapse(true);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        el.focus();
+        return true;
+      } catch (e) {
+        return false;
+      }
+    });
+    if (!caretPlaced) {
+      throw new Error('Cursor konnte im Compose-Editor nicht gesetzt werden. Es wurde nichts gespeichert und nichts überschrieben.');
+    }
+
+    await activePage.keyboard.type(bodyStr, { delay: 5 });
+    await activePage.waitForTimeout(600);
+
+    // Verifikation im Editor (fluechtig — der starke Beleg folgt unten).
+    const editorText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
+    if (!verifyBodyInserted(editorText, bodyStr)) {
+      throw new Error(
+        `Entwurfstext ist nach dem Tippen NICHT im Editor nachweisbar — es wird nicht ` +
+        `gespeichert, um keinen leeren Entwurf anzulegen. Editor-Text-Länge: ${editorText.length}.`
+      );
+    }
+    if (!isHistoryPreserved(preInsertText, editorText)) {
+      throw new Error(
+        'ABBRUCH: Beim Tippen ging die vorhandene Signatur verloren. ' +
+        'Der Entwurf wurde NICHT gespeichert, damit kein Inhaltsverlust entsteht.'
+      );
+    }
+
+    // Save draft
+    await activePage.keyboard.press('Control+s');
+    await activePage.waitForTimeout(3000);
+
+    // PERSISTIERTER NACHWEIS — derselbe Beweisstandard wie replyDraft.
+    const persisted = await this.verifyPersistedDraftBody(bodyStr);
+
+    if (persisted.verified !== true) {
+      return {
+        success: false,
+        to: toStr,
+        cc: ccStr || undefined,
+        subject: subjectStr,
+        preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
+        persistedBodyVerified: persisted.verified === null ? 'unverified' : false,
+        folder: 'Entwürfe (Drafts)',
+        message:
+          `WARNUNG: Der Entwurf wurde gespeichert, sein Text ist im gespeicherten Entwurf ` +
+          `aber NICHT nachweisbar. Der Entwurf bleibt zur Sichtung in "Entwürfe" liegen und ` +
+          `wurde NICHT automatisch gelöscht. Bitte manuell prüfen und ggf. neu anlegen. ` +
+          `Grund: ${persisted.detail}`
+      };
     }
 
     return {
@@ -3492,8 +3580,9 @@ export class OwaClient {
       cc: ccStr || undefined,
       subject: subjectStr,
       preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
-      folder: "Entwürfe (Drafts)",
-      message: "Entwurf wurde erfolgreich in Outlook unter 'Entwürfe' gespeichert (inklusive Signatur)."
+      persistedBodyVerified: true,
+      folder: 'Entwürfe (Drafts)',
+      message: 'Entwurf wurde in Outlook unter "Entwürfe" gespeichert und im gespeicherten Zustand verifiziert (Text via Tastatur, Serialisierung nachgewiesen).'
     };
   }
 
@@ -6154,62 +6243,12 @@ export class OwaClient {
     // dem Live-Befund tatsaechlich serialisiert.
     const bodyInsertSource = 'keyboard-typing';
 
-    // 8. PERSISTIERTER NACHWEIS (der eigentliche Beleg, Live-Befund 09.10.2026).
-    // Der flüchtige Editor-Inhalt ist KEIN Beweis fuer die Speicherung — genau
-    // dieser Check hat im ersten Fix "dom-insertion" faelschlich als Erfolg
-    // gemeldet, waehrend der gespeicherte Entwurf leer war. Belastbar ist nur
-    // der ZUSTAND NACH dem Speichern: den gespeicherten Entwurf erneut
-    // oeffnen und den Koerper daraus lesen.
-    //
-    // Schlaegt dieser Nachweis fehl, wird das Ergebnis ausdruecklich als
-    // "nicht verifiziert" gemeldet (success:false) statt einen scheinbar
-    // erfolgreichen, in Wahrheit leeren Entwurf zu behaupten. Der Entwurf
-    // bleibt zur Sichtung liegen - geloescht wird er NICHT automatisch.
-    let persistedBodyVerified = null;
-    let persistedDetail = null;
-    try {
-      await this.navigateFolder('drafts');
-      await new Promise((r) => setTimeout(r, 3000));
-      const draftPage = await this.getPage(true);
-
-      // Jüngsten Draft mit passendem Betreff finden
-      const draftId = await draftPage.evaluate((subjectGuess) => {
-        const rows = Array.from(document.querySelectorAll('div[data-convid]'));
-        for (const r of rows) {
-          const t = (r.innerText || '').replace(/\s+/g, ' ');
-          if (/\[Draft\]/i.test(t)) {
-            const id = r.getAttribute('data-convid') || '';
-            r.click();
-            return id;
-          }
-        }
-        return null;
-      }, emailSubject);
-
-      if (!draftId) {
-        persistedDetail = 'Draft nach dem Speichern nicht in der Entwurfsliste auffindbar.';
-      } else {
-        await new Promise((r) => setTimeout(r, 3500));
-        const persisted = await draftPage.evaluate(() => {
-          // Gleiche Editor-Identitaet wie oben: role=textbox ODER
-          // contenteditable=true, damit nicht der Wrapper ohne echten Editor
-          // gelesen wird.
-          const sel = '[contenteditable="true"][aria-label*="Message body" i], ' +
-            '[contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
-            'div[role="textbox"][aria-label*="Message body" i], ' +
-            'div[role="textbox"][aria-label*="Nachrichtentext" i]';
-          const ed = document.querySelector(sel);
-          if (ed) return { found: true, text: (ed.innerText || ed.textContent || '').trim() };
-          const pane = document.querySelector('div[role="main"]');
-          return { found: false, text: pane ? (pane.innerText || '') : (document.body.innerText || '') };
-        });
-        persistedBodyVerified = verifyBodyInserted(persisted.text, body);
-        persistedDetail = `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, ` +
-          `Editor gefunden: ${persisted.found}`;
-      }
-    } catch (e) {
-      persistedDetail = `Nachweis nicht durchfuehrbar: ${e && e.message ? e.message : e}`;
-    }
+    // 8. PERSISTIERTER NACHWEIS — gemeinsame Methode (s. verifyPersistedDraftBody).
+    // Nur der Zustand NACH dem Speichern gilt als Beleg; der Entwurf bleibt bei
+    // Fehlschlag zur Sichtung liegen und wird NICHT automatisch geloescht.
+    const persisted = await this.verifyPersistedDraftBody(body);
+    const persistedBodyVerified = persisted.verified;
+    const persistedDetail = persisted.detail;
 
     if (persistedBodyVerified !== true) {
       return {
@@ -6244,6 +6283,66 @@ export class OwaClient {
         `"Entwürfe" gespeichert und im gespeicherten Zustand verifiziert ` +
         `(Textübernahme: ${bodyInsertSource}). Verlauf und Signatur blieben erhalten.`
     };
+  }
+
+  // PERSISTIERTER NACHWEIS des gespeicherten Entwurfs (Problem 1, Live-Befund
+  // 09.10.2026). Der fluechtige Editor-Inhalt ist KEIN Beweis fuer die
+  // Speicherung — OWA serialisiert aus seinem internen Zustand, nicht aus dem
+  // DOM. Belastbar ist nur der ZUSTAND NACH dem Speichern: den Entwurf erneut
+  // oeffnen und den Koerper daraus lesen.
+  //
+  // Wird von replyDraft UND createDraft genutzt (gleicher Serialisierungs-Weg,
+  // gleicher Beweisstandard). Der Entwurf wird hier NIE geloescht — ein
+  // fehlgeschlagener Nachweis bleibt zur manuellen Sichtung liegen.
+  //
+  // Rueckgabe: { verified: boolean|null, detail: string }.
+  // verified=null bedeutet "nicht pruefbar" (z.B. Draft nicht auffindbar).
+  async verifyPersistedDraftBody(expectedBody) {
+    try {
+      await this.navigateFolder('drafts');
+      await new Promise((r) => setTimeout(r, 3000));
+      const draftPage = await this.getPage(true);
+
+      // Obersten [Draft] oeffnen (der juengste ist der soeben gespeicherte)
+      const draftId = await draftPage.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll('div[data-convid]'));
+        for (const r of rows) {
+          const t = (r.innerText || '').replace(/\s+/g, ' ');
+          if (/\[Draft\]/i.test(t)) {
+            const id = r.getAttribute('data-convid') || '';
+            r.click();
+            return id;
+          }
+        }
+        return null;
+      });
+
+      if (!draftId) {
+        return { verified: null, detail: 'Draft nach dem Speichern nicht in der Entwurfsliste auffindbar.' };
+      }
+
+      await new Promise((r) => setTimeout(r, 3500));
+      const persisted = await draftPage.evaluate(() => {
+        // Gleiche Editor-Identitaet wie beim Compose: role=textbox ODER
+        // contenteditable=true, damit nicht der Wrapper ohne echten Editor
+        // gelesen wird.
+        const sel = '[contenteditable="true"][aria-label*="Message body" i], ' +
+          '[contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
+          'div[role="textbox"][aria-label*="Message body" i], ' +
+          'div[role="textbox"][aria-label*="Nachrichtentext" i]';
+        const ed = document.querySelector(sel);
+        if (ed) return { found: true, text: (ed.innerText || ed.textContent || '').trim() };
+        const pane = document.querySelector('div[role="main"]');
+        return { found: false, text: pane ? (pane.innerText || '') : (document.body.innerText || '') };
+      });
+
+      return {
+        verified: verifyBodyInserted(persisted.text, expectedBody),
+        detail: `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, Editor gefunden: ${persisted.found}`
+      };
+    } catch (e) {
+      return { verified: null, detail: `Nachweis nicht durchfuehrbar: ${e && e.message ? e.message : e}` };
+    }
   }
 
   getLastPage() { return this.lastPage; }
