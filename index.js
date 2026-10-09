@@ -189,13 +189,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Schließt die Hintergrund-Browserinstanz.',
         inputSchema: {
           type: 'object',
-          properties: {}
+          properties: {
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
+          }
         }
       },
       {
         name: 'outlook_list_folders',
         description: 'Listet die Ordner im Navigationsbereich (Inbox, Sent Items, Archive, Deleted Items, Drafts, Newsletter) mit ihren Namen und Item-Counts.',
-        inputSchema: { type: 'object', properties: {} }
+        inputSchema: {
+          type: 'object',
+          properties: {
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
+          }
+        }
       },
       {
         name: 'outlook_navigate_folder',
