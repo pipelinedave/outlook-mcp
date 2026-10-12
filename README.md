@@ -19,12 +19,14 @@ neue E-Mail-Entwürfe sicher anlegen.
 
 ## Features
 
-- **22 leistungsfähige MCP-Tools**:
+- **24 leistungsfähige MCP-Tools**:
   - `outlook_status`: Prüft Verbindungs- und Anmeldestatus von Outlook Web.
   - `outlook_login`: Öffnet ein sichtbares Browserfenster für den einmaligen interaktiven Login (inkl. SSO / MFA).
   - `outlook_set_realm`: Schaltet den aktiven Tenant/Realm um (Multi-Tenant, z.B. `d-velop.de` ↔ `adesso.de`). Jeder Realm nutzt ein eigenes persistentes Browser-Profil, damit die Mailbox-Sessions nicht vermischt werden.
   - `outlook_search`: Volltextsuche über das OWA-Suchfeld (nach Kunden, Tickets, Absendern, Stichwörtern).
   - `outlook_get_email`: Liest eine E-Mail vollständig im Lesebereich aus (konvertiert in Markdown, extrahiert Teams-Links und Metadaten).
+  - `outlook_list_attachments`: **READ-ONLY** – listet die Anlagen einer E-Mail im Lesebereich auf (Anlagen-Chips mit Dateinamen + Inline-Bilder mit Größen). Vorstufe zum Speichern.
+  - `outlook_save_attachments`: Speichert die Anlagen einer E-Mail auf die Festplatte. Anlagen-Chips per Hover-Download-Button (echtes Playwright-Download-Event, `acceptDownloads`), Inline-Bilder (`blob:`/`data:`-URIs im Body) als Fallback. `destDir` (unter dem Home-Verzeichnis) oder Default `~/projects/outlook-attachments/<Zeitstempel>/`. Kollisionsfreie Dateinamen, Diagnostik pro Anhang.
   - `outlook_list_recent`: Schnelle Übersicht über die neuesten E-Mails im Posteingang.
   - `outlook_create_draft`: Legt neue E-Mail-Entwürfe im Ordner „Entwürfe“ (Drafts) an (per OWA DeepLink & Ctrl+S).
   - `outlook_reply_draft`: Erstellt einen nativen Antwort-Entwurf (Reply / Reply All) direkt auf eine bestehende E-Mail. Behält vollständigen E-Mail-Verlauf (Thread/Zitat) und die automatische Outlook-Signatur bei.

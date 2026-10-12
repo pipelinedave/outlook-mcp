@@ -103,6 +103,61 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'outlook_list_attachments',
+        description: 'LISTET die Anlagen einer E-Mail im Lesebereich auf (Dateinamen der Anlagen-Chips + Inline-Bilder mit Größen). Non-destruktive Vorstufe zu outlook_save_attachments.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            index: {
+              type: 'number',
+              description: '0-basierter Index der E-Mail in der aktuellen Liste (Standard: 0)',
+              default: 0
+            },
+            id: {
+              type: 'string',
+              description: 'Optionale Conversation-ID (data-convid) der E-Mail — hat Vorrang vor index'
+            },
+            folder: {
+              type: 'string',
+              description: 'Optionaler Ausgangsordner (inbox/sentitems/archive/drafts), in dem die Conversation-ID gesucht wird'
+            },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
+          }
+        }
+      },
+      {
+        name: 'outlook_save_attachments',
+        description: 'Speichert die Anlagen der E-Mail auf die Festplatte: Anlagen-Chips per Hover-Download (Playwright-Download-Event), Inline-Bilder (blob/data-URIs) als Fallback. Gibt die gespeicherten Dateipfade zurück. destDir muss unter dem Home-Verzeichnis liegen.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            index: {
+              type: 'number',
+              description: '0-basierter Index der E-Mail in der aktuellen Liste (Standard: 0)',
+              default: 0
+            },
+            id: {
+              type: 'string',
+              description: 'Optionale Conversation-ID (data-convid) der E-Mail — hat Vorrang vor index'
+            },
+            folder: {
+              type: 'string',
+              description: 'Optionaler Ausgangsordner (inbox/sentitems/archive/drafts), in dem die Conversation-ID gesucht wird'
+            },
+            destDir: {
+              type: 'string',
+              description: 'Zielordner (absolut oder ~/...; muss unter dem Home-Verzeichnis liegen). Default: ~/projects/outlook-attachments/<Zeitstempel>/'
+            },
+            includeInlineImages: {
+              type: 'boolean',
+              description: 'Inline-Bilder als Fallback extrahieren, wenn kein Chip-Download gelang (Standard: true; verhindert Duplikate, wenn Chips erfolgreich waren)',
+              default: true
+            },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
+          }
+        }
+      },
+      {
         name: 'outlook_list_recent',
         description: 'Listet die neuesten E-Mails im Posteingang auf.',
         inputSchema: {
@@ -545,6 +600,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           res.originalId = args.id;
           res.correctedId = correctedId;
         }
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_list_attachments': {
+        const res = await owaClient.listAttachments({
+          index: typeof args?.index === 'number' ? args.index : 0,
+          id: args?.id,
+          folder: args?.folder
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_save_attachments': {
+        const res = await owaClient.saveAttachments({
+          index: typeof args?.index === 'number' ? args.index : 0,
+          id: args?.id,
+          folder: args?.folder,
+          destDir: args?.destDir,
+          includeInlineImages: args?.includeInlineImages ?? true
+        });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 

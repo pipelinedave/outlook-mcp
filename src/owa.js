@@ -1,4 +1,7 @@
 import TurndownService from 'turndown';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { browserManager } from './browser.js';
 import { config } from './config.js';
 
@@ -22,6 +25,18 @@ export const FOLDER_MAP = {
 export function resolveFolder(folder) {
   if (!folder) return 'inbox';
   return FOLDER_MAP[folder.toLowerCase()] || folder.toLowerCase();
+}
+
+// Dateinamen auf sichere, plattformneutrale Form kürzen (keine Pfad-Trenner,
+// keine Steuerzeichen, Längenlimit mit erhaltener Endung).
+function sanitizeFilename(name) {
+  let s = String(name || '').replace(/[\\/:*?"<>|\r\n\t]+/g, '_').replace(/\s+/g, ' ').trim();
+  if (!s) s = 'anhang';
+  const ext = path.extname(s);
+  if (s.length > 120) {
+    s = (ext ? s.slice(0, 120 - ext.length) : s).trim() + ext;
+  }
+  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -5408,6 +5423,354 @@ export class OwaClient {
       await page.waitForTimeout(400);
     }
     throw new Error(`convid nicht gefunden nach Scroll-Enumeration: ${convid}`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Anlagen-Handling (Tool-Lücke geschlossen, 12.10.2026)
+  // ---------------------------------------------------------------------------
+  // gbrain #7330: Anlagen (v.a. Screenshot-Blobs) waren in OWA nur als Thumbnail
+  // sichtbar und per Tool nicht extrahierbar. Zwei UI-getriebene Wege, passend
+  // zum Bridge-Ansatz (echter OWA-Client, keine Graph-API):
+  //   A) Anlagen-Chips im Lesebereich -> Hover -> Download-Trigger -> Playwright-
+  //      Download-Event (browser.js: acceptDownloads: true) -> saveAs()
+  //   B) Inline-Bilder im Body (blob:/data:) via in-page fetch -> base64 -> Datei.
+  //      Nur als Fallback, wenn kein Chip-Download gelang (vermeidet Duplikate).
+
+  // Oeffnet die Ziel-E-Mail im Lesebereich (Conversation-ID inkl. Scroll-
+  // Enumeration oder Listen-Index) und liefert die Playwright-Page zurueck.
+  async _openEmailForAttachments({ index = 0, id, folder, timeoutMs = 60000 } = {}) {
+    const page = await this.getPage(true);
+    if (folder) {
+      await this.navigateFolder(folder);
+    }
+    await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 15000 });
+    const paneSel = 'div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView';
+
+    if (id) {
+      const deadline = Date.now() + timeoutMs;
+      const rowLocator = page.locator(`div[data-convid="${String(id).replace(/["\\]/g, '\\$&')}"]`).first();
+      while (Date.now() <= deadline) {
+        if ((await rowLocator.count().catch(() => 0)) > 0) {
+          await rowLocator.click();
+          await page.waitForTimeout(2200);
+          await page.waitForSelector(paneSel, { timeout: 15000 });
+          return page;
+        }
+        await page.evaluate(() => {
+          const lists = document.querySelectorAll('[aria-label="Message list"] [role="listbox"], [aria-label="Message list"]');
+          let el = null;
+          for (const list of lists) { el = list; break; }
+          for (let k = 0; k < 8 && el; k++) {
+            const s = getComputedStyle(el);
+            if ((s.overflowY === 'scroll' || s.overflowY === 'auto') && el.scrollHeight > el.clientHeight) { el.scrollTop += 4000; return; }
+            el = el.parentElement;
+          }
+        });
+        await page.waitForTimeout(400);
+      }
+      throw new Error(`Timeout: Conversation-ID "${id}" wurde für den Anlagenzugriff nicht gefunden (Scroll-Enumeration).`);
+    }
+
+    const rows = await page.$$('div[data-convid], div[role="option"]');
+    if (rows.length === 0) throw new Error('Keine E-Mails in der Liste gefunden.');
+    const target = rows[Math.min(Math.max(0, index), rows.length - 1)];
+    await target.click();
+    await page.waitForTimeout(2000);
+    await page.waitForSelector(paneSel, { timeout: 15000 });
+    return page;
+  }
+
+  // Scannt den Lesebereich nach Anlagen-Chips und Inline-Bildern. Reine Daten-
+  // rueckgabe ohne Klicks — gemeinsame Basis fuer list + save.
+  async _scanAttachments(page) {
+    return await page.evaluate(() => {
+      const pane = document.querySelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView');
+      if (!pane) return { error: 'Lesebereich nicht gefunden' };
+      const extRe = /\.(png|jpe?g|gif|bmp|webp|heic|tif|tiff|pdf|docx?|xlsx?|pptx?|one|zip|7z|rar|msg|eml|txt|csv|ics|vcf|html?)($|\s|\()/i;
+
+      // A) Anlagen-Chips: bevorzugt innerhalb eines Anlagen-Kontainers
+      //    (aria-label "Anlagen"/"Attachments"), sonst Heuristik ueber
+      //    klickbare Elemente mit dateinamenaehnlichem Label.
+      const containers = Array.from(pane.querySelectorAll('[aria-label*="nlagen" i], [aria-label*="nlage" i], [aria-label*="ttachment" i]'));
+      const chipRoots = [];
+      const seenEls = new Set();
+      const addChip = (el) => {
+        if (!el || seenEls.has(el)) return;
+        const label = [el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
+        if (!extRe.test(label)) return;
+        seenEls.add(el);
+        chipRoots.push(el);
+      };
+      for (const c of containers) {
+        c.querySelectorAll('[role="listitem"], [role="option"], [role="button"], button, a').forEach(addChip);
+      }
+      if (chipRoots.length === 0) {
+        pane.querySelectorAll('[role="listitem"], [role="button"], button, a, span[title], div[title]').forEach(addChip);
+      }
+
+      const chips = [];
+      const seenNames = new Set();
+      for (const el of chipRoots) {
+        const label = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
+        const line = label.split(/\n|\s{2,}/).map(function (s) { return s.trim(); }).filter(Boolean).find(function (s) { return extRe.test(s); }) || label.trim();
+        const name = line.replace(/\s*(Herunterladen|Download)\s*$/i, '').trim().slice(0, 180);
+        if (!name || seenNames.has(name)) continue;
+        seenNames.add(name);
+        chips.push({
+          name: name,
+          tag: el.tagName,
+          role: el.getAttribute('role') || null,
+          hasDownloadIcon: !!el.querySelector('[data-icon-name="Download"], [aria-label*="erunterladen" i]')
+        });
+      }
+
+      // B) Inline-Bilder im Body (blob:/data:) mit sinnvoller Groesse
+      const inlineImages = [];
+      for (const img of pane.querySelectorAll('img')) {
+        const src = img.getAttribute('src') || '';
+        if (src.indexOf('blob:') !== 0 && src.indexOf('data:image/') !== 0) continue;
+        const r = img.getBoundingClientRect();
+        if (r.width < 100 || r.height < 60) continue;
+        inlineImages.push({
+          srcType: src.indexOf('blob:') === 0 ? 'blob' : 'data',
+          alt: (img.getAttribute('alt') || '').slice(0, 80) || null,
+          width: Math.round(r.width),
+          height: Math.round(r.height)
+        });
+      }
+      return { containerCount: containers.length, chips: chips, inlineImages: inlineImages };
+    });
+  }
+
+  async listAttachments({ index = 0, id, folder, timeoutMs = 60000 } = {}) {
+    const page = await this._openEmailForAttachments({ index, id, folder, timeoutMs });
+    const scan = await this._scanAttachments(page);
+    if (scan.error) throw new Error(scan.error);
+    const total = (scan.chips ? scan.chips.length : 0) + (scan.inlineImages ? scan.inlineImages.length : 0);
+    return {
+      target: id || ('index:' + index),
+      chips: scan.chips,
+      inlineImages: scan.inlineImages,
+      containerCount: scan.containerCount,
+      hint: total === 0
+        ? 'Keine Anlagen/Inline-Bilder im Lesebereich gefunden — Mail ggf. zuerst mit outlook_read_email gegenpruefen.'
+        : 'Speichern mit outlook_save_attachments (gleiche Zielangabe index/id/folder).'
+    };
+  }
+
+  async saveAttachments({ index = 0, id, folder, destDir, includeInlineImages = true, timeoutMs = 60000 } = {}) {
+    const page = await this._openEmailForAttachments({ index, id, folder, timeoutMs });
+    const scan = await this._scanAttachments(page);
+    if (scan.error) throw new Error(scan.error);
+
+    // Zielordner: Default ~/projects/outlook-attachments/<Zeitstempel>;
+    // Sicherheits-Guard: NUR innerhalb des Home-Verzeichnisses.
+    const home = os.homedir();
+    let targetDir;
+    if (destDir && String(destDir).trim()) {
+      targetDir = path.resolve(String(destDir).replace(/^~(?=\/|$)/, home));
+    } else {
+      const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+      targetDir = path.join(home, 'projects', 'outlook-attachments', stamp);
+    }
+    if (!(targetDir === home || targetDir.startsWith(home + path.sep))) {
+      throw new Error('destDir muss innerhalb des Home-Verzeichnisses liegen (abgelehnt: ' + targetDir + ')');
+    }
+    fs.mkdirSync(targetDir, { recursive: true });
+
+    const saved = [];
+    const failed = [];
+    const usedNames = new Set();
+    const uniqueTarget = (name) => {
+      const safe = sanitizeFilename(name);
+      const ext = path.extname(safe);
+      const base = ext ? safe.slice(0, safe.length - ext.length) : safe;
+      let candidate = safe;
+      let n = 1;
+      while (usedNames.has(candidate.toLowerCase())) {
+        candidate = base + '-' + n + ext;
+        n += 1;
+      }
+      usedNames.add(candidate.toLowerCase());
+      return path.join(targetDir, candidate);
+    };
+
+    // --- Weg A: Chips ueber Download-Trigger + Playwright-Download-Event ---
+    // Handles einmalig im Browser sammeln (gleiche Logik wie _scanAttachments,
+    // aber als ElementHandles, damit ohne Re-Query geklickt werden kann).
+    const chipArray = await page.evaluateHandle(() => {
+      const pane = document.querySelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView');
+      if (!pane) return [];
+      const extRe = /\.(png|jpe?g|gif|bmp|webp|heic|tif|tiff|pdf|docx?|xlsx?|pptx?|one|zip|7z|rar|msg|eml|txt|csv|ics|vcf|html?)($|\s|\()/i;
+      const containers = Array.from(pane.querySelectorAll('[aria-label*="nlagen" i], [aria-label*="nlage" i], [aria-label*="ttachment" i]'));
+      const chipRoots = [];
+      const seenEls = new Set();
+      const addChip = (el) => {
+        if (!el || seenEls.has(el)) return;
+        const label = [el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
+        if (!extRe.test(label)) return;
+        seenEls.add(el);
+        chipRoots.push(el);
+      };
+      for (const c of containers) {
+        c.querySelectorAll('[role="listitem"], [role="option"], [role="button"], button, a').forEach(addChip);
+      }
+      if (chipRoots.length === 0) {
+        pane.querySelectorAll('[role="listitem"], [role="button"], button, a, span[title], div[title]').forEach(addChip);
+      }
+      return chipRoots;
+    });
+    const chipProps = await chipArray.getProperties();
+    await chipArray.dispose();
+
+    // Kaskade: exaktes Fluent-Download-Icon -> Label beginnt mit
+    // "Herunterladen"/"Download" -> Substring-Match. ("Alle herunterladen"
+    // als ZIP-Fallback bewusst NICHT Teil der Kaskade — pro-Anhang-Dateien
+    // sind das Ziel.)
+    const TRIGGER_SELS = [
+      '[data-icon-name="Download"]',
+      'button[aria-label^="Herunterladen" i], button[aria-label^="Download" i], [role="button"][aria-label^="Herunterladen" i], [role="button"][aria-label^="Download" i]',
+      'button[aria-label*="erunterladen" i], button[aria-label*="ownload" i]'
+    ];
+
+    for (const [, chipHandle] of chipProps) {
+      let name = 'anhang';
+      try {
+        name = await chipHandle.evaluate((el) => {
+          const extRe = /\.(png|jpe?g|gif|bmp|webp|heic|tif|tiff|pdf|docx?|xlsx?|pptx?|one|zip|7z|rar|msg|eml|txt|csv|ics|vcf|html?)($|\s|\()/i;
+          const label = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
+          const line = label.split(/\n|\s{2,}/).map(function (s) { return s.trim(); }).filter(Boolean).find(function (s) { return extRe.test(s); }) || label.trim();
+          return line.replace(/\s*(Herunterladen|Download)\s*$/i, '').trim() || 'anhang';
+        });
+      } catch (e) {
+        // Chip evtl. zwischen Scan und Klick rerendert -> generischer Name
+      }
+
+      try {
+        await chipHandle.scrollIntoViewIfNeeded({ timeout: 5000 });
+      } catch (e) {
+        // nicht kritisch
+      }
+
+      let trigger = null;
+      let previewOpened = false;
+      for (const sel of TRIGGER_SELS) {
+        trigger = await chipHandle.$(sel).catch(() => null);
+        if (trigger) break;
+      }
+      if (!trigger) {
+        // Download-Button erscheint in OWA teils erst beim Hover
+        await chipHandle.hover({ timeout: 4000 }).catch(() => {});
+        for (const sel of TRIGGER_SELS) {
+          trigger = await chipHandle.$(sel).catch(() => null);
+          if (trigger) break;
+        }
+      }
+      if (!trigger) {
+        // Chip-Klick oeffnet die Vorschau; Download-Button dort suchen
+        await chipHandle.click({ timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(1800);
+        previewOpened = true;
+        for (const sel of TRIGGER_SELS) {
+          trigger = await page.$('[role="dialog"] ' + sel).catch(() => null);
+          if (trigger) break;
+          trigger = await page.$(sel).catch(() => null);
+          if (trigger) break;
+        }
+      }
+
+      if (!trigger) {
+        failed.push({ name: name, error: 'Kein Download-Trigger gefunden (Chip + Vorschau)' });
+        await page.keyboard.press('Escape').catch(() => {});
+        continue;
+      }
+
+      try {
+        const dlPromise = page.waitForEvent('download', { timeout: 30000 });
+        await trigger.click({ timeout: 8000 });
+        const download = await dlPromise;
+        const suggested = download.suggestedFilename() || name;
+        const target = uniqueTarget(suggested);
+        await download.saveAs(target);
+        saved.push({
+          file: target,
+          sizeBytes: fs.existsSync(target) ? fs.statSync(target).size : null,
+          source: previewOpened ? 'chip-vorschau-download' : 'chip-download'
+        });
+        // Vorschau/Overlay schliessen, damit der naechste Chip klickbar bleibt
+        await page.keyboard.press('Escape').catch(() => {});
+        await page.waitForTimeout(600);
+      } catch (e) {
+        failed.push({ name: name, error: String((e && e.message) || e).slice(0, 200) });
+        await page.keyboard.press('Escape').catch(() => {});
+      }
+    }
+    for (const [, h] of chipProps) {
+      h.dispose().catch(() => {});
+    }
+
+    // --- Weg B (Fallback): Inline-Bilder aus dem Body extrahieren ---
+    const inlineCount = scan.inlineImages ? scan.inlineImages.length : 0;
+    let inlineSkippedReason = null;
+    if (includeInlineImages && inlineCount > 0 && saved.length === 0) {
+      const imgs = await page.evaluate(async () => {
+        const pane = document.querySelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView');
+        if (!pane) return [];
+        const out = [];
+        for (const img of pane.querySelectorAll('img')) {
+          const src = img.getAttribute('src') || '';
+          if (src.indexOf('blob:') !== 0 && src.indexOf('data:image/') !== 0) continue;
+          const r = img.getBoundingClientRect();
+          if (r.width < 100 || r.height < 60) continue;
+          try {
+            let b64 = null;
+            let mime = 'image/png';
+            if (src.indexOf('data:') === 0) {
+              const m = src.match(/^data:([^;]+);base64,([\s\S]*)$/);
+              if (m) { mime = m[1]; b64 = m[2]; }
+            } else {
+              const resp = await fetch(src);
+              const blob = await resp.blob();
+              mime = blob.type || 'image/png';
+              const buf = new Uint8Array(await blob.arrayBuffer());
+              let bin = '';
+              for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+              b64 = btoa(bin);
+            }
+            if (b64) out.push({ b64: b64, mime: mime, alt: img.getAttribute('alt') || null });
+          } catch (e) {
+            out.push({ error: String(e).slice(0, 120) });
+          }
+        }
+        return out;
+      });
+      let idx = 0;
+      for (const im of imgs) {
+        idx += 1;
+        if (!im.b64) {
+          failed.push({ name: 'inline-bild-' + idx, error: im.error || 'kein base64' });
+          continue;
+        }
+        const ext = (String(im.mime || 'image/png').split('/')[1] || 'png').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'png';
+        const baseName = (im.alt && /\.(png|jpe?g|gif|webp)$/i.test(im.alt)) ? im.alt : 'inline-bild-' + idx + '.' + ext;
+        const target = uniqueTarget(baseName);
+        fs.writeFileSync(target, Buffer.from(im.b64, 'base64'));
+        saved.push({ file: target, sizeBytes: fs.statSync(target).size, source: 'inline-image' });
+      }
+    } else if (inlineCount > 0 && saved.length > 0) {
+      inlineSkippedReason = 'Chips erfolgreich gespeichert — Inline-Bilder uebersprungen (Duplikatsvermeidung)';
+    }
+
+    return {
+      success: saved.length > 0,
+      target: id || ('index:' + index),
+      destDir: targetDir,
+      savedCount: saved.length,
+      saved: saved,
+      failed: failed,
+      inlineSkippedReason: inlineSkippedReason,
+      scanned: { chips: scan.chips, inlineImageCount: inlineCount }
+    };
   }
 
   async toggleFlag(convid, folder = 'flagged') {
