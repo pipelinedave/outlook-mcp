@@ -5487,6 +5487,7 @@ export class OwaClient {
       const pane = document.querySelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView');
       if (!pane) return { error: 'Lesebereich nicht gefunden' };
       const extRe = /\.(png|jpe?g|gif|bmp|webp|heic|tif|tiff|pdf|docx?|xlsx?|pptx?|one|zip|7z|rar|msg|eml|txt|csv|ics|vcf|html?)($|\s|\()/i;
+      const typeRe = /(\boutlook\s*item\b|\be-?mail-?nachricht\b|\bnachrichtenelement\b|\bmailnachricht\b)/i;
 
       // A) Anlagen-Chips: bevorzugt innerhalb eines Anlagen-Kontainers
       //    (aria-label "Anlagen"/"Attachments"), sonst Heuristik ueber
@@ -5494,26 +5495,31 @@ export class OwaClient {
       const containers = Array.from(pane.querySelectorAll('[aria-label*="nlagen" i], [aria-label*="nlage" i], [aria-label*="ttachment" i]'));
       const chipRoots = [];
       const seenEls = new Set();
-      const addChip = (el) => {
+      const labelOf = (el) => [el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
+      const acceptChip = (el, strict) => {
         if (!el || seenEls.has(el)) return;
-        const label = [el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
-        if (!extRe.test(label)) return;
+        const label = labelOf(el);
+        if (!label.trim()) return;
+        // Innerhalb eines Anlagen-Kontainers reicht ein nichtleeres Label — das
+        // deckt .msg-"Outlook Item"-Karten ohne Dateiendung ab (gbrain #7471).
+        // Im Fallback weiter draussen gelten Dateiendung ODER Typ-Stichwort.
+        if (strict && !extRe.test(label) && !typeRe.test(label)) return;
         seenEls.add(el);
         chipRoots.push(el);
       };
       for (const c of containers) {
-        c.querySelectorAll('[role="listitem"], [role="option"], [role="button"], button, a').forEach(addChip);
+        c.querySelectorAll('[role="listitem"], [role="option"], [role="button"], button, a').forEach((el) => acceptChip(el, false));
       }
       if (chipRoots.length === 0) {
-        pane.querySelectorAll('[role="listitem"], [role="button"], button, a, span[title], div[title]').forEach(addChip);
+        pane.querySelectorAll('[role="listitem"], [role="button"], button, a, span[title], div[title]').forEach((el) => acceptChip(el, true));
       }
 
       const chips = [];
       const seenNames = new Set();
       for (const el of chipRoots) {
         const label = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
-        const line = label.split(/\n|\s{2,}/).map(function (s) { return s.trim(); }).filter(Boolean).find(function (s) { return extRe.test(s); }) || label.trim();
-        const name = line.replace(/\s*(Herunterladen|Download)\s*$/i, '').trim().slice(0, 180);
+        const line = label.split(/\n|\s{2,}/).map(function (s) { return s.trim(); }).filter(Boolean).find(function (s) { return extRe.test(s) || typeRe.test(s); }) || label.trim();
+        const name = line.replace(/[\s,]*(Outlook Item|E-Mail-Nachricht|Herunterladen|Download)\s*$/i, '').trim().slice(0, 180);
         if (!name || seenNames.has(name)) continue;
         seenNames.add(name);
         chips.push({
@@ -5602,21 +5608,27 @@ export class OwaClient {
       const pane = document.querySelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView');
       if (!pane) return [];
       const extRe = /\.(png|jpe?g|gif|bmp|webp|heic|tif|tiff|pdf|docx?|xlsx?|pptx?|one|zip|7z|rar|msg|eml|txt|csv|ics|vcf|html?)($|\s|\()/i;
+      const typeRe = /(\boutlook\s*item\b|\be-?mail-?nachricht\b|\bnachrichtenelement\b|\bmailnachricht\b)/i;
       const containers = Array.from(pane.querySelectorAll('[aria-label*="nlagen" i], [aria-label*="nlage" i], [aria-label*="ttachment" i]'));
       const chipRoots = [];
       const seenEls = new Set();
-      const addChip = (el) => {
+      const labelOf = (el) => [el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
+      const acceptChip = (el, strict) => {
         if (!el || seenEls.has(el)) return;
-        const label = [el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
-        if (!extRe.test(label)) return;
+        const label = labelOf(el);
+        if (!label.trim()) return;
+        // Innerhalb eines Anlagen-Kontainers reicht ein nichtleeres Label — das
+        // deckt .msg-"Outlook Item"-Karten ohne Dateiendung ab (gbrain #7471).
+        // Im Fallback weiter draussen gelten Dateiendung ODER Typ-Stichwort.
+        if (strict && !extRe.test(label) && !typeRe.test(label)) return;
         seenEls.add(el);
         chipRoots.push(el);
       };
       for (const c of containers) {
-        c.querySelectorAll('[role="listitem"], [role="option"], [role="button"], button, a').forEach(addChip);
+        c.querySelectorAll('[role="listitem"], [role="option"], [role="button"], button, a').forEach((el) => acceptChip(el, false));
       }
       if (chipRoots.length === 0) {
-        pane.querySelectorAll('[role="listitem"], [role="button"], button, a, span[title], div[title]').forEach(addChip);
+        pane.querySelectorAll('[role="listitem"], [role="button"], button, a, span[title], div[title]').forEach((el) => acceptChip(el, true));
       }
       return chipRoots;
     });
@@ -5638,9 +5650,10 @@ export class OwaClient {
       try {
         name = await chipHandle.evaluate((el) => {
           const extRe = /\.(png|jpe?g|gif|bmp|webp|heic|tif|tiff|pdf|docx?|xlsx?|pptx?|one|zip|7z|rar|msg|eml|txt|csv|ics|vcf|html?)($|\s|\()/i;
+      const typeRe = /(\boutlook\s*item\b|\be-?mail-?nachricht\b|\bnachrichtenelement\b|\bmailnachricht\b)/i;
           const label = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText].filter(Boolean).join(' ');
-          const line = label.split(/\n|\s{2,}/).map(function (s) { return s.trim(); }).filter(Boolean).find(function (s) { return extRe.test(s); }) || label.trim();
-          return line.replace(/\s*(Herunterladen|Download)\s*$/i, '').trim() || 'anhang';
+          const line = label.split(/\n|\s{2,}/).map(function (s) { return s.trim(); }).filter(Boolean).find(function (s) { return extRe.test(s) || typeRe.test(s); }) || label.trim();
+          return line.replace(/[\s,]*(Outlook Item|E-Mail-Nachricht|Herunterladen|Download)\s*$/i, '').trim() || 'anhang';
         });
       } catch (e) {
         // Chip evtl. zwischen Scan und Klick rerendert -> generischer Name
