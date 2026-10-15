@@ -2,6 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion, recipientListContains, extractEmailLike } from '../src/owa.js';
 import { config } from '../src/config.js';
+import { owaClient } from '../src/owa.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
   test('Standardordner Deutsch & Englisch auflösen', () => {
@@ -2487,5 +2488,42 @@ describe('extractEmailLike - Sent-Fallback-Trigger (P5, Befund 15.10.2026)', () 
     assert.equal(extractEmailLike('UHK Beschaffungsantrag'), null);
     assert.equal(extractEmailLike(''), null);
     assert.equal(extractEmailLike(null), null);
+  });
+});
+
+describe('_withReadRetry - Playwright-Stabilitaet (P6, Befund 15.10.2026)', () => {
+  test('transienter Fehler wird nach Restart-Retry durchgereicht und geloest', async () => {
+    let attempts = 0;
+    const res = await owaClient._withReadRetry('test-read', async () => {
+      attempts++;
+      if (attempts < 2) throw new Error('Target page closed');
+      return 'ok';
+    }, { retries: 2 });
+    assert.equal(res, 'ok');
+    assert.equal(attempts, 2);
+  });
+
+  test('nicht-transienter Fehler bricht SOFORT ab (kein Retry, kein Browser-Restart)', async () => {
+    let attempts = 0;
+    await assert.rejects(
+      () => owaClient._withReadRetry('test-read', async () => {
+        attempts++;
+        throw new Error('Suchfeld nicht gefunden');
+      }, { retries: 2 }),
+      /Suchfeld nicht gefunden/
+    );
+    assert.equal(attempts, 1);
+  });
+
+  test('Erschoepfte Retries: Label im Fehler, attempts = retries+1', async () => {
+    let attempts = 0;
+    await assert.rejects(
+      () => owaClient._withReadRetry('outlook_get_email', async () => {
+        attempts++;
+        throw new Error('navigation destroyed');
+      }, { retries: 2 }),
+      /outlook_get_email \(nach 2 Restart-Retries\)/
+    );
+    assert.equal(attempts, 3);
   });
 });

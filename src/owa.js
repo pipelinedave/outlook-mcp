@@ -5485,7 +5485,47 @@ export class OwaClient {
     };
   }
 
+  // P6 (Befund 15.10.2026): 4x "Target page closed" / "navigation destroyed"
+  // pro Session — fragile Reads laufen teils mitten in OWA-Client-Navigationen.
+  // Bewährter Workaround aus der Live-Session: Browser schließen -> neu starten
+  // -> Read wiederholen. Diese Methode kapselt genau das: transient erkennbare
+  // Fehler (Target closed, navigation destroyed, Execution context destroyed)
+  // führen zu max. `retries` Wiederholungen MIT sauberem Browser-Restart; das
+  // Persistent-Profile behält die Anmeldung. Andere Fehler gehen sofort durch.
+  async _withReadRetry(label, fn, { retries = 2 } = {}) {
+    // Explizite Varianten: Playwright meldet denselben Abbruch als
+    // "Target page closed", "Target closed" oder "Target page, context or
+    // browser has been closed" — alle drei plus die Evaluate-/Navigation-
+    // Formen sind transient (Befund 15.10.2026).
+    const TRANSIENT = /target page closed|target closed|target page, context or browser has been closed|page has been closed|browser has been closed|session closed|navigation destroyed|execution context was destroyed|net::err_aborted/i;
+    let lastErr = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (attempt > 0) {
+        // Sauberer Restart vor dem nächsten Versuch (Session bleibt im Profil)
+        await browserManager.close().catch(() => null);
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      try {
+        return await fn(attempt);
+      } catch (e) {
+        lastErr = e;
+        const msg = String((e && e.message) || e);
+        if (!TRANSIENT.test(msg) || attempt === retries) break;
+      }
+    }
+    if (lastErr) {
+      lastErr.message = `${label} (nach ${retries} Restart-Retries): ${lastErr.message}`;
+    }
+    throw lastErr;
+  }
+
+  // Oeffentlicher Read-Pfad mit Restart-Retry (P6): fragile Such-Reads laufen
+  // mitten in OWA-Client-Navigationen.
   async searchEmails(query, maxResults = 10) {
+    return this._withReadRetry('outlook_search', () => this._searchEmailsInner(query, maxResults));
+  }
+
+  async _searchEmailsInner(query, maxResults = 10) {
     const page = await this.getPage(true);
     
     if (!page.url().includes('outlook.office.com/mail') && !page.url().includes('outlook.cloud.microsoft/mail')) {
@@ -5508,6 +5548,10 @@ export class OwaClient {
 
     await page.waitForTimeout(3000);
     await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 10000 }).catch(() => null);
+    // Sensibles Settle-Wait: die Ergebnisliste re-rendert nach dem Selector-
+    // Treffer noch (mid-navigation-Reads waren die Hauptursache von
+    // "navigation destroyed" in page.evaluate).
+    await page.waitForTimeout(800);
 
     const emails = await page.evaluate((limit) => {
       const items = [];
@@ -5664,7 +5708,14 @@ export class OwaClient {
     };
   }
 
+  // Oeffentlicher Read-Pfad mit Restart-Retry (P6): "Target page closed"/
+  // "navigation destroyed" traten v.a. beim Lesebereichs-Read auf; der
+  // Live-Workaround (close -> search -> get_email(index)) ist hier verallgemeinert.
   async getEmailDetails(indexOrId = 0) {
+    return this._withReadRetry('outlook_get_email', () => this._getEmailDetailsInner(indexOrId));
+  }
+
+  async _getEmailDetailsInner(indexOrId = 0) {
     const page = await this.getPage(true);
 
     await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 15000 });
@@ -5813,7 +5864,14 @@ export class OwaClient {
     return { folder, count: emails.length, emails };
   }
 
+  // Oeffentlicher Read-Pfad mit Restart-Retry (P6): Scroll-Enumeration +
+  // Lesebereichs-Read sind die laengsten fragilen Sequenzen. Das harte
+  // Zeitlimit gilt pro Versuch (nach Restart wird vollstaendig neu gezaehlt).
   async readEmailByConvId(convid, folder, { timeoutMs = 60000 } = {}) {
+    return this._withReadRetry('outlook_read_email', () => this._readEmailByConvIdInner(convid, folder, { timeoutMs }));
+  }
+
+  async _readEmailByConvIdInner(convid, folder, { timeoutMs = 60000 } = {}) {
     const page = await this.getPage(true);
     if (folder) { await this.navigateFolder(folder); }
     // Hartes Zeitlimit für die Scroll-Enumeration: Ohne Limit lief die Schleife so lange,
@@ -5986,7 +6044,13 @@ export class OwaClient {
     });
   }
 
-  async listAttachments({ index = 0, id, folder, timeoutMs = 60000 } = {}) {
+  // Oeffentlicher Read-Pfad mit Restart-Retry (P6): Hover-Downloads sind
+  // fragil gegenueber Mid-Navigation-Rerenders.
+  async listAttachments(opts = {}) {
+    return this._withReadRetry('outlook_list_attachments', () => this._listAttachmentsInner(opts));
+  }
+
+  async _listAttachmentsInner({ index = 0, id, folder, timeoutMs = 60000 } = {}) {
     const page = await this._openEmailForAttachments({ index, id, folder, timeoutMs });
     const scan = await this._scanAttachments(page);
     if (scan.error) throw new Error(scan.error);
