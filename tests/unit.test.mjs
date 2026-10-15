@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -2328,5 +2328,46 @@ describe('collectCalendarEventLabels - Quellen-Leiter + Struktur-Census (Defekt 
       // Toolbar-Text darf KEIN Slot werden
       assert.equal(slots.filter((s) => /work week/i.test(s.title)).length, 0);
     });
+  });
+});
+
+describe('classifyBodyMatch / buildBodySollIstDiff - Autokorrektur-Befund 15.10.2026', () => {
+  const SOLL = 'Hallo Frau Kro\u00dfa,\n\nvielen Dank, bzw. dem Termin stimme ich zu.\n\nViele Gr\u00fc\u00dfe';
+
+  test('exact: erste Soll-Zeile 1:1 gefunden', () => {
+    assert.equal(classifyBodyMatch('Hallo Frau Kro\u00dfa,\nRest', SOLL), 'exact');
+  });
+
+  test('exact: whitespace-normalisiert gefunden (OWA-Rendering-Unterschied)', () => {
+    assert.equal(classifyBodyMatch('Hallo Frau\nKro\u00dfa,\nRest', SOLL), 'exact');
+  });
+
+  test('fuzzy: Autokorrektur-Kapitalisierung wird erkannt, nicht als exact verkaufen', () => {
+    assert.equal(classifyBodyMatch('hallo frau kro\u00dfa,\nRest', SOLL), 'fuzzy');
+  });
+
+  test('none: abweichender Text, leerer Editor, leere Eingaben', () => {
+    assert.equal(classifyBodyMatch('Anderer Text', SOLL), 'none');
+    assert.equal(classifyBodyMatch('', SOLL), 'none');
+    assert.equal(classifyBodyMatch('X', ''), 'none');
+    assert.equal(classifyBodyMatch(null, 'Hallo'), 'none');
+  });
+
+  test('Soll/Ist-Diff enthaelt Laengen und erste Zeilen', () => {
+    const d = buildBodySollIstDiff(SOLL, 'hallo frau kro\u00dfa,\nRest');
+    assert.equal(d.match, 'fuzzy');
+    assert.ok(d.expectedFirstLine.startsWith('Hallo Frau Kro\u00dfa'));
+    assert.ok(d.actualFirstLine.startsWith('hallo frau kro\u00dfa'));
+    assert.ok(d.expectedLength > 0 && d.actualLength > 0);
+  });
+
+  test('verifyBodyInserted toleriert Whitespace, nicht Gross/Klein', () => {
+    assert.equal(verifyBodyInserted('Hallo Frau\nKro\u00dfa,\nRest', 'Hallo Frau Kro\u00dfa,'), true);
+    assert.equal(verifyBodyInserted('hallo welt', 'Hallo Welt'), false);
+  });
+
+  test('normalizeBodyForCompare konsolidiert Whitespace, erhaelt Gross/Klein', () => {
+    assert.equal(normalizeBodyForCompare('  a \n\n b  '), 'a b');
+    assert.equal(normalizeBodyForCompare('Dem'), 'Dem');
   });
 });

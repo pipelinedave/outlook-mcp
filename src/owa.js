@@ -54,11 +54,16 @@ function sanitizeFilename(name) {
 // Prüft, ob die erste nicht-leere Zeile des erwarteten Bodys im Editor-Text
 // nachweisbar ist. Vergleich gegen den GESAMTEN innerText (nicht nur den
 // Anfang), weil OWA den Body an anderer Editor-Position platzieren kann.
+// Whitespace-Normalisierung (25.10. / 15.10.2026-Befund): OWA rendert Umbrüche
+// im Editor anders, als der Solltext sie liefert — der rohe Substring-Vergleich
+// blockierte sonst berechtigte Saves. Gross/Klein-Abweichungen zählen bewusst
+// NICHT als exakter Treffer (dafür: classifyBodyMatch -> 'fuzzy').
 export function verifyBodyInserted(text, expectedBody) {
   const t = String(text || '').trim();
   const firstLine = String(expectedBody || '').split('\n').find((l) => l.trim().length > 0) || '';
   if (!firstLine || !t) return false;
-  return t.includes(firstLine.trim());
+  if (t.includes(firstLine.trim())) return true;
+  return normalizeBodyForCompare(t).includes(normalizeBodyForCompare(firstLine));
 }
 
 // Der Editor ist genau dann ein echter Eingabe-Editor, wenn er NICHT auf
@@ -98,6 +103,45 @@ export function isHistoryPreserved(beforeText, afterText, probeLength = 200) {
 export function resolveBodyInserted({ text = '', expectedBody = '', contentEditable = null } = {}) {
   if (!isWritableEditor(contentEditable)) return false;
   return verifyBodyInserted(text, expectedBody);
+}
+
+// Whitespace-normalisierte Vergleichsbasis: OWA kann Umbrueche/Leerzeichen im
+// Editor anders rendern, als der Solltext sie liefert. Gross/Kleinschreibung
+// bleibt bewusst ERHALTEN (Abweichungen davon sind Autokorrektur-Artefakte
+// und werden von classifyBodyMatch als 'fuzzy' gemeldet, nicht kaschiert).
+export function normalizeBodyForCompare(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+// Dreistufiger Body-Nachweis (Befund 15.10.2026):
+//   'exact' -> erste Soll-Zeile 1:1 im Editor-Text (raw oder whitespace-normalisiert)
+//   'fuzzy' -> erste Soll-Zeile nur case-insensitive gefunden (typisches
+//              Autokorrektur-Artefakt: "dem" -> "Dem" nach "bzw. ")
+//   'none'  -> nicht nachweisbar
+export function classifyBodyMatch(text, expectedBody) {
+  const t = String(text || '');
+  const firstLine = String(expectedBody || '').split('\n').find((l) => l.trim().length > 0) || '';
+  if (!firstLine || !t.trim()) return 'none';
+  const normT = normalizeBodyForCompare(t);
+  const normF = normalizeBodyForCompare(firstLine);
+  if (normT.includes(normF)) return 'exact';
+  if (normT.toLowerCase().includes(normF.toLowerCase())) return 'fuzzy';
+  return 'none';
+}
+
+// Kompakte Soll/Ist-Diagnose fuer Fehler-Returns — verhindert den stillen
+// Misserfolg der harten Zeichen-Verifikation (sie blockierte den Save, ohne
+// klar zu sagen, WELCHER Text erwartet und WAS stattdessen gefunden wurde).
+export function buildBodySollIstDiff(expectedBody, actualText) {
+  const expLines = String(expectedBody || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const actLines = String(actualText || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  return {
+    match: classifyBodyMatch(actualText, expectedBody),
+    expectedLength: String(expectedBody || '').length,
+    actualLength: String(actualText || '').length,
+    expectedFirstLine: (expLines[0] || '').slice(0, 160),
+    actualFirstLine: (actLines[0] || '').slice(0, 160)
+  };
 }
 
 export function buildComposeUrl(realm, { to, subject, body, cc } = {}) {
@@ -3430,6 +3474,60 @@ export class OwaClient {
     }
   }
 
+  // TEXT-INJECTION OHNE AUTOKORREKTUR (Befund 15.10.2026): keyboard.type() tippt
+  // zeichenweise — die OWA-Autokorrektur kapitalisiert wortunabhängig Wörter
+  // nach "bzw. " ("dem"->"Dem", "zum"->"Zum") und Absatzanfänge
+  // ("kurzes"->"Kurzes"). Zwei Wege umgehen die Autokorrektur vollständig:
+  //   1) keyboard.insertText() (CDP Input.insertText) — erzeugt ein echtes
+  //      Input-Event OHNE Key-Events, also keinen Autokorrektur-Pfad, und ist
+  //      serialisierbar (das Editor-Modell verarbeitet den Input-Event)
+  //   2) Clipboard-Paste (navigator.clipboard.writeText + Ctrl+V) — im
+  //      Live-Betrieb an Teams erprobt; kein Autokorrektur-Pfad
+  // Nach jedem Weg wird der Editor-Text gelesen und gegen den Solltext geprüft.
+  // MISSERFOLG wird NIEMALS still gemeldet: Rueckgabe enthaelt immer Methode,
+  // Trefferklasse und den Editor-Stand (fuer Soll/Ist-Diff durch den Aufrufer).
+  async _injectBodyText(activePage, editor, body) {
+    const readEditor = async () => (await editor.evaluate((el) => (el.innerText || el.textContent || '').trim()));
+
+    // Weg 1: CDP Input.insertText (kein Autokorrektur-Pfad)
+    try {
+      await activePage.keyboard.insertText(body);
+      await activePage.waitForTimeout(600);
+      const editorText = await readEditor();
+      const match = classifyBodyMatch(editorText, body);
+      if (match !== 'none') {
+        return { method: 'cdp-insertText', editorText, match };
+      }
+    } catch (e) {
+      //insertText nicht verfuegbar -> naechster Weg
+    }
+
+    // Teil-Insertion rueckgaengig machen, bevor der Clipboard-Weg doppelt einfuegen wuerde
+    await activePage.keyboard.press('Control+z').catch(() => null);
+    await activePage.waitForTimeout(400);
+
+    // Weg 2: Clipboard-Paste (Caret bleibt an seiner Position — additiv, kein Ctrl+A)
+    try {
+      await activePage.evaluate((t) => navigator.clipboard.writeText(t), body);
+      await activePage.waitForTimeout(200);
+      await activePage.keyboard.press('Control+v');
+      await activePage.waitForTimeout(800);
+      const editorText = await readEditor();
+      const match = classifyBodyMatch(editorText, body);
+      if (match !== 'none') {
+        return { method: 'clipboard-paste', editorText, match };
+      }
+    } catch (e) {
+      //Clipboard-Pfad nicht verfuegbar -> Misserfolg melden
+    }
+
+    // Beide Wege gescheitert: Insertion rueckgaengig machen, damit kein
+    // verfaelschter Entwurf zurueckbleibt, und offen melden.
+    await activePage.keyboard.press('Control+z').catch(() => null);
+    await activePage.waitForTimeout(400);
+    return { method: null, editorText: await readEditor(), match: 'none' };
+  }
+
   async createDraft({ to, subject, body, cc }) {
     if (!body || typeof body !== 'string' || body.trim().length === 0) {
       throw new Error('Parameter "body" ist erforderlich und darf nicht leer sein.');
@@ -3547,20 +3645,22 @@ export class OwaClient {
       throw new Error('Cursor konnte im Compose-Editor nicht gesetzt werden. Es wurde nichts gespeichert und nichts überschrieben.');
     }
 
-    await activePage.keyboard.type(bodyStr, { delay: 5 });
-    await activePage.waitForTimeout(600);
-
-    // Verifikation im Editor (fluechtig — der starke Beleg folgt unten).
-    const editorText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
-    if (!verifyBodyInserted(editorText, bodyStr)) {
+    // TEXTUEBERNAHME autokorrektur-frei (Befund 15.10.2026): insertText/Clipboard
+    // statt zeichenweisem keyboard.type — OWA kapitalisierte sonst Wörter nach
+    // "bzw. " und Absatzanfänge. Bei Totalversagen wird NICHT gespeichert und
+    // die Fehlermeldung enthaelt Soll/Ist (kein stiller Misserfolg).
+    const injection = await this._injectBodyText(activePage, editor, bodyStr);
+    const editorText = injection.editorText;
+    if (!injection.method) {
       throw new Error(
-        `Entwurfstext ist nach dem Tippen NICHT im Editor nachweisbar — es wird nicht ` +
-        `gespeichert, um keinen leeren Entwurf anzulegen. Editor-Text-Länge: ${editorText.length}.`
+        `Entwurfstext konnte NICHT in den Editor übernommen werden (insertText- und ` +
+        `Clipboard-Weg fehlgeschlagen). Es wurde nichts gespeichert. Soll/Ist: ` +
+        `${JSON.stringify(buildBodySollIstDiff(bodyStr, editorText))}.`
       );
     }
     if (!isHistoryPreserved(preInsertText, editorText)) {
       throw new Error(
-        'ABBRUCH: Beim Tippen ging die vorhandene Signatur verloren. ' +
+        'ABBRUCH: Beim Einfügen des Texts ging die vorhandene Signatur verloren. ' +
         'Der Entwurf wurde NICHT gespeichert, damit kein Inhaltsverlust entsteht.'
       );
     }
@@ -3572,6 +3672,12 @@ export class OwaClient {
     // PERSISTIERTER NACHWEIS — derselbe Beweisstandard wie replyDraft.
     const persisted = await this.verifyPersistedDraftBody(bodyStr);
 
+    const bodyMeta = {
+      bodyInsertSource: injection.method,
+      bodyMatch: persisted.match || 'unverified',
+      ...(persisted.match === 'fuzzy' ? { bodySollIst: persisted.diff } : {})
+    };
+
     if (persisted.verified !== true) {
       return {
         success: false,
@@ -3579,13 +3685,14 @@ export class OwaClient {
         cc: ccStr || undefined,
         subject: subjectStr,
         preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
+        ...bodyMeta,
         persistedBodyVerified: persisted.verified === null ? 'unverified' : false,
         folder: 'Entwürfe (Drafts)',
         message:
           `WARNUNG: Der Entwurf wurde gespeichert, sein Text ist im gespeicherten Entwurf ` +
           `aber NICHT nachweisbar. Der Entwurf bleibt zur Sichtung in "Entwürfe" liegen und ` +
           `wurde NICHT automatisch gelöscht. Bitte manuell prüfen und ggf. neu anlegen. ` +
-          `Grund: ${persisted.detail}`
+          `Grund: ${persisted.detail} | Soll/Ist: ${JSON.stringify(persisted.diff || buildBodySollIstDiff(bodyStr, ''))}`
       };
     }
 
@@ -3595,9 +3702,12 @@ export class OwaClient {
       cc: ccStr || undefined,
       subject: subjectStr,
       preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
+      ...bodyMeta,
       persistedBodyVerified: true,
       folder: 'Entwürfe (Drafts)',
-      message: 'Entwurf wurde in Outlook unter "Entwürfe" gespeichert und im gespeicherten Zustand verifiziert (Text via Tastatur, Serialisierung nachgewiesen).'
+      message:
+        `Entwurf wurde in Outlook unter "Entwürfe" gespeichert und im gespeicherten Zustand verifiziert ` +
+        `(Textübernahme: ${injection.method}${persisted.match === 'fuzzy' ? ', mit Abweichungen — siehe bodySollIst' : ''}).`
     };
   }
 
@@ -6587,20 +6697,22 @@ export class OwaClient {
     // innerText-Check bestaetigte deshalb nur die eigene Mutation und meldete
     // faelschlich Erfolg ("dom-insertion").
     //
-    // KORREKTER WEG: Der Text wird per echter Tastatureingabe getippt. Das
-    // erzeugt genau die Input-Events, die das OWA-Editor-Modell verarbeitet,
-    // und ist damit serialisierbar. Die Verifikation liest den Editor NACH dem
-    // Tippen; der entscheidende Nachweis ist aber das Wiederoeffnen des
-    // gespeicherten Entwurfs (Schritt 8) — erst der persistierte Zustand gilt
-    // als Beleg, nicht der flüchtige Editor.
+    // KORREKTER WEG: Der Text wird autokorrektur-frei eingefügt (CDP
+    // Input.insertText oder Clipboard-Paste — s. _injectBodyText). Beide Wege
+    // erzeugen Input-Events, die das OWA-Editor-Modell verarbeitet, und sind
+    // damit serialisierbar — OHNE den Autokorrektur-Pfad des zeichenweisen
+    // Tippens (Befund 15.10.2026: "dem"->"Dem" nach "bzw. "). Die Verifikation
+    // liest den Editor NACH dem Einfügen; der entscheidende Nachweis ist aber
+    // das Wiederoeffnen des gespeicherten Entwurfs (Schritt 8) — erst der
+    // persistierte Zustand gilt als Beleg, nicht der flüchtige Editor.
     //
     // REIHENFOLGE (bewusst, verhaltnis-richtig):
-    //   a) Inhalt VOR dem Tippen merken (Beweis fuer die Unversehrtheit von
+    //   a) Inhalt VOR dem Einfügen merken (Beweis fuer die Unversehrtheit von
     //      Verlauf/Signatur),
     //   b) Cursor an den Anfang des Editors setzen (additiv, KEIN Control+A —
-    //      das wuerde Verlauf und Signatur markieren und beim Tippen
+    //      das wuerde Verlauf und Signatur markieren und beim Einfügen
     //      ueberschreiben, also genau das zerstoeren, was ein Reply bewahrt),
-    //   c) Text tippen,
+    //   c) Text einfügen (insertText, sonst Clipboard),
     //   d) Verifikation: (i) Text im Editor, (ii) Bestand noch vorhanden.
     const preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
 
@@ -6635,33 +6747,29 @@ export class OwaClient {
       );
     }
 
-    await activePage.keyboard.type(body, { delay: 5 });
-    await activePage.waitForTimeout(600);
+    // TEXTUEBERNAHME autokorrektur-frei (Befund 15.10.2026): insertText/Clipboard
+    // statt zeichenweisem keyboard.type — OWA kapitalisierte sonst Wörter nach
+    // "bzw. " ("dem"->"Dem") und Absatzanfänge ("kurzes"->"Kurzes").
+    const injection = await this._injectBodyText(activePage, editor, body);
 
-    // Verifikation NACH dem Tippen (flüchtig — der starke Beleg folgt in Schritt 8
+    // Verifikation NACH dem Einfügen (flüchtig — der starke Beleg folgt in Schritt 8
     // durch Wiederoeffnen des gespeicherten Entwurfs).
-    const editorText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
-    const bodyVerified = resolveBodyInserted({
-      text: editorText,
-      expectedBody: body,
-      contentEditable: insertionVerification && insertionVerification.contentEditable
-    });
-
-    if (!bodyVerified) {
+    const editorText = injection.editorText;
+    if (!injection.method) {
       throw new Error(
-        `Antwort-Text ist nach dem Tippen NICHT im Editor nachweisbar — es wird ` +
-        `nicht gespeichert, um keinen leeren Entwurf anzulegen. ` +
-        `Diagnostik: ${JSON.stringify(insertionVerification)} ` +
-        `Editor-Text-Länge: ${editorText.length} sample="${editorText.slice(0, 80)}".`
+        `Antwort-Text konnte NICHT in den Editor übernommen werden (insertText- und ` +
+        `Clipboard-Weg fehlgeschlagen) — es wird nicht gespeichert, um keinen leeren ` +
+        `oder verfaelschten Entwurf anzulegen. Diagnostik: ${JSON.stringify(insertionVerification)} ` +
+        `Soll/Ist: ${JSON.stringify(buildBodySollIstDiff(body, editorText))}.`
       );
     }
 
-    // Unversehrtheits-Beweis: Der Bestand (Verlauf/Signatur) muss nach dem Tippen
-    // noch vorhanden sein. Fehlt er, hat das Tippen ueberschrieben — dann ist
+    // Unversehrtheits-Beweis: Der Bestand (Verlauf/Signatur) muss nach dem Einfügen
+    // noch vorhanden sein. Fehlt er, hat die Injection überschrieben — dann ist
     // das Entwurfs-Ergebnis verfaelscht und wird NICHT gespeichert.
     if (!isHistoryPreserved(preInsertText, editorText)) {
       throw new Error(
-        `ABBRUCH: Beim Tippen des Antwort-Texts ist der vorhandene E-Mail-Verlauf bzw. die ` +
+        `ABBRUCH: Beim Einfügen des Antwort-Texts ist der vorhandene E-Mail-Verlauf bzw. die ` +
         `Signatur verloren gegangen. Der Entwurf wurde NICHT gespeichert, damit kein ` +
         `Inhaltsverlust entsteht. Bitte den Entwurf manuell neu anlegen.`
       );
@@ -6673,9 +6781,8 @@ export class OwaClient {
     await activePage.keyboard.press('Control+s');
     await activePage.waitForTimeout(3500);
 
-    // bodyInsertSource ist jetzt konstant 'keyboard-typing': der Weg, der nach
-    // dem Live-Befund tatsaechlich serialisiert.
-    const bodyInsertSource = 'keyboard-typing';
+    // bodyInsertSource kommt aus der Injection (cdp-insertText | clipboard-paste).
+    const bodyInsertSource = injection.method;
 
     // 8. PERSISTIERTER NACHWEIS — gemeinsame Methode (s. verifyPersistedDraftBody).
     // Nur der Zustand NACH dem Speichern gilt als Beleg; der Entwurf bleibt bei
@@ -6683,6 +6790,11 @@ export class OwaClient {
     const persisted = await this.verifyPersistedDraftBody(body);
     const persistedBodyVerified = persisted.verified;
     const persistedDetail = persisted.detail;
+
+    // fuzzy = Abweichungen (z.B. Reste von Autokorrektur) — im Return als diff melden
+    const bodyMatchMeta = persisted.match === 'fuzzy'
+      ? { bodyMatch: 'fuzzy', bodySollIst: persisted.diff }
+      : {};
 
     if (persistedBodyVerified !== true) {
       return {
@@ -6698,7 +6810,8 @@ export class OwaClient {
           `WARNUNG: Der Antwort-Entwurf wurde gespeichert, sein Text ist im gespeicherten ` +
           `Entwurf aber NICHT nachweisbar. Der Entwurf bleibt zur Sichtung in "Entwürfe" ` +
           `liegen und wurde NICHT automatisch gelöscht. Bitte manuell prüfen und ` +
-          `ggf. neu anlegen. Grund: ${persistedDetail}`,
+          `ggf. neu anlegen. Grund: ${persistedDetail} | Soll/Ist: ` +
+          `${JSON.stringify(persisted.diff || buildBodySollIstDiff(body, ''))}`,
         diagnostics: { insertionVerification, persistedDetail }
       };
     }
@@ -6710,12 +6823,14 @@ export class OwaClient {
       targetMailPreview: selectedMailPreview || undefined,
       preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
       bodyInsertSource,
+      ...bodyMatchMeta,
       persistedBodyVerified: true,
       folder: 'Entwürfe (Drafts)',
       message:
         `Antwort-Entwurf (${isReplyAll ? 'Allen antworten' : 'Antworten'}) erstellt, in ` +
         `"Entwürfe" gespeichert und im gespeicherten Zustand verifiziert ` +
-        `(Textübernahme: ${bodyInsertSource}). Verlauf und Signatur blieben erhalten.`
+        `(Textübernahme: ${bodyInsertSource}${persisted.match === 'fuzzy' ? ', mit Abweichungen — siehe bodySollIst' : ''}). ` +
+        `Verlauf und Signatur blieben erhalten.`
     };
   }
 
@@ -6770,9 +6885,15 @@ export class OwaClient {
         return { found: false, text: pane ? (pane.innerText || '') : (document.body.innerText || '') };
       });
 
+      // Dreistufiger Nachweis: 'exact' = sauber, 'fuzzy' = Abweichung (z.B.
+      // Autokorrektur-Kapitalisierung) — zählt als verifiziert, MUSS aber im
+      // Return als diff gemeldet werden. 'none' = nicht nachweisbar.
+      const cls = classifyBodyMatch(persisted.text, expectedBody);
       return {
-        verified: verifyBodyInserted(persisted.text, expectedBody),
-        detail: `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, Editor gefunden: ${persisted.found}`
+        verified: cls !== 'none',
+        match: cls,
+        diff: buildBodySollIstDiff(expectedBody, persisted.text),
+        detail: `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, Editor gefunden: ${persisted.found}, Match: ${cls}`
       };
     } catch (e) {
       return { verified: null, detail: `Nachweis nicht durchfuehrbar: ${e && e.message ? e.message : e}` };
