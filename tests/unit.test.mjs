@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -2369,5 +2369,88 @@ describe('classifyBodyMatch / buildBodySollIstDiff - Autokorrektur-Befund 15.10.
   test('normalizeBodyForCompare konsolidiert Whitespace, erhaelt Gross/Klein', () => {
     assert.equal(normalizeBodyForCompare('  a \n\n b  '), 'a b');
     assert.equal(normalizeBodyForCompare('Dem'), 'Dem');
+  });
+});
+
+describe('resolveReplyTargetAssertion - Reply-Ziel-Gate (Befund 15.10.2026)', () => {
+  const ROW = 'Isenberg, Petra\nTicket 00886209 CMIS\nDi. 14.10.\nSehr geehrter Herr Hallmann,';
+
+  test('Passende Quellmail: ok, alle Pruefungen bestaetigt', () => {
+    const r = resolveReplyTargetAssertion({
+      evidence: ROW + '\nAn: hallmann@d-velop.de',
+      senderEvidence: ROW,
+      recipientEvidence: 'hallmann@d-velop.de',
+      expectedFrom: 'Isenberg',
+      expectedTo: 'hallmann@d-velop.de',
+      expectedSubject: 'CMIS',
+      expectedDate: '2026-10-14',
+      rowTimestamp: new Date(2026, 9, 14, 10, 0).getTime()
+    });
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.unverified, []);
+  });
+
+  test('MISMATCH Absender: ok=false, reason=expected_from (Fehl-Reply-Case Prignitz/Isenberg)', () => {
+    const r = resolveReplyTargetAssertion({
+      evidence: 'Prignitz, Marion\nUHK Anfrage\nMo. 13.10.',
+      senderEvidence: 'Prignitz, Marion\nUHK Anfrage',
+      expectedFrom: 'Isenberg',
+      expectedSubject: 'UHK'
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'expected_from');
+  });
+
+  test('MISMATCH Betreff: ok=false, reason=expected_subject', () => {
+    const r = resolveReplyTargetAssertion({
+      evidence: ROW,
+      senderEvidence: ROW,
+      expectedSubject: 'UHK Beschaffung'
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'expected_subject');
+  });
+
+  test('MISMATCH Datum: ok=false mit Soll/Ist im Detail', () => {
+    const r = resolveReplyTargetAssertion({
+      evidence: ROW,
+      senderEvidence: ROW,
+      expectedDate: '12.10.2026',
+      rowTimestamp: new Date(2026, 9, 14, 9, 30).getTime()
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'expected_date');
+    assert.ok(r.details.date.includes('14.10.2026'));
+    assert.ok(r.details.date.includes('12.10.2026'));
+  });
+
+  test('Empfaenger eingeklappt: unverifizierbar zaehlt NICHT als Mismatch, wird gemeldet', () => {
+    const r = resolveReplyTargetAssertion({
+      evidence: ROW,
+      senderEvidence: ROW,
+      recipientEvidence: '',
+      expectedTo: 'isenberg@stadt.de'
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.unverified.length, 1);
+    assert.ok(r.unverified[0].includes('expected_to'));
+  });
+
+  test('evidenceMatchesExpected: E-Mail-Local-Part und Name-Token', () => {
+    assert.equal(evidenceMatchesExpected('Petra Isenberg <p.isenberg@stadt.de>', 'p.isenberg@stadt.de'), true);
+    // Toleranz by design: Local-Part 'isenberg' steckt im reinen Anzeigenamen
+    // ('Petra Isenberg' ohne Adresse im Listen-Rendering)
+    assert.equal(evidenceMatchesExpected('Petra Isenberg', 'isenberg@stadt.de'), true);
+    assert.equal(evidenceMatchesExpected('Marion Prignitz', 'isenberg@stadt.de'), false);
+    assert.equal(evidenceMatchesExpected('An: Isenberg, Petra; Kro\u00dfa', 'Isenberg'), true);
+    assert.equal(evidenceMatchesExpected('An: Isenberg, Petra', 'Isenberg Kro\u00dfa'), false);
+    assert.equal(evidenceMatchesExpected('', 'Isenberg'), false);
+  });
+
+  test('parseFlexibleDateInput: ISO und deutsches Format, sonst null', () => {
+    assert.deepEqual(parseFlexibleDateInput('2026-10-14'), { y: 2026, m: 10, d: 14 });
+    assert.deepEqual(parseFlexibleDateInput('14.10.2026'), { y: 2026, m: 10, d: 14 });
+    assert.equal(parseFlexibleDateInput('gestern'), null);
+    assert.equal(parseFlexibleDateInput(''), null);
   });
 });

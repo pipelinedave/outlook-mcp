@@ -144,6 +144,120 @@ export function buildBodySollIstDiff(expectedBody, actualText) {
   };
 }
 
+// Toleranter Beweis, dass ein erwarteter Wert (Absender/Empfaenger/Betreff)
+// in den gesammelten Beweis-Texten der Quellmail steckt (Befund 15.10.2026,
+// Fehl-Reply auf Prignitz/Isenberg statt UHK). Toleranzstufen:
+//   1) normalisierter Substring
+//   2) E-Mail: Local-Part oder Domain einzeln (Anzeige zeigt oft nur Namen)
+//   3) Namen: ALLE Token (>=3 Zeichen) muessen vorkommen ("Spieker" in "Spieker, Leonie")
+export function evidenceMatchesExpected(evidence, expected) {
+  const exp = normalizeBodyForCompare(expected).toLowerCase();
+  if (!exp) return false;
+  const ev = normalizeBodyForCompare(evidence).toLowerCase();
+  if (!ev) return false;
+  if (ev.includes(exp)) return true;
+  if (exp.includes('@')) {
+    const at = exp.indexOf('@');
+    const local = exp.slice(0, at).replace(/[^\w.+-]/g, '');
+    const domain = exp.slice(at + 1);
+    if (local.length >= 3 && ev.includes(local)) return true;
+    if (domain.length >= 4 && ev.includes(domain)) return true;
+    return false;
+  }
+  const tokens = exp.replace(/,/g, ' ').split(/\s+/).filter((t) => t.length >= 3);
+  if (tokens.length && tokens.every((t) => ev.includes(t))) return true;
+  return false;
+}
+
+// Flexibles Datum-Input fuer die Reply-Assertion: 'YYYY-MM-DD' oder 'DD.MM.YYYY'
+// -> { y, m, d } | null. Bewusst nur Datumsanteile — die Uhrzeit der Quellmail
+// ist fuer den Thread-Beleg irrelevant.
+export function parseFlexibleDateInput(s) {
+  const str = String(s || '').trim();
+  let m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return { y: +m[1], m: +m[2], d: +m[3] };
+  m = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (m) return { y: +m[3], m: +m[2], d: +m[1] };
+  return null;
+}
+
+// REPLY-ZIEL-ASSERTION (Sicherheitsgate, Befund 15.10.2026): Prueft die
+// gewaehlte Quellmail gegen die erwarteten Werte, BEVOR der Reply-Button
+// geklickt wird. Kein Treffer = Abbruch — keine implizite "naechste beste
+// Mail"-Logik. Rueckgabe:
+//   { ok: true,  unverified: [...] }              — alle Pruefungen bestanden (oder unverifizierbar, dort gelistet)
+//   { ok: false, reason, details }                — MISMATCH: Abbruch
+export function resolveReplyTargetAssertion({ evidence = '', senderEvidence = '', recipientEvidence = '', expectedFrom, expectedTo, expectedSubject, expectedDate, rowTimestamp = null } = {}) {
+  const unverified = [];
+  const details = {};
+
+  if (expectedSubject) {
+    if (evidenceMatchesExpected(evidence, expectedSubject)) {
+      details.subject = 'bestaetigt';
+    } else {
+      return {
+        ok: false,
+        reason: 'expected_subject',
+        details: { ...details, subject: `NICHT gefunden: "${expectedSubject}"` }
+      };
+    }
+  }
+
+  if (expectedFrom) {
+    if (evidenceMatchesExpected(senderEvidence || evidence, expectedFrom)) {
+      details.from = 'bestaetigt';
+    } else {
+      return {
+        ok: false,
+        reason: 'expected_from',
+        details: { ...details, from: `NICHT gefunden: "${expectedFrom}"` }
+      };
+    }
+  }
+
+  if (expectedTo) {
+    // Empfaenger-Chips sind in OWA teils eingeklappt ("An: 3 weitere") — dann
+    // ist der Check unverifizierbar und wird gemeldet, statt zu blockieren.
+    if (!recipientEvidence || !String(recipientEvidence).trim()) {
+      unverified.push('expected_to (Empfänger im Lesebereich nicht sichtbar)');
+    } else if (evidenceMatchesExpected(recipientEvidence, expectedTo)) {
+      details.to = 'bestaetigt';
+    } else {
+      return {
+        ok: false,
+        reason: 'expected_to',
+        details: { ...details, to: `NICHT gefunden: "${expectedTo}"` }
+      };
+    }
+  }
+
+  if (expectedDate) {
+    const want = parseFlexibleDateInput(expectedDate);
+    if (!want) {
+      unverified.push(`expected_date (Format unlesbar: "${expectedDate}" — bitte YYYY-MM-DD oder DD.MM.YYYY)`);
+    } else if (rowTimestamp === null || rowTimestamp === undefined) {
+      unverified.push('expected_date (Datum der Quellmail nicht aus der Listenzeile parsebar)');
+    } else {
+      const got = new Date(rowTimestamp);
+      const sameDay = got.getFullYear() === want.y && (got.getMonth() + 1) === want.m && got.getDate() === want.d;
+      if (sameDay) {
+        details.date = 'bestaetigt';
+      } else {
+        return {
+          ok: false,
+          reason: 'expected_date',
+          details: {
+            ...details,
+            date: `Quellmail ist vom ${String(got.getDate()).padStart(2, '0')}.${String(got.getMonth() + 1).padStart(2, '0')}.${got.getFullYear()}, erwartet ${expectedDate}`
+          }
+        };
+      }
+    }
+  }
+
+  return { ok: true, unverified, details };
+}
+
 export function buildComposeUrl(realm, { to, subject, body, cc } = {}) {
   const toStr = Array.isArray(to) ? to.join('; ') : (to || '');
   const ccStr = Array.isArray(cc) ? cc.join('; ') : (cc || '');
@@ -6427,7 +6541,7 @@ export class OwaClient {
     };
   }
 
-  async replyDraft({ email_id, id, query, subject, body, reply_all = false, replyAll, folder } = {}) {
+  async replyDraft({ email_id, id, query, subject, body, reply_all = false, replyAll, folder, expected_from, expectedTo, expected_to, expectedSubject, expected_subject, expectedDate, expected_date } = {}) {
     if (!body || typeof body !== 'string' || body.trim().length === 0) {
       throw new Error('Parameter "body" ist erforderlich und darf nicht leer sein.');
     }
@@ -6435,12 +6549,20 @@ export class OwaClient {
     const targetId = email_id || id;
     const searchQuery = query || subject;
     const isReplyAll = Boolean(reply_all ?? replyAll ?? false);
+    // Alias-Normalisierung der Assertions-Parameter (camelCase und snake_case)
+    const expFrom = expected_from;
+    const expTo = expected_to || expectedTo;
+    const expSubject = expected_subject || expectedSubject;
+    const expDate = expected_date || expectedDate;
 
     const page = await this.getPage(true);
     const context = browserManager.context;
 
     // Vorschau der getroffenen Ziel-Mail (Transparenz: welche Thread-Nachricht wurde beantwortet?)
     let selectedMailPreview = null;
+    // Volltext der gewaehlten Listenzeile — Beweisbasis der Reply-Ziel-Assertion
+    // (Absender + Betreff + Datum stehen in der Zeile, Befund 15.10.2026)
+    let selectedRowText = '';
 
     // 1. Target email locating
     if (searchQuery) {
@@ -6495,7 +6617,8 @@ export class OwaClient {
         throw new Error(`Keine E-Mail für Suchbegriff "${searchQuery}" gefunden.`);
       }
       const selectedRow = rows[bestIndex] || rows[0];
-      selectedMailPreview = ((await selectedRow.innerText().catch(() => '')) || '')
+      selectedRowText = ((await selectedRow.innerText().catch(() => '')) || '').slice(0, 800);
+      selectedMailPreview = selectedRowText
         .split('\n').map(l => l.trim()).filter(Boolean).slice(0, 3).join(' | ').slice(0, 200);
       await selectedRow.click();
       await page.waitForTimeout(2000);
@@ -6530,6 +6653,9 @@ export class OwaClient {
       if (!targetRow) {
         throw new Error(`E-Mail mit ID "${targetId}" konnte im Ordner nicht gefunden werden.`);
       }
+      selectedRowText = ((await targetRow.innerText().catch(() => '')) || '').slice(0, 800);
+      selectedMailPreview = selectedRowText
+        .split('\n').map(l => l.trim()).filter(Boolean).slice(0, 3).join(' | ').slice(0, 200);
       await targetRow.click();
       await page.waitForTimeout(2000);
     } else {
@@ -6558,6 +6684,57 @@ export class OwaClient {
     await page.waitForTimeout(1500);
 
     const emailSubject = await readingPane.$eval('h1, h2, [role="heading"]', el => el.innerText).catch(() => '');
+
+    let replyTargetAssertion = null;
+    // REPLY-ZIEL-ASSERTION (Sicherheitsgate, Befund 15.10.2026): Bevor geantwortet
+    // wird, muss die gewählte Quellmail zu den erwarteten Werten passen — ein
+    // Fehl-Reply (Prignitz/Isenberg statt UHK) erzeugt sonst einen Draft im
+    // falschen Thread mit falschem Text. Beweisbasis: Listenzeile + Lesebereich-
+    // Header (Absender-Chips, "An:"-Zeile, Betreff-Heading).
+    if (expFrom || expTo || expSubject || expDate) {
+      const headerEvidence = await page.evaluate(() => {
+        const pane = document.querySelector('div[role="main"], div[aria-label="Lesebereich"], div[aria-label="Reading Pane"], div.ItemPartView');
+        if (!pane) return { senderHints: '', recipientHints: '', paneHead: '' };
+        // Strings aus Title-/Aria-Attributen: OWA legt E-Mail-Adressen in
+        // Persona-Chips dort ab, nicht immer im sichtbaren Text.
+        const attribs = [];
+        for (const el of pane.querySelectorAll('[title], [aria-label]')) {
+          attribs.push(el.getAttribute('title') || '', el.getAttribute('aria-label') || '');
+        }
+        const withAddress = attribs.filter((s) => s && s.includes('@')).join(' ; ');
+        const paneText = (pane.innerText || '').slice(0, 1500);
+        return {
+          senderHints: `${withAddress} ; ${paneText}`,
+          recipientHints: withAddress,
+          paneHead: paneText
+        };
+      }).catch(() => ({ senderHints: '', recipientHints: '', paneHead: '' }));
+
+      const assertion = resolveReplyTargetAssertion({
+        evidence: `${selectedRowText}\n${headerEvidence.paneHead}`,
+        senderEvidence: `${selectedRowText}\n${headerEvidence.senderHints}`,
+        recipientEvidence: headerEvidence.recipientHints,
+        expectedFrom: expFrom,
+        expectedTo: expTo,
+        expectedSubject: expSubject,
+        expectedDate: expDate,
+        rowTimestamp: selectedRowText ? parseMailRowTimestamp(selectedRowText) : null
+      });
+
+      if (!assertion.ok) {
+        throw new Error(
+          `REPLY-ZIEL-PRÜFUNG FEHLGESCHLAGEN (${assertion.reason}): Die gewählte Quellmail passt ` +
+          `nicht zu den erwarteten Werten. Es wurde KEIN Antwort-Entwurf erstellt. ` +
+          `Gefundene Quellmail: "${selectedMailPreview || headerEvidence.paneHead.slice(0, 200) || '(kein Zeilentext verfügbar)'}". ` +
+          `Prüfung: ${JSON.stringify(assertion.details)}. Bitte Zielpost/expected_*-Parameter prüfen ` +
+          `oder die Quellmail per email_id eindeutig adressieren.`
+        );
+      }
+      replyTargetAssertion = {
+        checked: assertion.details,
+        unverified: assertion.unverified
+      };
+    }
 
     // 3. Find Reply or Reply-All button
     const buttons = await page.$$('button[aria-label], button[title], [role="button"][aria-label]');
@@ -6802,6 +6979,7 @@ export class OwaClient {
         action: isReplyAll ? 'reply_all' : 'reply',
         subject: emailSubject || undefined,
         targetMailPreview: selectedMailPreview || undefined,
+        replyTargetAssertion: replyTargetAssertion || undefined,
         preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
         bodyInsertSource,
         persistedBodyVerified: persistedBodyVerified === null ? 'unverified' : false,
@@ -6821,6 +6999,7 @@ export class OwaClient {
       action: isReplyAll ? 'reply_all' : 'reply',
       subject: emailSubject || undefined,
       targetMailPreview: selectedMailPreview || undefined,
+      replyTargetAssertion: replyTargetAssertion || undefined,
       preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
       bodyInsertSource,
       ...bodyMatchMeta,

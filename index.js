@@ -234,6 +234,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: 'Optional: Ordner, in dem gesucht werden soll (Standard: inbox).'
             },
+            expected_from: {
+              type: 'string',
+              description: 'Sicherheits-Assertion: Erwarteter Absender der Quellmail (Name oder E-Mail). Bei Abweichung wird KEIN Entwurf erstellt (verhindert Reply im falschen Thread).'
+            },
+            expected_to: {
+              type: 'string',
+              description: 'Optionale Sicherheits-Assertion: Erwarteter Haupt-Empfänger (To) der Quellmail.'
+            },
+            expected_subject: {
+              type: 'string',
+              description: 'Optionale Sicherheits-Assertion: Erwarteter Betreff der Quellmail.'
+            },
+            expected_date: {
+              type: 'string',
+              description: 'Optionale Sicherheits-Assertion: Erwartetes Datum der Quellmail ("YYYY-MM-DD" oder "DD.MM.YYYY").'
+            },
             realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['body']
@@ -521,7 +537,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           query: args?.query || args?.subject,
           body: args?.body,
           reply_all: args?.reply_all ?? args?.replyAll ?? false,
-          folder: args?.folder
+          folder: args?.folder,
+          expected_from: args?.expected_from,
+          expected_to: args?.expected_to,
+          expected_subject: args?.expected_subject,
+          expected_date: args?.expected_date
         });
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
