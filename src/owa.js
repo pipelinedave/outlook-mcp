@@ -258,6 +258,29 @@ export function resolveReplyTargetAssertion({ evidence = '', senderEvidence = ''
   return { ok: true, unverified, details };
 }
 
+// Beweis, dass eine Empfänger-Adresse in einer gelesenen Empfängerliste steckt
+// (Befund 15.10.2026: CC via &cc=DeepLink wurde von OWA teils nicht persistiert,
+// der Tool-Return sagte trotzdem cc ok). Tolerant gegenüber Chip-Labels der Form
+// "Name <mail@x.de>" und Mehrfach-Eingaben (Semikolon/Komma-getrennt).
+export function recipientListContains(list, expected) {
+  if (!expected || !String(expected).trim()) return true;
+  const hay = (Array.isArray(list) ? list : [list])
+    .map((x) => String(x || '').toLowerCase())
+    .join(' ; ');
+  if (!hay.trim()) return false;
+  const parts = String(expected).toLowerCase().split(/[;,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return hay.includes(String(expected).toLowerCase().trim());
+  // Jede erwartete Adresse muss nachweisbar sein; Alternative: Match auf den
+  // reinen Adressteil (Chip-Label "Name <mail@x.de>" enthält die Adresse).
+  return parts.every((p) => {
+    if (hay.includes(p)) return true;
+    const addr = p.match(/<([^>]+)>/);
+    return addr ? hay.includes(addr[1].trim()) : false;
+  });
+}
+
 export function buildComposeUrl(realm, { to, subject, body, cc } = {}) {
   const toStr = Array.isArray(to) ? to.join('; ') : (to || '');
   const ccStr = Array.isArray(cc) ? cc.join('; ') : (cc || '');
@@ -3784,7 +3807,58 @@ export class OwaClient {
     await activePage.waitForTimeout(3000);
 
     // PERSISTIERTER NACHWEIS — derselbe Beweisstandard wie replyDraft.
-    const persisted = await this.verifyPersistedDraftBody(bodyStr);
+    // Bei CC-Auftrag zusätzlich die persistierten Empfänger mitlesen.
+    const persisted = await this.verifyPersistedDraftBody(bodyStr, { withRecipients: Boolean(ccStr) });
+
+    // P4 (Befund 15.10.2026): CC via &cc=DeepLink wird von OWA teils NICHT
+    // persistiert — der frühere Tool-Return sagte cc ok, der gespeicherte Draft
+    // hatte keine CC-Chips. Deshalb: Empfänger des PERSISTIERTEN Drafts gegen
+    // den Auftrag prüfen, fehlende CC nachziehen (UI-Chips) und erneut
+    // verifizieren; sonst klarer Warn-Return.
+    let ccState = null;
+    if (ccStr && persisted.verified === true) {
+      const recips = persisted.recipients || { to: [], cc: [] };
+      const inCc = recipientListContains(recips.cc, ccStr);
+      const inTo = recipientListContains(recips.to, ccStr);
+      if (inCc) {
+        ccState = { ccPersisted: true, ccLocation: 'cc', recipients: recips };
+      } else if (inTo) {
+        ccState = {
+          ccPersisted: false, ccLocation: 'to', recipients: recips,
+          ccNote: 'CC-Empfänger ist im Draft unter "An" statt "Cc" — Zustellung gesichert, Verteilung weicht vom Auftrag ab.'
+        };
+      } else {
+        const repair = await this._repairDraftCc(ccStr);
+        let ok = false;
+        let recips2 = recips;
+        let where = null;
+        if (repair.repaired) {
+          const recheck = await this._readPersistedDraftRecipients();
+          if (recheck.found) {
+            recips2 = recheck.recipients;
+            if (recipientListContains(recips2.cc, ccStr)) { ok = true; where = 'cc'; }
+            else if (recipientListContains(recips2.to, ccStr)) { ok = true; where = 'to'; }
+          }
+        }
+        ccState = {
+          ccPersisted: ok,
+          ...(where ? { ccLocation: where } : {}),
+          ccRepaired: Boolean(repair.repaired),
+          ...(repair.reason ? { ccRepairReason: repair.reason } : {}),
+          recipients: recips2
+        };
+      }
+    }
+
+    const ccMeta = ccState ? {
+      ccRequested: ccStr,
+      ccPersisted: ccState.ccPersisted,
+      ...(ccState.ccLocation ? { ccLocation: ccState.ccLocation } : {}),
+      ...(ccState.ccNote ? { ccNote: ccState.ccNote } : {}),
+      ...(ccState.ccRepaired !== undefined ? { ccRepaired: ccState.ccRepaired } : {}),
+      ...(ccState.ccRepairReason ? { ccRepairReason: ccState.ccRepairReason } : {}),
+      recipients: ccState.recipients
+    } : {};
 
     const bodyMeta = {
       bodyInsertSource: injection.method,
@@ -3817,11 +3891,15 @@ export class OwaClient {
       subject: subjectStr,
       preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
       ...bodyMeta,
+      ...ccMeta,
       persistedBodyVerified: true,
       folder: 'Entwürfe (Drafts)',
       message:
         `Entwurf wurde in Outlook unter "Entwürfe" gespeichert und im gespeicherten Zustand verifiziert ` +
-        `(Textübernahme: ${injection.method}${persisted.match === 'fuzzy' ? ', mit Abweichungen — siehe bodySollIst' : ''}).`
+        `(Textübernahme: ${injection.method}${persisted.match === 'fuzzy' ? ', mit Abweichungen — siehe bodySollIst' : ''}).` +
+        (ccState && ccState.ccPersisted === false
+          ? ` WARNUNG: CC wurde NICHT (bzw. nicht als "Cc") persistiert${ccState.ccNote ? ' — ' + ccState.ccNote : ' — bitte im Draft manuell prüfen, bevor gesendet wird.'}`
+          : '')
     };
   }
 
@@ -7025,7 +7103,7 @@ export class OwaClient {
   //
   // Rueckgabe: { verified: boolean|null, detail: string }.
   // verified=null bedeutet "nicht pruefbar" (z.B. Draft nicht auffindbar).
-  async verifyPersistedDraftBody(expectedBody) {
+  async verifyPersistedDraftBody(expectedBody, { withRecipients = false } = {}) {
     try {
       await this.navigateFolder('drafts');
       await new Promise((r) => setTimeout(r, 3000));
@@ -7064,6 +7142,13 @@ export class OwaClient {
         return { found: false, text: pane ? (pane.innerText || '') : (document.body.innerText || '') };
       });
 
+      // P4 (Befund 15.10.2026): Persistierte Empfänger mitlesen — der CC-DeepLink
+      // (&cc=) wird von OWA teils nicht übernommen.
+      let recipients = null;
+      if (withRecipients) {
+        recipients = await this._extractRecipientsFromCompose(draftPage);
+      }
+
       // Dreistufiger Nachweis: 'exact' = sauber, 'fuzzy' = Abweichung (z.B.
       // Autokorrektur-Kapitalisierung) — zählt als verifiziert, MUSS aber im
       // Return als diff gemeldet werden. 'none' = nicht nachweisbar.
@@ -7072,10 +7157,124 @@ export class OwaClient {
         verified: cls !== 'none',
         match: cls,
         diff: buildBodySollIstDiff(expectedBody, persisted.text),
-        detail: `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, Editor gefunden: ${persisted.found}, Match: ${cls}`
+        detail: `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, Editor gefunden: ${persisted.found}, Match: ${cls}`,
+        ...(recipients ? { recipients } : {})
       };
     } catch (e) {
       return { verified: null, detail: `Nachweis nicht durchfuehrbar: ${e && e.message ? e.message : e}` };
+    }
+  }
+
+  // P4: Empfänger-Chips des aktuell offenen Compose/Drafts lesen. OWA legt die
+  // E-Mail-Adressen in title-/aria-label-Attributen der Chips ab; die Zuordnung
+  // zu "An"/"Cc" läuft über die aria-labels der übergeordneten Wells. Unklar
+  // zuordenbare Chips zählen für beide Wells (konservativ — "CC fehlt" wird
+  // dann nicht fälschlich gemeldet, wenn die Adresse nur schwach gelabelt ist).
+  async _extractRecipientsFromCompose(page) {
+    try {
+      return await page.evaluate(() => {
+        const out = { to: [], cc: [] };
+        const push = (well, label) => {
+          if (!label) return;
+          if (well === 'cc') out.cc.push(label);
+          else if (well === 'to') out.to.push(label);
+          else { out.to.push(label); out.cc.push(label); }
+        };
+        const wellOf = (el) => {
+          let cur = el;
+          for (let i = 0; i < 8 && cur; i++) {
+            const al = (cur.getAttribute && cur.getAttribute('aria-label')) || '';
+            if (/^(an|to)\b/i.test(al.trim())) return 'to';
+            if (/^(cc|ccempf|kopie|carbon)/i.test(al.trim())) return 'cc';
+            cur = cur.parentElement;
+          }
+          return null;
+        };
+        // Chips: title/aria-label enthält eine E-Mail-Adresse
+        for (const chip of document.querySelectorAll('[title*="@"], [aria-label*="@"]')) {
+          const label = (chip.getAttribute('title') || chip.getAttribute('aria-label') || '').trim();
+          push(wellOf(chip), label);
+        }
+        // Frisch getippte, noch nicht als Chip gerenderte Werte in Eingabefeldern
+        for (const inp of document.querySelectorAll('input[aria-label]')) {
+          const al = (inp.getAttribute('aria-label') || '').trim();
+          const val = (inp.value || '').trim();
+          if (!val) continue;
+          if (/^(an|to)\b/i.test(al)) push('to', val);
+          else if (/^(cc|kopie)/i.test(al)) push('cc', val);
+        }
+        return out;
+      });
+    } catch (e) {
+      return { to: [], cc: [] };
+    }
+  }
+
+  // P4: Persistierte Empfänger des obersten [Draft]-Entwurfs lesen (Entwurf
+  // frisch öffnen — der Zustand nach dem Speichern ist der Beleg).
+  async _readPersistedDraftRecipients() {
+    try {
+      const page = await this.getPage(true);
+      await this.navigateFolder('drafts');
+      await page.waitForTimeout(2500);
+      await page.waitForSelector('div[data-convid]', { timeout: 10000 }).catch(() => null);
+      const opened = await page.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll('div[data-convid]'));
+        for (const r of rows) {
+          const t = (r.innerText || '').replace(/\s+/g, ' ');
+          if (/\[Draft\]/i.test(t)) {
+            r.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (!opened) {
+        return { found: false, recipients: { to: [], cc: [] } };
+      }
+      await page.waitForTimeout(3000);
+      const recipients = await this._extractRecipientsFromCompose(page);
+      return { found: true, recipients };
+    } catch (e) {
+      return { found: false, recipients: { to: [], cc: [] } };
+    }
+  }
+
+  // P4: Fehlende CC-Adresse im offenen Draft nachziehen (UI-Chips) und speichern.
+  // Läuft auf der Seite, die verifyPersistedDraftBody mit dem geöffneten Entwurf
+  // hinterlassen hat. Rückgabe: { repaired: boolean, reason?: string }.
+  async _repairDraftCc(ccStr) {
+    try {
+      const page = await this.getPage(true);
+      // Cc-Zeile ggf. erst einblenden (OWA: "Cc verwenden"-Button im eingeklappten Zustand)
+      const ccReveal = await page.$(
+        'button[aria-label*="Cc verwenden" i], button[aria-label*="Show Cc" i], ' +
+        'button[aria-label*="Cc" i][aria-expanded="false"], button[title*="Cc" i]'
+      );
+      if (ccReveal) {
+        await ccReveal.click().catch(() => null);
+        await page.waitForTimeout(700);
+      }
+      const ccInput = await page.waitForSelector(
+        'input[aria-label^="Cc" i], div[aria-label^="Cc" i] input, input[id*="cc" i]',
+        { timeout: 5000 }
+      ).catch(() => null);
+      if (!ccInput) {
+        return { repaired: false, reason: 'Cc-Eingabefeld im geöffneten Entwurf nicht gefunden' };
+      }
+      await ccInput.click();
+      await page.waitForTimeout(300);
+      await page.keyboard.type(ccStr, { delay: 20 });
+      await page.waitForTimeout(900); // Kontaktvorschläge laden lassen
+      await page.keyboard.press('Enter'); // Chip bestätigen
+      await page.waitForTimeout(600);
+      await page.keyboard.press('Escape').catch(() => null); // Vorschlags-Popup schließen
+      await page.waitForTimeout(300);
+      await page.keyboard.press('Control+s');
+      await page.waitForTimeout(3000);
+      return { repaired: true };
+    } catch (e) {
+      return { repaired: false, reason: `CC-Reparatur fehlgeschlagen: ${e && e.message ? e.message : e}` };
     }
   }
 

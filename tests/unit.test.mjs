@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion, recipientListContains } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -2452,5 +2452,27 @@ describe('resolveReplyTargetAssertion - Reply-Ziel-Gate (Befund 15.10.2026)', ()
     assert.deepEqual(parseFlexibleDateInput('14.10.2026'), { y: 2026, m: 10, d: 14 });
     assert.equal(parseFlexibleDateInput('gestern'), null);
     assert.equal(parseFlexibleDateInput(''), null);
+  });
+});
+
+describe('recipientListContains - CC-Persistenz-Beweis (P4, Befund 15.10.2026)', () => {
+  test('Adresse in Chip-Label mit Klarnamen gefunden', () => {
+    assert.equal(recipientListContains(['Isenberg, Petra <p.isenberg@stadt.de>'], 'p.isenberg@stadt.de'), true);
+  });
+
+  test('Adresse fehlt -> false (CC war nicht persistiert)', () => {
+    assert.equal(recipientListContains(['Mlynarek <m@stadt.de>'], 'chef@firma.de'), false);
+    assert.equal(recipientListContains([], 'chef@firma.de'), false);
+    assert.equal(recipientListContains(null, 'chef@firma.de'), false);
+  });
+
+  test('Mehrere CC-Empfaenger: alle muessen nachweisbar sein', () => {
+    assert.equal(recipientListContains(['a@x.de', 'b@x.de'], 'a@x.de; b@x.de'), true);
+    assert.equal(recipientListContains(['a@x.de'], 'a@x.de; b@x.de'), false);
+  });
+
+  test('leerer erwarteter Wert -> trivially true', () => {
+    assert.equal(recipientListContains([], ''), true);
+    assert.equal(recipientListContains([], null), true);
   });
 });
