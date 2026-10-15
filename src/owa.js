@@ -6488,32 +6488,18 @@ export class OwaClient {
       await page.waitForTimeout(1500);
 
       // VERIFIKATION NACH LISTEN-RELOAD: Der Zustand vor dem Reload ist kein Beleg.
+      // Die frische Zeilen-Referenz dient zugleich der nächsten Strategie —
+      // alte Handles sind nach dem Reload detached.
       await this.navigateFolder(folder || 'drafts');
       await page.waitForTimeout(2000);
       await page.waitForSelector('div[data-convid]', { timeout: 10000 }).catch(() => null);
-      const rowsAfter = await page.$$('div[data-convid]');
-      let stillThere = false;
-      for (const r of rowsAfter) {
-        if (await rowMatches(r)) { stillThere = true; break; }
-      }
-      if (!stillThere) { gone = true; break; }
-      attempted.push(`${strategy.name}: Entwurf nach Reload noch sichtbar`);
-
-      // Zeile neu greifen (DOM-Referenz nach Reload ungültig) für den nächsten Versuch
       targetRow = null;
-      for (let i = 0; i < 20 && !targetRow; i++) {
-        const rows = await page.$$('div[data-convid]');
-        for (const r of rows) {
-          if (await rowMatches(r)) { targetRow = r; break; }
-        }
-        if (targetRow) break;
-        await page.evaluate(() => {
-          const list = document.querySelector('[aria-label="Message list"]');
-          if (list) list.scrollTop += 1500;
-        });
-        await page.waitForTimeout(500);
+      const rowsAfter = await page.$$('div[data-convid]');
+      for (const r of rowsAfter) {
+        if (await rowMatches(r)) { targetRow = r; break; }
       }
       if (!targetRow) { gone = true; break; }
+      attempted.push(`${strategy.name}: Entwurf nach Reload noch sichtbar`);
     }
 
     return {
