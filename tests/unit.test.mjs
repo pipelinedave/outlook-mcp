@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion, recipientListContains } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion, recipientListContains, extractEmailLike } from '../src/owa.js';
 import { config } from '../src/config.js';
 
 describe('resolveFolder - Outlook Web Ordner-Mapping', () => {
@@ -2474,5 +2474,18 @@ describe('recipientListContains - CC-Persistenz-Beweis (P4, Befund 15.10.2026)',
   test('leerer erwarteter Wert -> trivially true', () => {
     assert.equal(recipientListContains([], ''), true);
     assert.equal(recipientListContains([], null), true);
+  });
+});
+
+describe('extractEmailLike - Sent-Fallback-Trigger (P5, Befund 15.10.2026)', () => {
+  test('Adresse im Query-Text finden', () => {
+    assert.equal(extractEmailLike('Mail an uhk@example.de vom 12.10.'), 'uhk@example.de');
+    assert.equal(extractEmailLike('kontakt.vorname.nachname@sub.domain-x.de'), 'kontakt.vorname.nachname@sub.domain-x.de');
+  });
+
+  test('keine Adresse -> null', () => {
+    assert.equal(extractEmailLike('UHK Beschaffungsantrag'), null);
+    assert.equal(extractEmailLike(''), null);
+    assert.equal(extractEmailLike(null), null);
   });
 });

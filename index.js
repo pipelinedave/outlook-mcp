@@ -65,7 +65,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'outlook_search',
-        description: 'Sucht E-Mails in Outlook Web anhand eines Suchbegriffs (z.B. Kundenname, Ticketnummer, Absender).',
+        description: 'Sucht E-Mails in Outlook Web anhand eines Suchbegriffs (z.B. Kundenname, Ticketnummer, Absender). Bei leerer OWA-Suche automatischer Fallback: Datumsfenster-Enumeration im Sent-Ordner mit Empfänger-Filter; wenn weiterhin nichts gefunden: klarer NOT FOUND-Return.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -77,6 +77,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'number',
               description: 'Maximale Anzahl an Ergebnissen (Standard: 10)',
               default: 10
+            },
+            folder: {
+              type: 'string',
+              description: 'Optional: Ordner-Scoping. "sentitems" erzwingt die Sent-Enumeration (Fallback für Mail-Indexierungslücken versendeter Mails).'
+            },
+            to: {
+              type: 'string',
+              description: 'Optional: Empfänger-Adresse oder -Name für den Sent-Fallback-Filter (nur relevant mit folder="sentitems" oder wenn OWA-Suche leer bleibt).'
+            },
+            date_from: {
+              type: 'string',
+              description: 'Optional: Fensterstart für die Sent-Enumeration ("YYYY-MM-DD" oder "DD.MM.YYYY").'
+            },
+            date_to: {
+              type: 'string',
+              description: 'Optional: Fensterende für die Sent-Enumeration ("YYYY-MM-DD" oder "DD.MM.YYYY").'
             },
             realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de") für den gezielten Kontenwechsel.' }
           },
@@ -549,7 +565,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'outlook_search': {
-        const results = await owaClient.searchEmails(args.query, args.limit || 10);
+        const results = await owaClient.searchWithFallback(args.query, {
+          limit: args.limit || 10,
+          folder: args.folder,
+          to: args.to,
+          dateFrom: args.date_from,
+          dateTo: args.date_to
+        });
         return {
           content: [{ type: 'text', text: JSON.stringify(results, null, 2) }]
         };

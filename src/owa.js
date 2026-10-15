@@ -281,6 +281,13 @@ export function recipientListContains(list, expected) {
   });
 }
 
+// Findet eine E-Mail-Adresse in freiem Suchtext (fuer den Sent-Enumeration-
+// Fallback: "Mail an uhk@example.de vom 12.10." -> "uhk@example.de").
+export function extractEmailLike(s) {
+  const m = String(s || '').match(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/);
+  return m ? m[0] : null;
+}
+
 export function buildComposeUrl(realm, { to, subject, body, cc } = {}) {
   const toStr = Array.isArray(to) ? to.join('; ') : (to || '');
   const ccStr = Array.isArray(cc) ? cc.join('; ') : (cc || '');
@@ -5525,6 +5532,135 @@ export class OwaClient {
       query: query,
       count: emails.length,
       results: emails
+    };
+  }
+
+  // P5 (Befund 15.10.2026): Ursprungsmails fehlten BOTH in der OWA-Suche ALS AUCH
+  // im sentitems-Enumerationsergebnis des Aufrufers — der Reply-Draft entstand
+  // ohne Thread-Verlauf. Dieser Fallback enumeriert den Sent-Ordner im
+  // Datumsfenster und filtert nach Empfänger/Begriffen direkt auf den Zeilentexten.
+  async enumerateSent({ to, query, dateFrom, dateTo, maxScrolls = 200 } = {}) {
+    const page = await this.getPage(true);
+    await this.navigateFolder('sentitems');
+    const seen = new Map();
+    let stalled = 0;
+    const stopBefore = dateFrom ? parseFlexibleDateInput(dateFrom) : null;
+    const stopAfter = dateTo ? parseFlexibleDateInput(dateTo) : null;
+    const inWindow = (ts) => {
+      if (ts === null) return true; // ohne parsebares Datum nicht ausschließen
+      const d = new Date(ts);
+      const ymd = { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() };
+      const cmp = (b) => ymd.y !== b.y ? ymd.y - b.y : (ymd.m !== b.m ? ymd.m - b.m : ymd.d - b.d);
+      if (stopBefore && cmp(stopBefore) < 0) return false;
+      if (stopAfter && cmp(stopAfter) > 0) return false;
+      return true;
+    };
+
+    let stopEarly = false;
+    for (let i = 0; i < maxScrolls && !stopEarly; i++) {
+      const beforeCount = seen.size;
+      const rows = await page.$$('div[data-convid]');
+      for (const r of rows) {
+        const id = await r.getAttribute('data-convid');
+        if (!id || seen.has(id)) continue;
+        const text = ((await r.innerText().catch(() => '')) || '');
+        const ts = parseMailRowTimestamp(text);
+        // Liste ist neueste-zuerst sortiert: Rows vor dem Fensterstart überspringen,
+        // unter dem Fensterrand kann die Enumeration abgebrochen werden.
+        if (stopBefore && ts !== null && !inWindow(ts)) {
+          const d = new Date(ts);
+          const ymd = { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() };
+          const cmp = (b) => ymd.y !== b.y ? ymd.y - b.y : (ymd.m !== b.m ? ymd.m - b.m : ymd.d - b.d);
+          if (cmp(stopBefore) < 0) { stopEarly = true; break; }
+          continue;
+        }
+        const rowText = text.slice(0, 600);
+        const matchTo = to ? evidenceMatchesExpected(rowText, to) : null;
+        const matchQuery = query ? evidenceMatchesExpected(rowText, query) : null;
+        const matchAll = (matchTo === null || matchTo === true) && (matchQuery === null || matchQuery === true);
+        if (!matchAll) continue;
+        const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+        seen.set(id, {
+          index: seen.size,
+          id,
+          previewText: lines.join(' | ').slice(0, 300),
+          timestampIso: ts !== null ? new Date(ts).toISOString() : null
+        });
+      }
+      if (stopEarly) break;
+
+      // Viewport-Step in der virtualisierten Liste (gleiche Technik wie bulkList)
+      await page.evaluate(() => {
+        const list = document.querySelector('[aria-label="Message list"]');
+        let el = null;
+        const roots = list ? [list, ...Array.from(list.querySelectorAll('*'))] : [];
+        for (const e of roots) {
+          const s = getComputedStyle(e);
+          if ((s.overflowY === 'scroll' || s.overflowY === 'auto') && e.scrollHeight > e.clientHeight) { el = e; break; }
+        }
+        if (!el) return;
+        const step = Math.max(el.clientHeight - 20, 100);
+        el.scrollTop += step;
+      });
+      await page.waitForTimeout(700);
+      if (seen.size === beforeCount) { stalled++; } else { stalled = 0; }
+      if (stalled >= 15) break;
+    }
+
+    const results = [...seen.values()];
+    return { folder: 'sentitems', count: results.length, results };
+  }
+
+  // P5: Suche mit Fallback-Kette. 1) Normale OWA-Suche. 2) Bei Leere: Sent-
+  // Enumeration (Datumsfenster + Empfänger-Filter), angestoßen durch folder=,
+  // to= oder eine E-Mail-Adresse im Query. 3) Wenn weiterhin nichts: KLARER
+  // "NOT FOUND"-Return mit Strategie-Hinweis — der aufrufende Agent kann damit
+  // umgehen (z.B. Reply ohne Thread-Verlauf bewusst erstellen).
+  async searchWithFallback(query, { limit = 10, folder, to, dateFrom, dateTo } = {}) {
+    const trimmedQuery = String(query || '').trim();
+
+    if (trimmedQuery) {
+      try {
+        const primary = await this.searchEmails(trimmedQuery, limit);
+        if (primary.count > 0) return { ...primary, strategy: 'owa-search' };
+      } catch (e) {
+        // OWA-Suche selbst fehlgeschlagen -> Fallback weiter versuchen
+      }
+    }
+
+    const emailInQuery = extractEmailLike(trimmedQuery);
+    const folderWantsSent = ['sentitems', 'sent', 'gesendet'].includes(String(folder || '').toLowerCase());
+    if (folderWantsSent || to || emailInQuery) {
+      const sent = await this.enumerateSent({
+        to: to || emailInQuery || undefined,
+        query: trimmedQuery && !emailInQuery ? trimmedQuery : (trimmedQuery && to ? trimmedQuery : undefined),
+        dateFrom,
+        dateTo
+      });
+      if (sent.count > 0) {
+        return {
+          query: trimmedQuery || to,
+          count: sent.count,
+          results: sent.results.slice(0, limit),
+          strategy: 'sentitems-enumeration',
+          note: 'OWA-Suche lieferte nichts; Treffer stammen aus der Datumsfenster-Enumeration des Sent-Ordners.'
+        };
+      }
+      return {
+        query: trimmedQuery || to,
+        count: 0,
+        results: [],
+        strategy: 'sentitems-enumeration',
+        note: 'NOT FOUND: OWA-Suche und Datumsfenster-Enumeration im Sent-Ordner lieferten keinen Treffer. Die Mail ist ggf. aus einem anderen Postfach versendet oder im Sent-Ordner noch nicht angekommen (Sync-Lücke).'
+      };
+    }
+
+    return {
+      query: trimmedQuery,
+      count: 0,
+      results: [],
+      strategy: 'owa-search',
+      note: 'NOT FOUND: OWA-Suche lieferte keine Treffer. Tipp: Bei vermutlich versendeten Mails den Sent-Ordner durchsuchen (folder="sentitems", ggf. to="<Empfängeradresse>" und date_from/date_to).'
     };
   }
 
