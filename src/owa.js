@@ -5908,97 +5908,155 @@ export class OwaClient {
       throw new Error(`Entwurf "${targetQuery}" im Ordner "${folder || 'drafts'}" nicht gefunden.`);
     }
 
-    // 1. Versuch: Kontextmenü (Rechtsklick) -> "Verwerfen"/"Discard"
-    let discarded = false;
-    await targetRow.click({ button: 'right' });
-    await page.waitForTimeout(600);
-    const discardItem = await page.waitForSelector(
-      '[role="menuitem"]:has-text("Verwerfen"), [role="menuitem"]:has-text("Discard"), ' +
-      '[role="menuitem"][aria-label*="Verwerfen" i], [role="menuitem"][aria-label*="Discard" i]',
-      { timeout: 5000 }
-    ).catch(() => null);
-    if (discardItem) {
-      await discardItem.click();
-      discarded = true;
-      await page.waitForTimeout(2000);
-    }
+    // DISCARD-STRATEGIEN (Befund 15.10.2026): Der frühere Einmal-Pfad (Kontextmenü
+    // "Verwerfen", sonst Toolbar-Button) löschte Reply-Entwürfe nicht zuverlässig —
+    // der Entwurf blieb in der Liste, weitere Versuche aktualisierten nur den
+    // Zeitstempel (OWA-Autosave beim erneuten Öffnen). Bewährte Wege aus der
+    // Live-Session (delete_junk_keyboard.mjs / discard_junk_drafts.mjs):
+    //   1) Zeile selektieren + ENTF-Taste (Delete-Key) — zuverlässigster Weg
+    //   2) Toolbar-Button "Löschen/Discard" im geöffneten Entwurf
+    //   3) Kontextmenü (Rechtsklick) -> "Löschen/Verwerfen"
+    // Nach JEDEM Versuch: Bestätigungsdialog abfangen, Undo-Toast auslaufen lassen,
+    // Liste NEU LADEN (navigateFolder) und erst dann verifizieren — der DOM-Stand
+    // vor dem Reload ist kein Beleg (OWA rendert die Zeile teils nach).
+    const confirmDialog = async () => this._confirmDestructiveDialog(page);
 
-    // 2. Fallback: Entwurf öffnen und Toolbar-"Verwerfen" klicken
-    if (!discarded) {
-      await targetRow.click();
-      await page.waitForTimeout(2000);
-      const toolbarBtn = await page.waitForSelector(
-        'button[aria-label*="Verwerfen" i], button[aria-label*="Discard" i], ' +
-        '[role="button"][aria-label*="Verwerfen" i], [role="button"][aria-label*="Discard" i]',
-        { timeout: 6000 }
-      ).catch(() => null);
-      if (toolbarBtn) {
-        await toolbarBtn.click();
-        discarded = true;
-        await page.waitForTimeout(2000);
-      }
-    }
-
-    // 3. Bestätigungsdialog abfangen (falls OWA nachfragt): Verwerfen/Löschen bestätigen,
-    //    niemals "Abbrechen/Cancel" klicken.
-    for (let i = 0; i < 3 && discarded; i++) {
-      await page.waitForTimeout(800);
-      const confirmed = await page.evaluate(() => {
-        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
-          .filter(d => {
-            const t = (d.innerText || '').toLowerCase();
-            return t.includes('verwerfen') || t.includes('discard') || t.includes('löschen') ||
-                   t.includes('delete') || t.includes('sicher') || t.includes('sure');
-          });
-        for (const root of dialogs) {
-          const els = Array.from(root.querySelectorAll('button, [role="button"]'));
-          const cands = els.map(el => ({
-            el,
-            t: (el.innerText || '').trim().toLowerCase(),
-            l: (el.getAttribute('aria-label') || '').toLowerCase()
-          })).filter(c => {
-            const comb = `${c.t} ${c.l}`.trim();
-            return (comb.includes('verwerfen') || comb.includes('discard') ||
-                    comb.includes('löschen') || comb.includes('delete')) &&
-                   !comb.includes('abbrechen') && !comb.includes('cancel');
-          });
-          if (cands.length) {
-            cands.sort((a, b) => (a.t || 'x').length - (b.t || 'x').length);
-            cands[0].el.click();
-            return true;
+    const strategies = [
+      { name: 'delete-key', run: async () => {
+          await targetRow.click();
+          await page.waitForTimeout(1500);
+          await page.keyboard.press('Delete');
+        } },
+      { name: 'toolbar-button', run: async () => {
+          await targetRow.click();
+          await page.waitForTimeout(2000);
+          const toolbarBtn = await page.waitForSelector(
+            'button[aria-label*="Löschen" i], button[aria-label*="Delete" i], ' +
+            'button[aria-label*="Verwerfen" i], button[aria-label*="Discard" i], ' +
+            'button[title*="Löschen" i], button[title*="Delete" i]',
+            { timeout: 6000 }
+          ).catch(() => null);
+          if (!toolbarBtn) return false;
+          await toolbarBtn.click();
+          return true;
+        } },
+      { name: 'context-menu', run: async () => {
+          await targetRow.click({ button: 'right' });
+          await page.waitForTimeout(600);
+          const discardItem = await page.waitForSelector(
+            '[role="menuitem"]:has-text("Löschen"), [role="menuitem"]:has-text("Verwerfen"), ' +
+            '[role="menuitem"]:has-text("Delete"), [role="menuitem"]:has-text("Discard"), ' +
+            '[role="menuitem"][aria-label*="Löschen" i], [role="menuitem"][aria-label*="Verwerfen" i], ' +
+            '[role="menuitem"][aria-label*="Delete" i], [role="menuitem"][aria-label*="Discard" i]',
+            { timeout: 5000 }
+          ).catch(() => null);
+          if (!discardItem) {
+            await page.keyboard.press('Escape').catch(() => null);
+            return false;
           }
-        }
-        return false;
-      });
-      if (!confirmed) break;
+          await discardItem.click();
+          return true;
+        } }
+    ];
+
+    const attempted = [];
+    let gone = false;
+    for (const strategy of strategies) {
+      let triggered = false;
+      try {
+        triggered = (await strategy.run()) !== false;
+      } catch (e) {
+        attempted.push(`${strategy.name}: FEHLER ${e && e.message ? e.message : e}`);
+        continue;
+      }
+      if (!triggered) {
+        attempted.push(`${strategy.name}: Auslöser nicht gefunden`);
+        continue;
+      }
+      attempted.push(`${strategy.name}: ausgelöst`);
+
+      // Bestätigungsdialoge abfangen (max. 3, niemals Abbrechen klicken)
+      for (let i = 0; i < 3; i++) {
+        await page.waitForTimeout(800);
+        if (!(await confirmDialog())) break;
+        await page.waitForTimeout(1200);
+      }
+
+      // Undo-Toast auslaufen lassen (NICHT anklicken — der Verwurf soll stehen bleiben)
       await page.waitForTimeout(1500);
-    }
 
-    if (!discarded) {
-      return {
-        success: false,
-        query: targetQuery,
-        message: `Verwerfen-Button für Entwurf "${targetQuery}" nicht gefunden. Bitte manuell in Outlook prüfen.`
-      };
-    }
+      // VERIFIKATION NACH LISTEN-RELOAD: Der Zustand vor dem Reload ist kein Beleg.
+      await this.navigateFolder(folder || 'drafts');
+      await page.waitForTimeout(2000);
+      await page.waitForSelector('div[data-convid]', { timeout: 10000 }).catch(() => null);
+      const rowsAfter = await page.$$('div[data-convid]');
+      let stillThere = false;
+      for (const r of rowsAfter) {
+        if (await rowMatches(r)) { stillThere = true; break; }
+      }
+      if (!stillThere) { gone = true; break; }
+      attempted.push(`${strategy.name}: Entwurf nach Reload noch sichtbar`);
 
-    // VERIFIKATION: Entwurf aus der Entwurfsliste entfernt? Nie blind success melden.
-    await page.waitForTimeout(1500);
-    let stillThere = false;
-    const rowsAfter = await page.$$('div[data-convid]');
-    for (const r of rowsAfter) {
-      if (await rowMatches(r)) { stillThere = true; break; }
+      // Zeile neu greifen (DOM-Referenz nach Reload ungültig) für den nächsten Versuch
+      targetRow = null;
+      for (let i = 0; i < 20 && !targetRow; i++) {
+        const rows = await page.$$('div[data-convid]');
+        for (const r of rows) {
+          if (await rowMatches(r)) { targetRow = r; break; }
+        }
+        if (targetRow) break;
+        await page.evaluate(() => {
+          const list = document.querySelector('[aria-label="Message list"]');
+          if (list) list.scrollTop += 1500;
+        });
+        await page.waitForTimeout(500);
+      }
+      if (!targetRow) { gone = true; break; }
     }
 
     return {
-      success: !stillThere,
-      verified: !stillThere,
+      success: gone,
+      verified: gone,
       query: targetQuery,
       folder: folder || 'drafts',
-      message: stillThere
-        ? `WARNUNG: Verwerfen wurde ausgelöst, aber Entwurf "${targetQuery}" ist noch in der Entwurfsliste sichtbar. Bitte manuell prüfen.`
-        : `Entwurf "${targetQuery}" wurde verworfen (aus der Entwurfsliste entfernt und verifiziert).`
+      attemptedStrategies: attempted,
+      message: gone
+        ? `Entwurf "${targetQuery}" wurde verworfen (nach Listen-Reload verifiziert, aus der Entwurfsliste entfernt).`
+        : `Fehler: Entwurf "${targetQuery}" konnte NICHT verworfen werden — nach allen Strategien noch in der Entwurfsliste sichtbar. Versuche: ${attempted.join(' | ')}. Bitte manuell in Outlook prüfen (ggf. OWA-Autosave hat den Entwurf neu angelegt).`
     };
+  }
+
+  // Bestätigungsdialog abfangen (falls OWA nachfragt): Verwerfen/Löschen bestätigen,
+  // niemals "Abbrechen/Cancel" klicken. Rueckgabe: true, wenn bestätigt wurde.
+  async _confirmDestructiveDialog(page) {
+    return page.evaluate(() => {
+      const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+        .filter(d => {
+          const t = (d.innerText || '').toLowerCase();
+          return t.includes('verwerfen') || t.includes('discard') || t.includes('löschen') ||
+                 t.includes('delete') || t.includes('sicher') || t.includes('sure');
+        });
+      for (const root of dialogs) {
+        const els = Array.from(root.querySelectorAll('button, [role="button"]'));
+        const cands = els.map(el => ({
+          el,
+          t: (el.innerText || '').trim().toLowerCase(),
+          l: (el.getAttribute('aria-label') || '').toLowerCase()
+        })).filter(c => {
+          const comb = `${c.t} ${c.l}`.trim();
+          return (comb.includes('verwerfen') || comb.includes('discard') ||
+                  comb.includes('löschen') || comb.includes('delete') ||
+                  comb === 'ok') &&
+                 !comb.includes('abbrechen') && !comb.includes('cancel');
+        });
+        if (cands.length) {
+          cands.sort((a, b) => (a.t || 'x').length - (b.t || 'x').length);
+          cands[0].el.click();
+          return true;
+        }
+      }
+      return false;
+    });
   }
 
   async acceptMeeting({ email_id, id, query, subject, folder, send_response = true } = {}) {
