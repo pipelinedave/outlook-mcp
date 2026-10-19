@@ -165,7 +165,7 @@ const prevWin = globalThis.window;
 describe('READ-ONLY Kalender-Lese-Tool: OwaClient.listCalendarEvents', () => {
   before(() => {
     browserManager.ensureContext = async () => ({ page: activeCalendar.page, context: {} });
-    browserManager.context = null;
+    browserManager.resetForTest();
     globalThis.window = { getComputedStyle: () => ({ display: 'block', visibility: 'visible', position: 'static' }) };
   });
   after(() => {

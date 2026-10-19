@@ -3688,8 +3688,8 @@ export class OwaClient {
     const composeUrl = buildComposeUrl(this.realm, { to, subject, cc });
 
     // Der Compose-DeepLink kann einen NEUEN Tab oeffnen (gleiche Faehigkeit wie
-    // beim Kalender-DeepLink) — Tabliste vorher merken.
-    const context = browserManager.context;
+    // beim Kalender-DeepLink) — Tabliste vorher merken. (Realm-Multiplex: Context dieses Realms)
+    const context = browserManager.getContext(this.realm);
     const pagesBefore = context ? context.pages().length : 0;
 
     await page.goto(composeUrl, { waitUntil: 'domcontentloaded' });
@@ -3927,8 +3927,8 @@ export class OwaClient {
     // Body NICHT in URL-Parameter geben, da OWA den Editor sonst auf Plain-Text umstellt.
     const calendarUrl = buildCalendarComposeUrl(this.realm, { subject, start: startDt, end: endDt, is_all_day });
 
-    // Der Kalender-Deep-Link kann einen NEUEN Tab öffnen. Daher Zeitstempel der Tab-Liste merken.
-    const context = browserManager.context;
+    // Der Kalender-Deep-Link kann einen NEUEN Tab öffnen. (Realm-Multiplex: Context dieses Realms)
+    const context = browserManager.getContext(this.realm);
     const pagesBefore = context ? context.pages().length : 0;
 
     await page.goto(calendarUrl, { waitUntil: 'domcontentloaded' });
@@ -5395,7 +5395,7 @@ export class OwaClient {
   // Wochenansicht noch vorhanden ist. Navigiert zur Wochenansicht und matcht ARIA-Labels.
   // Rückgabe: true = noch vorhanden, false = weg/nicht gefunden.
   async eventStillInWeekView(query) {
-    let page = browserManager.page;
+    let page = browserManager.getPage(this.realm);
     if (!page || page.isClosed()) {
       // Beim Aufbau eigenen Kontext holen
       const r = await browserManager.ensureContext(true, this.realm);
@@ -6549,7 +6549,7 @@ export class OwaClient {
 
   async acceptMeeting({ email_id, id, query, subject, folder, send_response = true } = {}) {
     const page = await this.getPage(true);
-    const context = browserManager.context;
+    const context = browserManager.getContext(this.realm);
 
     const targetId = email_id || id;
     const searchQuery = query || subject;
@@ -6820,7 +6820,7 @@ export class OwaClient {
     const expDate = expected_date || expectedDate;
 
     const page = await this.getPage(true);
-    const context = browserManager.context;
+    const context = browserManager.getContext(this.realm);
 
     // Vorschau der getroffenen Ziel-Mail (Transparenz: welche Thread-Nachricht wurde beantwortet?)
     let selectedMailPreview = null;

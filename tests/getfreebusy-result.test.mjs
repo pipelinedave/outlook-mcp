@@ -194,7 +194,7 @@ const prevWin = globalThis.window;
 describe('ECHTER PFAD: OwaClient.getFreeBusy — Ergebnis-Invarianten', () => {
   before(() => {
     browserManager.ensureContext = async () => ({ page: activeCalendar.page, context: {} });
-    browserManager.context = null;
+    browserManager.resetForTest();
     globalThis.window = { getComputedStyle: () => ({ display: 'block', visibility: 'visible', position: 'static' }) };
   });
   after(() => {

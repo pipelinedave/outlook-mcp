@@ -3,53 +3,100 @@ import path from 'path';
 import fs from 'fs';
 import { config } from './config.js';
 
+/**
+ * Realm-Multiplex (geteilter Daemon, 2026-10-19):
+ * Frueher war BrowserManager ein Singleton mit EINER context/page — d.h. der Prozess
+ * konnte nur EINEN Realm gleichzeitig offen halten (Realm-Wechsel schloss den Browser).
+ * Fuer die HTTP-Daemon-Konsolidierung muessen mehrere Realms (adesso.de / d-velop.de)
+ * PARALLEL offen sein, damit mehrere Agents ohne Kollision arbeiten koennen.
+ *
+ * Umstellung: Eine Map<realm, { context, page, isHeadless }> statt einzelner Felder.
+ * ensureContext(realm) legt/behaelt den Browser NUR fuer diesen Realm an und schliesst
+ * KEINEN anderen mehr. Alle Realm-Profil-Verzeichnisse (config.getProfileDirForRealm)
+ * bleiben erhalten — die eingeloggten Mailbox-Sessions je Tenant werden weiter getrennt.
+ */
 class BrowserManager {
   constructor() {
-    this.context = null;
-    this.page = null;
-    this.isHeadless = true;
-    this.currentRealm = null;
+    // realm -> { context, page, isHeadless }
+    this.browsers = new Map();
+  }
+
+  _entry(realm) {
+    return this.browsers.get(realm) || null;
+  }
+
+  // Realm-scoped Getter fuer owa.js (statt direkter Singleton-Felder).
+  getContext(realm) {
+    const e = this._entry(realm);
+    return e ? e.context : null;
+  }
+
+  // Test-Hilfe: Reset des internen Zustands ohne echte Browser zu schliessen
+  // (Tests mocken ensureContext; die alte `context = null`-Zuweisung geht mit
+  // Getter-basiertem Design nicht mehr). Nur fuer Test-Setups gedacht.
+  resetForTest() {
+    this.browsers = new Map();
+  }
+
+  getPage(realm) {
+    const e = this._entry(realm);
+    return e ? e.page : null;
+  }
+
+  // Abwaertskompatible Aliase: ohne realm = default-Realm (einzelner Browser im alten Stil).
+  get context() {
+    return this.getContext(config.defaultRealm);
+  }
+
+  get page() {
+    return this.getPage(config.defaultRealm);
+  }
+
+  get currentRealm() {
+    return config.defaultRealm;
+  }
+
+  get isHeadless() {
+    const e = this._entry(config.defaultRealm);
+    return e ? e.isHeadless : true;
   }
 
   async ensureContext(headless = true, realm) {
     const targetRealm = realm || config.defaultRealm;
-    if (this.context && this.currentRealm !== targetRealm) {
-      await this.close();
-    }
-    this.currentRealm = targetRealm;
+    let entry = this._entry(targetRealm);
 
     // Stabilitäts-Regel: Einmal sichtbar (headless=false, z.B. Login-Fenster) gestartet,
-    // bleibt der Browser sichtbar. Wir schließen einen laufenden Kontext NUR, wenn ein
+    // bleibt der Browser sichtbar. Wir schliessen einen laufenden Kontext NUR, wenn ein
     // SICHTBARES Fenster gewünscht ist, aktuell aber headless läuft. Niemals von sichtbar
-    // auf headless zurückschalten — das würde z.B. das sichtbare Login-Fenster mitten im
-    // Login schließen und "das Fenster verschwindet" verursachen.
-    if (this.context) {
-      if (this.isHeadless && !headless) {
-        // Sichtbar gewünscht, läuft aber headless -> sichtbar neu öffnen
-        await this.close();
+    // auf headless zurueckschalten — das wuerde z.B. ein offenes Login-Fenster mitten im
+    // Login schliessen. Diese Regel gilt PRO REALM.
+    if (entry && entry.context) {
+      if (entry.isHeadless && !headless) {
+        // Sichtbar gewuenscht, laeuft aber headless -> sichtbar neu oeffnen (nur dieser Realm)
+        await this.close(targetRealm);
+        entry = null;
       } else {
         try {
           // Session-Gesundheits-Gate: Eine offene Seite, die auf die Microsoft-
           // Login-Seite umgeleitet wurde (Session abgelaufen), ist NICHT gesund.
-          // Wir bauen den Context dann sauber neu, statt auf einer toten Seite weiter
-          // zu arbeiten (verhindert stillschweigend fehlschlagende Tool-Calls).
-          if (this.page && !this.page.isClosed()) {
-            const u = this.page.url();
+          if (entry.page && !entry.page.isClosed()) {
+            const u = entry.page.url();
             const loggedOut = u.includes('login.microsoftonline.com') ||
               u.includes('login.live.com') ||
               u.includes('error/login') ||
               (u.includes('outlook') && u.includes('sampleresponse')) === false &&
               (u === 'about:blank' || u.includes('error'));
             if (loggedOut) {
-              await this.close();
+              await this.close(targetRealm);
+              entry = null;
             } else {
-              return { context: this.context, page: this.page };
+              return { context: entry.context, page: entry.page };
             }
           }
         } catch (e) {
-          // Seite nicht mehr abfragbar -> neu aufbauen
-          this.context = null;
-          this.page = null;
+          // Seite nicht mehr abfragbar -> diesen Realm neu aufbauen
+          this.browsers.delete(targetRealm);
+          entry = null;
         }
       }
     }
@@ -59,20 +106,16 @@ class BrowserManager {
       fs.mkdirSync(profileDir, { recursive: true });
     }
 
-    // Stale-Chromium-Dateien gründlich bereinigen: Bei abgestürzten/versehentlich
+    // Stale-Chromium-Dateien gruendlich bereinigen: Bei abgestuerzten/versehentlich
     // beendeten Prozessen (Profil-Kollision mehrerer Sessions, Fact #2672) bleiben
-    // tote Locks/Port-Dateien zurück, die einen sauberen Neustart blockieren können.
-    // Nur Dateien entfernen — NIEMALS verwaiste Chrome-Prozesse killen (könnten zu
-    // anderen Sessions gehören).
+    // tote Locks/Port-Dateien zurueck. Nur Dateien entfernen — NIE Prozesse killen.
     const cleanStaleFiles = () => {
       const relics = ['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'DevToolsActivePort', 'lockfile', 'parent.lock'];
       for (const file of relics) {
         const p = path.join(profileDir, file);
         try {
           if (fs.existsSync(p)) fs.unlinkSync(p);
-        } catch (e) {
-          // Datei evtl. von laufendem Prozess gesperrt -> ignorieren (Chromium kümmert sich)
-        }
+        } catch (e) {}
       }
     };
     cleanStaleFiles();
@@ -84,11 +127,7 @@ class BrowserManager {
       );
     }
 
-    this.isHeadless = headless;
-    // Bei sichtbaren Fenstern (headless=false) die WSLg-Anzeige-Umgebung HART setzen,
-    // damit Chromium den Wayland-Socket findet und NICHT auf --ozone-platform=headless
-    // zurückfällt. Fehlerquelle: Im Prozess ist XDG_RUNTIME_DIR oft /run/user/1000
-    // (kein WSLg-Socket) -> ein bloßer ||-Fallback greift dann nicht.
+    // Bei sichtbaren Fenstern (headless=false) die WSLg-Anzeige-Umgebung HART setzen.
     const wslgEnv = headless
       ? {
           DISPLAY: process.env.DISPLAY || ':0',
@@ -102,24 +141,19 @@ class BrowserManager {
           PULSE_SERVER: process.env.PULSE_SERVER || '/mnt/wslg/PulseServer'
         };
 
-    // Launch mit einem Retry: Bei kurzzeitigen Lock-Kollisionen (z.B. ein anderer
-    // MCP-Prozess schließt gerade), ein zweiter, bereinigter Versuch. Sonst Fehler
-    // transparent durchreichen.
+    // Launch mit Retry bei kurzzeitigen Lock-Kollisionen.
     let launched = false;
     let lastError = null;
+    let context = null;
     for (let attempt = 0; attempt < 2 && !launched; attempt++) {
       if (attempt > 0) {
         cleanStaleFiles();
         await new Promise(r => setTimeout(r, 800));
       }
       try {
-        this.context = await chromium.launchPersistentContext(profileDir, {
+        context = await chromium.launchPersistentContext(profileDir, {
           headless: headless,
           executablePath: chromeExecutable,
-          // Download-Handling (Tool-Luecke Anhänge, 12.10.2026): Ohne acceptDownloads
-          // verwarf Chromium Downloads sofort (gbrain #7330: "kein Download-Handling").
-          // Mit true feuert Playwright 'download'-Events, die saveAttachments per
-          // saveAs() einfängt.
           acceptDownloads: true,
           viewport: { width: 1280, height: 800 },
           userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0',
@@ -138,21 +172,22 @@ class BrowserManager {
         launched = true;
       } catch (e) {
         lastError = e;
-        this.context = null;
+        context = null;
       }
     }
 
-    if (!launched) {
+    if (!launched || !context) {
       throw new Error(`Browser-Start fehlgeschlagen (auch nach Retry): ${lastError ? lastError.message : 'unbekannter Fehler'}`);
     }
 
-    const pages = this.context.pages();
-    this.page = pages.length > 0 ? pages[0] : await this.context.newPage();
-    return { context: this.context, page: this.page };
+    const pages = context.pages();
+    const page = pages.length > 0 ? pages[0] : await context.newPage();
+    this.browsers.set(targetRealm, { context, page, isHeadless: headless });
+    return { context, page };
   }
 
   async openLoginWindow(realm = config.defaultRealm) {
-    await this.close();
+    await this.close(realm);
     const { page } = await this.ensureContext(false, realm);
     const loginUrl = realm
       ? `https://outlook.office.com/mail/?realm=${encodeURIComponent(realm)}`
@@ -161,13 +196,25 @@ class BrowserManager {
     return page;
   }
 
-  async close() {
-    if (this.context) {
-      try {
-        await this.context.close();
-      } catch (e) {}
-      this.context = null;
-      this.page = null;
+  // Schliesst einen bestimmten Realm (Standard) oder alle, wenn kein realm angegeben.
+  async close(realm) {
+    if (realm) {
+      const entry = this._entry(realm);
+      if (entry && entry.context) {
+        try {
+          await entry.context.close();
+        } catch (e) {}
+        this.browsers.delete(realm);
+      }
+      return;
+    }
+    for (const [r, e] of [...this.browsers.entries()]) {
+      if (e.context) {
+        try {
+          await e.context.close();
+        } catch (err) {}
+      }
+      this.browsers.delete(r);
     }
   }
 }
