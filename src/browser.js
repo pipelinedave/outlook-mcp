@@ -17,8 +17,37 @@ import { config } from './config.js';
  */
 class BrowserManager {
   constructor() {
-    // realm -> { context, page, isHeadless }
+    // realm -> { context, page, isHeadless, lastUsed }
     this.browsers = new Map();
+    // Idle-Unload (2026-10-20): Browser je Realm nach N Minuten ohne Zugriff
+    // schliessen. Profil bleibt erhalten -> naechster Call startet lazy neu.
+    // 0 = deaktiviert.
+    this.idleMinutes = Number.parseInt(process.env.OUTLOOK_MCP_BROWSER_IDLE_MIN ?? '30', 10);
+    this.idleTimer = null;
+    this.startIdleReaper();
+  }
+
+  startIdleReaper() {
+    if (!Number.isFinite(this.idleMinutes) || this.idleMinutes <= 0) return;
+    const idleMs = this.idleMinutes * 60_000;
+    this.idleTimer = setInterval(() => { void this.reapIdle(idleMs); }, 60_000);
+    if (typeof this.idleTimer.unref === 'function') this.idleTimer.unref();
+  }
+
+  async reapIdle(idleMs) {
+    const now = Date.now();
+    for (const [realm, e] of [...this.browsers.entries()]) {
+      if (!e?.context) continue;
+      if (now - (e.lastUsed || 0) < idleMs) continue;
+      if (this.browsers.get(realm) !== e) continue;
+      // Vor close austragen: eine parallele ensureContext darf den NEUEN Eintrag
+      // nicht durch das nachgelagerte delete verlieren.
+      this.browsers.delete(realm);
+      try {
+        await e.context.close();
+      } catch (err) {}
+      console.error(`[outlook-mcp] idle-unload: Browser fuer Realm '${realm}' nach ${this.idleMinutes} min Inaktivitaet geschlossen`);
+    }
   }
 
   _entry(realm) {
@@ -28,6 +57,7 @@ class BrowserManager {
   // Realm-scoped Getter fuer owa.js (statt direkter Singleton-Felder).
   getContext(realm) {
     const e = this._entry(realm);
+    if (e) e.lastUsed = Date.now();
     return e ? e.context : null;
   }
 
@@ -40,6 +70,7 @@ class BrowserManager {
 
   getPage(realm) {
     const e = this._entry(realm);
+    if (e) e.lastUsed = Date.now();
     return e ? e.page : null;
   }
 
@@ -90,6 +121,7 @@ class BrowserManager {
               await this.close(targetRealm);
               entry = null;
             } else {
+              entry.lastUsed = Date.now(); // Idle-Timer zuruecksetzen
               return { context: entry.context, page: entry.page };
             }
           }
@@ -182,7 +214,7 @@ class BrowserManager {
 
     const pages = context.pages();
     const page = pages.length > 0 ? pages[0] : await context.newPage();
-    this.browsers.set(targetRealm, { context, page, isHeadless: headless });
+    this.browsers.set(targetRealm, { context, page, isHeadless: headless, lastUsed: Date.now() });
     return { context, page };
   }
 
