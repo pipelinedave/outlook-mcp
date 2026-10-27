@@ -40,7 +40,7 @@ neue E-Mail-Entwürfe sicher anlegen.
    - `outlook_close`: Beendet die Hintergrund-Browserinstanz.
 - **Firmenkalender-Tools** (für Blocker & Fokuszeiten im Outlook-Firmenkalender):
   - `outlook_create_calendar_event`: Legt einen Kalender-Eintrag (Standard `transparency: busy`) per OWA DeepLink an. Termin-Zeiten werden korrekt als Berlin-Lokalzeit interpretiert (keine UTC-Verschiebung).
-  - `outlook_get_freebusy`: Fragt die Belegung des Firmenkalenders in einem Zeitfenster ab (Busy-Slots aus ARIA-Labels), zur Kollisionsprüfung vor dem Anlegen eines Blockers.
+  - `outlook_get_freebusy`: Fragt die Belegung in einem Zeitfenster ab. OHNE `attendees`: eigener Firmenkalender (Busy-Slots aus ARIA-Labels). MIT `attendees` (Array von E-Mails): Verfügbarkeit der angegebenen Teilnehmer über das OWA-GraphQL-Gateway (Free/Busy/Tentative/OOF + gemeinsame freie Slots) — zur kollisionsfreien Terminvorschlag-Findung.
   - `outlook_list_calendar_events`: **READ-ONLY** – listet ALLE Termine (Titel, Datum, Start/Ende, Ganztag, Status) des Firmenkalenders in einem Zeitraum. Basis für Termin-Briefings. Es wird nur gelesen, nichts verändert.
   - `outlook_get_calendar_event`: **READ-ONLY** – liest die Detail-Ansicht (Reading-Panel) eines Kalender-Events anhand seines Titels. Liefert den vollständigen Detail-Text für Termin-Briefings.
   - `outlook_delete_calendar_event`: Löscht ein Kalender-Event anhand seines Titels/Suchbegriffs (über die Wochenansicht + echten Playwright-Klick). Entfernt einzelne Events, verhindert versehentliches Löschen ganzer Serien.
@@ -158,6 +158,35 @@ Nützlich, um Fokusblöcke/Abwesenheiten anzulegen, Kollisionen zu prüfen und B
   "arguments": { "query": "Fokus: tiefe Arbeit" }
 }
 ```
+
+### Teilnehmer-Verfügbarkeit (attendees-Parameter)
+
+Mit `attendees` fragt `outlook_get_freebusy` die Verfügbarkeit der ANGEGEBENEN
+Personen ab (statt des eigenen Kalenders) — für kollisionsfreie Terminvorschläge:
+
+```json
+{
+  "name": "outlook_get_freebusy",
+  "arguments": {
+    "attendees": ["silas.beckmann@d-velop.de", "mathis.kuenzel@d-velop.de"],
+    "start": "2026-10-29T09:00:00",
+    "end": "2026-10-29T17:00:00",
+    "interval_minutes": 15
+  }
+}
+```
+
+Rückgabe: je Teilnehmer `busySlots` (Free/Busy/Tentative/OOF, UTC + Berlin-Lokalzeit),
+`scheduleItems` (Betreff sofern nicht privat), `workingHours` — plus
+`commonFreeSlots` (gemeinsame freie Intervalle ≥ Slot-Granularität).
+
+Technik (Live-verifiziert 27.10.2026): Abfrage über das OWA-GraphQL-Gateway
+(`POST /outlookgatewayb2/graphql`, Operation `GetSchedule`). Der Bearer-Token wird
+beim Kalender-Boot aus dem Eigen-Traffic der App abgegriffen (JWT, ~24h gültig,
+gecacht — Folgeaufrufe < 1s), `userId` kommt aus dem GetSchedule-Body bzw. den
+JWT-Claims. Gesamtzeitbudget 40s (sicher unter dem MCP-Client-Timeout); Fehler
+je Teilnehmer werden einzeln berichtet, statt den Call zu killen. Der Hinweis in
+`note` warnt, wenn Teilnehmer fehlschlugen — deren Belegung ist dann NICHT enthalten.
 
 > **Zeitzonen-Hinweis**: Zeiten ohne Offset (z.B. `2026-09-15T08:00:00`) werden als
 > **Europe/Berlin-Lokalzeit** interpretiert (OWA interpretiert `startdt` ohne Offset als

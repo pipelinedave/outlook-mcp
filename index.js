@@ -405,12 +405,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'outlook_get_freebusy',
-        description: 'Fragt die Belegung des Outlook-FIRMENKALENDERS in einem Zeitfenster ab (Busy-Slots), zur Kollisionsprüfung vor dem Anlegen eines Blockers.',
+        description: 'Fragt die Kalender-Belegung in einem Zeitfenster ab. OHNE attendees: eigener FIRMENKALENDER (Busy-Slots aus der Wochenansicht). MIT attendees (Array von E-Mails): Verfügbarkeit der ANGEGEBENEN TEILNEHMER über das OWA-Gateway (Free/Busy/Tentative/OOF je Teilnehmer + gemeinsame freie Slots) — für kollisionsfreie Terminvorschläge. Empfohlen vor jedem outlook_create_calendar_event.',
         inputSchema: {
           type: 'object',
           properties: {
-            start: { type: 'string', description: 'Start ISO, z.B. "2026-09-15T09:30:00"' },
-            end: { type: 'string', description: 'Ende ISO, z.B. "2026-09-15T11:00:00"' },
+            start: { type: 'string', description: 'Start ISO, z.B. "2026-09-15" oder "2026-09-15T09:30:00"' },
+            end: { type: 'string', description: 'Ende ISO, z.B. "2026-09-15" oder "2026-09-15T18:00:00"' },
+            attendees: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optional: E-Mail-Adressen der Teilnehmer, deren Verfügbarkeit geprüft werden soll, z.B. ["silas.beckmann@d-velop.de","mathis.kuenzel@d-velop.de"]. Ohne Angabe: eigener Kalender.',
+              maxItems: 20
+            },
+            interval_minutes: { type: 'integer', description: 'Slot-Granularität in Minuten (nur mit attendees, Default 15, 5-60).', default: 15, minimum: 5, maximum: 60 },
             realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['start', 'end']
@@ -710,7 +717,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'outlook_get_freebusy': {
-        const res = await owaClient.getFreeBusy({ start: args.start, end: args.end });
+        // Zwei Modi: MIT attendees -> Teilnehmer-Verfügbarkeit über das
+        // OWA-GraphQL-Gateway (Kollegen-Kalender). OHNE attendees -> bisheriges
+        // Verhalten (eigener Kalender, Wochenansicht-DOM).
+        const attendeeList = Array.isArray(args?.attendees) ? args.attendees : [];
+        const res = attendeeList.length
+          ? await owaClient.getAttendeeAvailability({
+              attendees: attendeeList,
+              start: args.start,
+              end: args.end,
+              intervalMinutes: args?.interval_minutes ?? 15
+            })
+          : await owaClient.getFreeBusy({ start: args.start, end: args.end });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 

@@ -3454,9 +3454,328 @@ export function resolveMailboxVerification(hints, realmDomain) {
   return { activeMailboxMatchesRealm: matchingHint !== null, matchingHint };
 }
 
+// ---------------------------------------------------------------------------
+// Teilnehmer-Verfügbarkeit (GetSchedule via OWA-GraphQL-Gateway)
+//
+// Live-Befund 27.10.2026 (Probe 1–6): Die OWA-App lädt Teilnehmer-Verfügbarkeit
+// NICHT über service.svc/GetUserAvailabilityInternal (401 ohne Canary), sondern
+// über das GraphQL-Gateway:
+//   POST {origin}/outlookgatewayb2/graphql   (origin: outlook.cloud.microsoft)
+//   Authorization: Bearer <JWT>  (aud outlook.office.com, ~24h gültig, scopes
+//   Calendars.ReadWrite*) — OWA hängt den Token an JEDEN dieser Calls.
+//   Body: [{ operationName:'GetSchedule', variables:{ input:{ userId,
+//   availabilityViewInterval, startTime/endTime {dateTime,timeZone}, schedules[]
+//   }}, query }]
+// Der Token (und userId + Gateway-URL) werden aus dem Eigen-Traffic der
+// Kalender-App beim Boot abgegriffen (page.on('request')) und gecacht. Der
+// POST läuft über den Playwright-APIRequestContext (context.request) — kein
+// CORS, Cookies automatisch, Timeouts hart deckelbar.
+//
+// availabilityView-Format: EIN Zeichen je Slot (intervalMinutes, Default 15):
+//   0=free 1=tentative 2=busy 3=oof 4=workingElsewhere (sonst unknown).
+// ---------------------------------------------------------------------------
+
+// Status-Map je availabilityView-Zeichen.
+export const AVAILABILITY_STATUS_MAP = {
+  0: 'free', 1: 'tentative', 2: 'busy', 3: 'oof', 4: 'workingElsewhere'
+};
+
+// Hartes Gesamtzeitbudget für den KOMPLETTEN getAttendeeAvailability-Call.
+// Muss sicher UNTER dem MCP-Client-Timeout liegen (vgl. FREEBUSY_TOTAL_BUDGET_MS).
+export const ATTENDEE_TOTAL_BUDGET_MS = 40000;
+// Max. Wartezeit auf den Boot-GraphQL-Call (Token-Abgriff) je Versuch.
+export const ATTENDEE_TOKEN_WAIT_MAX_MS = 25000;
+// HTTP-Timeout des Gateway-POSTs (einzelner Request).
+export const ATTENDEE_HTTP_TIMEOUT_MS = 20000;
+// Sicherheits-Marge, ab der ein gecachter Token als ablaufend gilt (2 min).
+export const ATTENDEE_TOKEN_MARGIN_MS = 120000;
+// Obergrenze der Teilnehmer je Anfrage (Gateway-Kosten + Antwortgröße).
+export const ATTENDEE_MAX_ATTENDEES = 20;
+
+// GraphQL-Query (kompakt, verifiziert gegen Live-Antwort 27.10.2026 — Probe 6:
+// 200 OK mit schedules/availabilityView/scheduleItems/workingHours).
+export const GET_SCHEDULE_QUERY = `query GetSchedule($input: GetScheduleInput) {
+  getSchedule(request: $input) {
+    schedules {
+      availabilityView
+      error { message responseCode diagnosticData }
+      scheduleId
+      scheduleItems {
+        isPrivate location status subject isException isReminderSet isMeeting isRecurring id
+        startTime { dateTime timeZone { name } }
+        endTime { dateTime timeZone { name } }
+      }
+      workingHours { daysOfWeek startTime endTime timeZone { name bias } }
+    }
+  }
+}`;
+
+// Normalisiert die attendees-Eingabe: Strings -> E-Mail-Kandidaten (der erste
+// E-Mail-Like-Teil gewinnt, extractEmailLike), lowercase, Dedupe, Cap. Reine
+// Funktion: wirft NICHT, liefert { valid, invalid }.
+export function normalizeAttendeeList(attendees, max = ATTENDEE_MAX_ATTENDEES) {
+  const valid = [];
+  const invalid = [];
+  if (!Array.isArray(attendees)) return { valid, invalid };
+  const seen = new Set();
+  for (const raw of attendees) {
+    if (valid.length >= max) break;
+    if (typeof raw !== 'string') { if (raw != null) invalid.push(String(raw)); continue; }
+    const email = extractEmailLike(raw);
+    if (!email) { invalid.push(raw); continue; }
+    const key = email.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    valid.push(key);
+  }
+  return { valid, invalid };
+}
+
+// Dekodiert die exp-Claim eines JWT (Payload, base64url) in ms. Wirft NICHT.
+export function parseJwtExp(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+    return Number.isFinite(payload.exp) ? payload.exp * 1000 : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Dekodiert ausgewählte Identitäts-Claims eines JWT. Quelle für die
+// GetSchedule-userId, wenn der OWA-Boot-Call sie nicht hergibt (Live-Befund
+// 27.10.2026: upn/unique_name = Login-Alias, z.B. ext-dhal@d-velop.de).
+export function parseJwtIdentity(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return {};
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+    const pick = (v) => (typeof v === 'string' && v.includes('@')) ? v : null;
+    return {
+      upn: pick(payload.upn),
+      uniqueName: pick(payload.unique_name),
+      name: typeof payload.name === 'string' ? payload.name : null
+    };
+  } catch (e) {
+    return {};
+  }
+}
+
+// Ist der Token (noch) verwendbar? Marge: kurz vor Ablauf gilt als abgelaufen.
+export function isTokenUsable(token, { marginMs = ATTENDEE_TOKEN_MARGIN_MS, nowMs = Date.now() } = {}) {
+  const exp = parseJwtExp(token);
+  return typeof token === 'string' && token.length > 0 && Number.isFinite(exp) && (nowMs + marginMs) < exp;
+}
+
+// Offset einer Zeitzone zu UTC für einen Zeitpunkt (ms; DST-sicher via Intl).
+export function timeZoneOffsetMs(utcMs, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(new Date(utcMs))) parts[p.type] = p.value;
+  const asUtc = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour) % 24, Number(parts.minute), Number(parts.second)
+  );
+  return asUtc - Math.floor(utcMs / 1000) * 1000;
+}
+
+// Naive Zeitangabe in einer Ziel-Zeitzone -> UTC-ISO. Werte MIT Offset/Z
+// bleiben unverändert. Zwei Iterationen fangen DST-Grenzfälle.
+export function zonedTimeToUtcIso(naiveIso, timeZone = 'Europe/Berlin') {
+  const s = String(naiveIso || '').trim();
+  if (!s) return null;
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(s)) {
+    const direct = new Date(s).getTime();
+    return Number.isNaN(direct) ? null : new Date(direct).toISOString();
+  }
+  const guessMs = Date.parse(s + 'Z');
+  if (Number.isNaN(guessMs)) return null;
+  let utcMs = guessMs;
+  for (let i = 0; i < 2; i++) {
+    const corrected = guessMs - timeZoneOffsetMs(utcMs, timeZone);
+    if (corrected === utcMs) break;
+    utcMs = corrected;
+  }
+  return new Date(utcMs).toISOString();
+}
+
+// Baut den GraphQL-Request-Body (Array-Wrapper, wie OWA selbst sendet).
+// dateTime-Strings werden als UTC übergeben (ohne 'Z', wie der OWA-Eigencall).
+export function buildGetScheduleRequest({ userId, attendeeEmails, startUtcIso, endUtcIso, intervalMinutes = 15 }) {
+  const stripZ = (iso) => String(iso || '').replace(/\.(\d{3})Z$/, '.$1').replace(/Z$/, '');
+  return [{
+    operationName: 'GetSchedule',
+    variables: {
+      input: {
+        userId: userId || attendeeEmails[0],
+        availabilityViewInterval: intervalMinutes,
+        startTime: { dateTime: stripZ(startUtcIso), timeZone: { name: 'UTC' } },
+        endTime: { dateTime: stripZ(endUtcIso), timeZone: { name: 'UTC' } },
+        schedules: [...attendeeEmails]
+      }
+    },
+    query: GET_SCHEDULE_QUERY
+  }];
+}
+
+// Dekodiert availabilityView in zusammengeführte Segmente, auf das Fenster
+// geclippt. Reine Funktion, wirft NICHT (ungültig -> leere Segmente).
+export function decodeAvailabilityView(view, { startUtcIso, endUtcIso, intervalMinutes = 15 } = {}) {
+  const v = String(view || '');
+  const startMs = Date.parse(startUtcIso || '');
+  const endMs = Date.parse(endUtcIso || '');
+  const raw = { segments: [], busySegments: [], slotCount: 0 };
+  if (!v || !Number.isFinite(startMs) || !Number.isFinite(endMs) || !(intervalMinutes > 0)) return raw;
+  const out = [];
+  for (let i = 0; i < v.length; i++) {
+    const slotStart = startMs + i * intervalMinutes * 60000;
+    const slotEnd = slotStart + intervalMinutes * 60000;
+    if (slotStart >= endMs) break;
+    if (slotEnd <= startMs) continue;
+    const code = v[i];
+    const from = Math.max(slotStart, startMs);
+    const to = Math.min(slotEnd, endMs);
+    out.push({
+      status: AVAILABILITY_STATUS_MAP[code] || 'unknown',
+      startUtcIso: new Date(from).toISOString(),
+      endUtcIso: new Date(to).toISOString(),
+      minutes: Math.round((to - from) / 60000)
+    });
+  }
+  // Zusammenführen gleicher Nachbar-Status (Slots desselben Status).
+  const segments = [];
+  for (const s of out) {
+    const last = segments[segments.length - 1];
+    if (last && last.status === s.status) {
+      last.endUtcIso = s.endUtcIso;
+      last.minutes += s.minutes;
+    } else {
+      segments.push({ ...s });
+    }
+  }
+  return {
+    segments,
+    busySegments: segments.filter(s => s.status !== 'free'),
+    slotCount: v.length
+  };
+}
+
+// Parst die Gateway-Antwort: Array-Wrapper ODER nacktes Objekt, GraphQL-
+// errors-Array, Nicht-JSON. Liefert { ok, schedules, errorInfo }.
+export function parseGetScheduleResponse(bodyText) {
+  let json = null;
+  try {
+    json = JSON.parse(String(bodyText || ''));
+  } catch (e) {
+    return { ok: false, schedules: [], errorInfo: { kind: 'non-json', snippet: String(bodyText || '').slice(0, 400) } };
+  }
+  const envelope = Array.isArray(json) ? json[0] : json;
+  if (!envelope || typeof envelope !== 'object') {
+    return { ok: false, schedules: [], errorInfo: { kind: 'empty-envelope', snippet: String(bodyText || '').slice(0, 200) } };
+  }
+  if (Array.isArray(envelope.errors) && envelope.errors.length) {
+    return { ok: false, schedules: [], errorInfo: { kind: 'graphql-errors', errors: envelope.errors.slice(0, 5) } };
+  }
+  const schedules = envelope?.data?.getSchedule?.schedules;
+  if (!Array.isArray(schedules)) {
+    return { ok: false, schedules: [], errorInfo: { kind: 'missing-schedules', snippet: String(bodyText || '').slice(0, 300) } };
+  }
+  return { ok: true, schedules, errorInfo: null };
+}
+
+// Mergt überlappende/sortierte Intervall-Listen (ms) zu einer disjunkten Liste.
+function mergeBusyIntervals(intervals) {
+  const sorted = [...intervals].filter(i => i.endMs > i.startMs).sort((a, b) => a.startMs - b.startMs);
+  const out = [];
+  for (const iv of sorted) {
+    const last = out[out.length - 1];
+    if (last && iv.startMs <= last.endMs) {
+      last.endMs = Math.max(last.endMs, iv.endMs);
+    } else {
+      out.push({ startMs: iv.startMs, endMs: iv.endMs });
+    }
+  }
+  return out;
+}
+
+// Invertiert Busy-Intervalle in Freie innerhalb des Fensters.
+function freeIntervalsFor(busyMerged, windowStartMs, windowEndMs) {
+  const free = [];
+  let cursor = windowStartMs;
+  for (const iv of busyMerged) {
+    if (iv.startMs > cursor) free.push({ startMs: cursor, endMs: Math.min(iv.startMs, windowEndMs) });
+    cursor = Math.max(cursor, iv.endMs);
+    if (cursor >= windowEndMs) break;
+  }
+  if (cursor < windowEndMs) free.push({ startMs: cursor, endMs: windowEndMs });
+  return free.filter(f => f.endMs > f.startMs);
+}
+
+// Schnittmenge zweier sortierter, disjunkter Freier-Listen.
+function intersectTwoFreeLists(a, b) {
+  const out = [];
+  let i = 0, j = 0;
+  while (i < a.length && j < b.length) {
+    const startMs = Math.max(a[i].startMs, b[j].startMs);
+    const endMs = Math.min(a[i].endMs, b[j].endMs);
+    if (endMs > startMs) out.push({ startMs, endMs });
+    if (a[i].endMs < b[j].endMs) i++; else j++;
+  }
+  return out;
+}
+
+// Gemeinsame freie Slots aller Teilnehmer (min. Dauer gefiltert).
+export function intersectFreeSegments(busySegmentsPerAttendee, { startUtcIso, endUtcIso, minDurationMinutes = 15 } = {}) {
+  const startMs = Date.parse(startUtcIso || '');
+  const endMs = Date.parse(endUtcIso || '');
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return [];
+  let common = freeIntervalsFor([], startMs, endMs); // komplettes Fenster
+  for (const busyList of busySegmentsPerAttendee) {
+    const merged = mergeBusyIntervals(busyList.map(s => ({
+      startMs: Date.parse(s.startUtcIso),
+      endMs: Date.parse(s.endUtcIso)
+    })).filter(i => Number.isFinite(i.startMs) && Number.isFinite(i.endMs)));
+    const free = freeIntervalsFor(merged, startMs, endMs);
+    common = intersectTwoFreeLists(common, free);
+    if (!common.length) return [];
+  }
+  const minMs = minDurationMinutes * 60000;
+  return common
+    .filter(f => (f.endMs - f.startMs) >= minMs)
+    .map(f => ({
+      start: new Date(f.startMs).toISOString(),
+      end: new Date(f.endMs).toISOString(),
+      durationMinutes: Math.round((f.endMs - f.startMs) / 60000)
+    }));
+}
+
+// UTC-ISO -> lesbare Lokalzeit (de-DE) für die Agent-Ausgabe.
+export function formatUtcIsoInZone(iso, timeZone = 'Europe/Berlin') {
+  const ms = Date.parse(iso || '');
+  if (!Number.isFinite(ms)) return null;
+  return new Intl.DateTimeFormat('de-DE', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(new Date(ms));
+}
+
 export class OwaClient {
   constructor(realm = config.defaultRealm) {
     this.realm = realm;
+    // Token-Cache für das GraphQL-Gateway (Teilnehmer-Verfügbarkeit):
+    // Token + Ablauf, Gateway-URL und signed-in userId werden aus dem
+    // Eigen-Traffic der Kalender-App abgegriffen (captureScheduleToken).
+    this._scheduleToken = null;
+    this._scheduleTokenExpMs = 0;
+    this._scheduleGraphqlUrl = null;
+    this._scheduleUserId = null;
   }
 
   setRealm(realm) {
@@ -4932,6 +5251,295 @@ export class OwaClient {
       result.diagnostics = diag;
     }
     return result;
+  }
+
+  // ===========================================================================
+  // Teilnehmer-Verfügbarkeit (outlook_get_freebusy mit attendees-Parameter):
+  // getAttendeeAvailability.
+  //
+  // Fragt die Busy-/Free-Belegung MEHRERER Kalender (Kollegen) für ein
+  // Zeitfenster über das OWA-GraphQL-Gateway ab (Live-verifiziert 27.10.2026).
+  // Der Bearer-Token kommt aus dem Eigen-Traffic der Kalender-App
+  // (captureScheduleToken) — kein Passwort, keine Canary, session-gebunden.
+  //
+  // Ehrlichkeits-Garantien (Stil getFreeBusy):
+  //  - Hartes Gesamtzeitbudget ATTENDEE_TOTAL_BUDGET_MS (40s, sicher unter dem
+  //    MCP-Client-Timeout); alle Phasen deckeln sich gegen die Restzeit.
+  //  - Fehler werden als strukturiertes Ergebnis (status:'error') MIT
+  //    Diagnostik zurückgegeben, NICHT als nackter Throw geworfen — nur die
+  //    reine Parametervalidierung wirft (wie getFreeBusy).
+  //  - Pro Teilnehmer wird ein API-Fehler (z.B. keine Berechtigung/externes
+  //    Postfach) einzeln berichtet, statt den ganzen Call zu killen.
+  // ===========================================================================
+
+  // Grifft den Bearer-Token (+ userId, Gateway-URL) aus dem Kalender-Boot-
+  // Traffic ab. force=true umgeht den Cache (nach 401).
+  async captureScheduleToken(page, { remaining, force = false, triggerUrl = null } = {}) {
+    if (!force && isTokenUsable(this._scheduleToken, { nowMs: Date.now() }) && this._scheduleGraphqlUrl) {
+      return {
+        token: this._scheduleToken,
+        userId: this._scheduleUserId,
+        url: this._scheduleGraphqlUrl,
+        source: 'cache'
+      };
+    }
+    const budget = phaseBudgetMs(remaining(), ATTENDEE_TOKEN_WAIT_MAX_MS, 2000);
+    if (budget <= 0) {
+      return { token: null, error: 'Kein Zeitbudget mehr für den Token-Abgriff (Gesamtbudget aufgebraucht).' };
+    }
+
+    const captured = { token: null, userId: null, url: null, requests: [] };
+    const onReq = (req) => {
+      try {
+        const u = req.url() || '';
+        if (!u.includes('outlookgatewayb2/graphql')) return;
+        if (captured.requests.length < 20) captured.requests.push(req);
+        const auth = req.headers()['authorization'];
+        if (auth && !captured.token) {
+          captured.token = String(auth).replace(/^Bearer\s+/i, '');
+          captured.url = u;
+        }
+        const pd = req.postData() || '';
+        const m = /"userId"\s*:\s*"([^"]+)"/.exec(pd);
+        if (m && !captured.userId) captured.userId = m[1];
+      } catch (e) { /* Request kann zwischendrin verschwinden — ignorieren */ }
+    };
+    page.on('request', onReq);
+    try {
+      // Boot-Trigger: Kalender-Ansicht laden. OWA feuert beim Boot mindestens
+      // einen GetSchedule-GraphQL-Call (Live-Befund Probe 5/6, 27.10.2026).
+      const url = triggerUrl || (this.realm
+        ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+        : 'https://outlook.office.com/calendar/view/week');
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(15000, budget) }).catch(() => null);
+      const waitEnd = Date.now() + budget;
+      while (!captured.token && Date.now() < waitEnd) {
+        await page.waitForTimeout(400).catch(() => null);
+      }
+      // userId nachträglich aus den gecaptured Request-Bodies lesen (postData
+      // ist im Request-Event teils noch nicht verfügbar, Live-Befund 27.10.).
+      if (!captured.userId) {
+        for (const req of captured.requests) {
+          try {
+            const pd = typeof req.postData === 'function' ? await req.postData() : req.postData();
+            const m = /"userId"\s*:\s*"([^"]+)"/.exec(String(pd || ''));
+            if (m) { captured.userId = m[1]; break; }
+          } catch (e) { /* weiter mit dem nächsten Request */ }
+        }
+      }
+    } finally {
+      try { page.off('request', onReq); } catch (e) {}
+    }
+
+    if (!captured.token) {
+      return {
+        token: null,
+        error: 'Kein GraphQL-Call mit Bearer-Token beim Kalender-Boot abgefangen. ' +
+          'Session ggf. abgelaufen (outlook_login) oder Kalender-App nicht geladen.'
+      };
+    }
+    this._scheduleToken = captured.token;
+    this._scheduleTokenExpMs = parseJwtExp(captured.token) || 0;
+    // userId-Kaskade: OWA-GetSchedule-Body -> JWT-Claims (upn/unique_name)
+    // -> Fallback beim Aufruf (attendees[0], Live-verified im selben Tenant).
+    if (!captured.userId) {
+      const claims = parseJwtIdentity(captured.token);
+      captured.userId = claims.upn || claims.uniqueName || null;
+    }
+    if (captured.url) {
+      try {
+        const u = new URL(captured.url);
+        this._scheduleGraphqlUrl = u.origin + '/outlookgatewayb2/graphql';
+      } catch (e) {
+        this._scheduleGraphqlUrl = 'https://outlook.cloud.microsoft/outlookgatewayb2/graphql';
+      }
+    }
+    if (captured.userId) this._scheduleUserId = captured.userId;
+    return {
+      token: this._scheduleToken,
+      userId: this._scheduleUserId,
+      url: this._scheduleGraphqlUrl,
+      source: force ? 'refresh' : 'boot'
+    };
+  }
+
+  async getAttendeeAvailability({ attendees, start, end, intervalMinutes = 15, timezone = 'Europe/Berlin' } = {}) {
+    // --- Parametervalidierung (throw wie getFreeBusy) ---
+    const { valid: validAttendees, invalid: invalidAttendees } = normalizeAttendeeList(attendees);
+    if (!validAttendees.length) {
+      throw new Error('Parameter "attendees" ist erforderlich: mindestens EINE gültige E-Mail-Adresse ' +
+        `(z.B. ["silas.beckmann@d-velop.de"]). Ungültig: ${invalidAttendees.length ? invalidAttendees.map(a => `"${a}"`).join(', ') : 'keine Eingabe'}`);
+    }
+    if (!start || !end) {
+      throw new Error('Parameter "start" und "end" sind erforderlich.');
+    }
+    let interval = Number.parseInt(intervalMinutes, 10);
+    if (!Number.isFinite(interval)) interval = 15;
+    interval = Math.min(60, Math.max(5, interval));
+
+    // Fenster -> UTC (naive Angaben gelten als Ziel-Zeitzone, Default Europe/Berlin)
+    const startLocal = String(start).length === 10 ? `${start}T00:00:00` : String(start);
+    const endLocal = String(end).length === 10 ? `${end}T23:59:59.999` : String(end);
+    const startUtcIso = zonedTimeToUtcIso(startLocal, timezone);
+    const endUtcIso = zonedTimeToUtcIso(endLocal, timezone);
+    if (!startUtcIso || !endUtcIso) {
+      throw new Error(`Ungültige Zeitangaben: start="${start}", end="${end}" (ISO erwartet, z.B. "2026-10-28T09:30:00").`);
+    }
+    const startMs = Date.parse(startUtcIso);
+    const endMs = Date.parse(endUtcIso);
+    if (endMs <= startMs) {
+      throw new Error(`"end" (${endUtcIso}) muss nach "start" (${startUtcIso}) liegen.`);
+    }
+
+    const budgetStart = Date.now();
+    const deadline = budgetStart + ATTENDEE_TOTAL_BUDGET_MS;
+    const remaining = () => deadline - Date.now();
+
+    const errorResult = (message, extra = {}) => ({
+      status: 'error',
+      error: message,
+      attendees: validAttendees,
+      requestedRange: { start, end, startUtc: startUtcIso, endUtc: endUtcIso, timezone },
+      diagnostics: {
+        totalBudgetMs: ATTENDEE_TOTAL_BUDGET_MS,
+        usedMs: Date.now() - budgetStart,
+        remainingMs: Math.max(0, remaining()),
+        ...extra
+      }
+    });
+
+    // Seite + Session
+    let page;
+    try {
+      page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
+      this.lastPage = page;
+    } catch (e) {
+      return errorResult(`Browser-Kontext nicht verfügbar: ${e.message}`);
+    }
+
+    // Token-Abgriff (Cache -> Boot-Traffic)
+    let cap = await this.captureScheduleToken(page, { remaining });
+    if (!cap.token) {
+      return errorResult(`Kein gültiger Auth-Token für das Outlook-Gateway: ${cap.error || 'unbekannter Grund'}`, { tokenSource: cap.source || null });
+    }
+
+    const requestBody = buildGetScheduleRequest({
+      userId: cap.userId, attendeeEmails: validAttendees, startUtcIso, endUtcIso, intervalMinutes: interval
+    });
+
+    // POST (ein Retry bei 401/403 mit Token-Refresh)
+    const context = page.context();
+    const postSchedule = async () => {
+      const httpTimeout = Math.min(ATTENDEE_HTTP_TIMEOUT_MS, Math.max(3000, remaining()));
+      return context.request.post(this._scheduleGraphqlUrl, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this._scheduleToken}`,
+          'x-ms-appname': 'owa-reactcalendar'
+        },
+        data: requestBody,
+        timeout: httpTimeout
+      });
+    };
+
+    let resp = null;
+    try {
+      resp = await postSchedule();
+      if (resp.status() === 401 || resp.status() === 403) {
+        // Token abgelaufen/ungültig -> einmal frisch abgreifen und retryen.
+        cap = await this.captureScheduleToken(page, { remaining, force: true });
+        if (!cap.token) {
+          return errorResult(`Auth-Token-Refresh fehlgeschlagen (HTTP ${resp.status()}): ${cap.error || 'unbekannter Grund'}`, { httpStatus: resp.status(), tokenSource: 'refresh-failed' });
+        }
+        resp = await postSchedule();
+      }
+    } catch (e) {
+      return errorResult(`Gateway-POST fehlgeschlagen: ${e.message}`, { tokenSource: cap.source || null });
+    }
+
+    const httpStatus = resp.status();
+    const bodyText = await resp.text().catch(() => '');
+    if (httpStatus !== 200) {
+      return errorResult(`Gateway-Antwort HTTP ${httpStatus}: ${bodyText.slice(0, 300) || '(leerer Body)'}`, { httpStatus, tokenSource: cap.source || null });
+    }
+
+    const parsed = parseGetScheduleResponse(bodyText);
+    if (!parsed.ok) {
+      return errorResult(`Gateway-Antwort nicht verwertbar: ${parsed.errorInfo.kind}`, {
+        httpStatus, tokenSource: cap.source || null, errorInfo: parsed.errorInfo
+      });
+    }
+
+    // Pro Teilnehmer dekodieren
+    const attendeeResults = [];
+    const busyPerAttendee = [];
+    for (const s of parsed.schedules) {
+      const email = s.scheduleId || s.email?.address || '(unbekannt)';
+      const apiError = (s.error && (s.error.message || s.error.responseCode))
+        ? { message: s.error.message || null, responseCode: s.error.responseCode || null }
+        : null;
+      const decoded = decodeAvailabilityView(s.availabilityView, { startUtcIso, endUtcIso, intervalMinutes: interval });
+      busyPerAttendee.push(apiError ? [] : decoded.busySegments);
+      const minutesByStatus = {};
+      for (const seg of decoded.segments) minutesByStatus[seg.status] = (minutesByStatus[seg.status] || 0) + seg.minutes;
+      attendeeResults.push({
+        email,
+        error: apiError,
+        availabilityView: s.availabilityView || '',
+        slotMinutes: interval,
+        busySlots: decoded.busySegments.map(seg => ({
+          status: seg.status,
+          start: seg.startUtcIso,
+          end: seg.endUtcIso,
+          startLocal: formatUtcIsoInZone(seg.startUtcIso, timezone),
+          endLocal: formatUtcIsoInZone(seg.endUtcIso, timezone)
+        })),
+        minutesByStatus,
+        scheduleItems: (Array.isArray(s.scheduleItems) ? s.scheduleItems : []).slice(0, 20).map(it => ({
+          status: it.status || null,
+          start: it.startTime?.dateTime || null,
+          end: it.endTime?.dateTime || null,
+          subject: it.isPrivate ? null : (it.subject || null),
+          isPrivate: it.isPrivate === true
+        })),
+        workingHours: s.workingHours || null
+      });
+    }
+
+    const commonFreeSlots = intersectFreeSegments(busyPerAttendee, {
+      startUtcIso, endUtcIso, minDurationMinutes: interval
+    });
+
+    const failed = attendeeResults.filter(a => a.error);
+    const note = 'Verfügbarkeit über das OWA-GraphQL-Gateway (GetSchedule) abgefragt — ' +
+      'Autorisierung über den Session-Token der eingeloggten Kalender-App. ' +
+      'Zeiten in UTC (start/end mit Z) + Lokalzeit (' + timezone + '). ' +
+      'commonFreeSlots = Schnittmenge aller freien Intervalle (>= ' + interval + ' Min). ' +
+      (failed.length
+        ? `WARNUNG: ${failed.length} Teilnehmer hatte(n) einen API-Fehler (${failed.map(f => `${f.email}: ${f.error.responseCode || f.error.message}`).join('; ')}) — deren Belegung ist NICHT enthalten.`
+        : 'Alle Teilnehmer ohne API-Fehler.');
+
+    return {
+      status: 'ok',
+      start: startLocal,
+      end: endLocal,
+      window: { startUtc: startUtcIso, endUtc: endUtcIso, timezone },
+      intervalMinutes: interval,
+      attendees: attendeeResults,
+      commonFreeSlots,
+      count: attendeeResults.length,
+      note,
+      diagnostics: {
+        totalBudgetMs: ATTENDEE_TOTAL_BUDGET_MS,
+        usedMs: Date.now() - budgetStart,
+        httpStatus,
+        tokenSource: cap.source || null,
+        tokenExpiresAt: this._scheduleTokenExpMs ? new Date(this._scheduleTokenExpMs).toISOString() : null,
+        userId: cap.userId || this._scheduleUserId || null,
+        attendeeCount: validAttendees.length,
+        invalidAttendees
+      }
+    };
   }
 
   // ===========================================================================
