@@ -7155,14 +7155,12 @@ export class OwaClient {
     });
   }
 
-  async acceptMeeting({ email_id, id, query, subject, folder, send_response = true } = {}) {
+  // Gemeinsame Lokalisierung einer Termineinladung (RSVP Accept/Decline):
+  // Suchbegriff -> OWA-Suche; convid/Zeilen-ID -> Ordner-Scan; sonst erste Zeile.
+  // Klickt die Einladung an und laedt den Lesebereich (Rueckgabe: Lesebereich-Handle).
+  async _locateMeetingInvite({ targetId, searchQuery, folder } = {}) {
     const page = await this.getPage(true);
-    const context = browserManager.getContext(this.realm);
 
-    const targetId = email_id || id;
-    const searchQuery = query || subject;
-
-    // 1. Einladung lokalisieren (Suchbegriff oder convid)
     if (searchQuery) {
       const url = this.realm
         ? `https://outlook.office.com/mail/inbox?realm=${encodeURIComponent(this.realm)}`
@@ -7236,6 +7234,17 @@ export class OwaClient {
     if (!readingPane) {
       throw new Error('Lesebereich der Einladung nicht geladen.');
     }
+
+    return { page, readingPane };
+  }
+
+  async acceptMeeting({ email_id, id, query, subject, folder, send_response = true } = {}) {
+    const targetId = email_id || id;
+    const searchQuery = query || subject;
+
+    // 1. Einladung lokalisieren + Lesebereich oeffnen (gemeinsamer RSVP-Helper)
+    const { page, readingPane } = await this._locateMeetingInvite({ targetId, searchQuery, folder });
+    const context = browserManager.getContext(this.realm);
 
     // 3. "Annehmen" (Accept) Button finden und klicken.
     // OWA zeigt bei Termineinladungen im Lesebereich eine Toolbar mit "Annehmen / Unter Vorbehalt / Absagen"
@@ -7410,6 +7419,229 @@ export class OwaClient {
         : accepted
           ? 'Termineinladung erfolgreich angenommen und aus dem Posteingang entfernt. Die Gegenseite wurde benachrichtigt, der Termin steht im Kalender.'
           : 'Termineinladung wurde angenommen. Bitte prüfe den Status in Outlook.'
+    };
+  }
+
+  async declineMeeting({ email_id, id, query, subject, folder, send_response = true, comment } = {}) {
+    const targetId = email_id || id;
+    const searchQuery = query || subject;
+    const hasComment = typeof comment === 'string' && comment.trim().length > 0;
+
+    // 1. Einladung lokalisieren + Lesebereich oeffnen (gemeinsamer RSVP-Helper)
+    const { page, readingPane } = await this._locateMeetingInvite({ targetId, searchQuery, folder });
+    const context = browserManager.getContext(this.realm);
+
+    // 3. "Absagen" (Decline) Button finden und klicken.
+    // OWA zeigt bei Termineinladungen im Lesebereich eine Toolbar mit "Annehmen / Unter Vorbehalt / Absagen"
+    // (deutsch) bzw. "Accept / Tentative / Decline" (englisch), oft als Dropdown unter "Jetzt antworten".
+    const findDecline = async () => {
+      // Präziser Selektor: OWA-Toolbar der Termineinladung nutzt aria-label "Decline the meeting" / "Absagen".
+      const direct = await page.$('button[aria-label="Decline the meeting"], button[aria-label*="Decline the meeting"], button[aria-label="Absagen"], button[aria-label*="Absagen"]').catch(() => null);
+      if (direct) return direct;
+      const buttons = await page.$$('button[aria-label], button[title], [role="button"][aria-label]');
+      for (const btn of buttons) {
+        const ariaLabel = ((await btn.getAttribute('aria-label')) || '').toLowerCase();
+        const title = ((await btn.getAttribute('title')) || '').toLowerCase();
+        const text = ((await btn.innerText().catch(() => '')) || '').toLowerCase();
+        const combined = `${ariaLabel} ${title} ${text}`;
+        // "Absagen/Decline" ist die Ziel-Aktion; kombinierte Gruppen-Labels (Accept/Decline,
+        // Tentative) sowie Annehmen-Varianten ausschließen.
+        if ((combined.includes('absagen') || combined.includes('decline')) &&
+            !combined.includes('annehmen') && !combined.includes('accept') &&
+            !combined.includes('tentative') && !combined.includes('unter vorbehalt') &&
+            !combined.includes('cancel') && !combined.includes('stornier')) {
+          return btn;
+        }
+      }
+      return null;
+    };
+
+    // 3a. Fallback: "Jetzt antworten" / "Respond" Dropdown öffnen und "Absagen" darin wählen
+    const openRespondDropdown = async () => {
+      const buttons = await page.$$('button[aria-label], button[title], [role="button"][aria-label]');
+      for (const btn of buttons) {
+        const ariaLabel = ((await btn.getAttribute('aria-label')) || '').toLowerCase();
+        const title = ((await btn.getAttribute('title')) || '').toLowerCase();
+        const text = ((await btn.innerText().catch(() => '')) || '').toLowerCase();
+        const combined = `${ariaLabel} ${title} ${text}`;
+        const isRespond =
+          combined.includes('antworten') || combined.includes('respond') ||
+          combined.includes('jetzt antworten') || combined.includes('rsvp');
+        const isNotReplyForm =
+          !combined.includes('weiterleiten') && !combined.includes('forward') &&
+          !combined.includes('allen antworten') && !combined.includes('reply all');
+        if (isRespond && isNotReplyForm) {
+          return btn;
+        }
+      }
+      return null;
+    };
+
+    let targetBtn = await findDecline();
+    if (!targetBtn) {
+      const respondBtn = await openRespondDropdown();
+      if (respondBtn) {
+        await respondBtn.click();
+        await page.waitForTimeout(700);
+        const menuItems = await page.$$('[role="menuitem"], [role="option"], [role="menuitemradio"]');
+        for (const item of menuItems) {
+          const text = ((await item.innerText().catch(() => '')) || '').toLowerCase();
+          const ariaLabel = ((await item.getAttribute('aria-label')) || '').toLowerCase();
+          const combined = `${text} ${ariaLabel}`;
+          const isDecline =
+            combined.includes('absagen') || combined.includes('decline') || combined.includes('ablehnen');
+          const isNotAccept =
+            !combined.includes('annehmen') && !combined.includes('accept') &&
+            !combined.includes('unter vorbehalt') && !combined.includes('tentative');
+          if (isDecline && isNotAccept) {
+            targetBtn = item;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!targetBtn) {
+      throw new Error('"Absagen"-Button für die Termineinladung in Outlook Web nicht gefunden.');
+    }
+
+    // 4. Decline klicken (aktiver Tab/Page berücksichtigen)
+    const initialPages = context ? context.pages() : [page];
+    await targetBtn.click();
+    let activePage = page;
+    if (context) {
+      const startWait = Date.now();
+      while (Date.now() - startWait < 5000) {
+        const currentPages = context.pages();
+        if (currentPages.length > initialPages.length) {
+          const newTab = currentPages.find(p => !initialPages.includes(p));
+          if (newTab) {
+            activePage = newTab;
+            await activePage.waitForLoadState('domcontentloaded').catch(() => null);
+            break;
+          }
+        }
+        const dialog = await activePage.$('[role="dialog"], [role="alertdialog"]').catch(() => null);
+        if (dialog) break;
+        await activePage.waitForTimeout(300);
+      }
+    }
+    this.lastPage = activePage;
+    await activePage.waitForTimeout(800);
+
+    // 5. Bestätigungsdialog (falls vorhanden) behandeln:
+    //    - mit Antworttext: "Antwort bearbeiten" -> Compose-Editor befüllen -> senden
+    //    - sonst send_response=true:  "Antwort senden" / "Send the response"
+    //    - sonst send_response=false: "Keine Antwort senden" / "Do not send a response"
+    if (hasComment) {
+      const editBtn = await activePage.$('button:has-text("Antwort bearbeiten"), button:has-text("Edit the response")').catch(() => null);
+      if (editBtn) {
+        await editBtn.click();
+        await activePage.waitForTimeout(1500);
+      }
+
+      // Compose-Editor der Ablehnungs-Antwort finden (echter contenteditable-Knoten)
+      const editor = await activePage.waitForSelector(
+        'div[role="textbox"][contenteditable="true"][aria-label*="Message body" i], ' +
+        'div[role="textbox"][contenteditable="true"][aria-label*="Nachrichtentext" i], ' +
+        '[contenteditable="true"][aria-label*="Message body" i], ' +
+        '[contenteditable="true"][aria-label*="Nachrichtentext" i]',
+        { timeout: 15000 }
+      ).catch(() => null);
+
+      if (!editor) {
+        throw new Error('Compose-Editor für den Ablehnungs-Kommentar konnte nicht gefunden werden.');
+      }
+      await editor.click();
+      await activePage.waitForTimeout(300);
+      await this._injectBodyText(activePage, editor, comment.trim());
+
+      // Antwort absenden: Senden-Button oder Strg+Enter
+      let sent = false;
+      const sendBtn = await activePage.$('button[aria-label="Senden"], button[aria-label="Send"], button:has-text("Senden"), button:has-text("Send")').catch(() => null);
+      if (sendBtn) { await sendBtn.click(); sent = true; }
+      if (!sent) {
+        await activePage.keyboard.press('Control+Enter');
+        sent = true;
+      }
+      await activePage.waitForTimeout(2000);
+    } else {
+      const confirmBtn = await activePage.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button[aria-label], button[title], button'));
+        for (const btn of btns) {
+          const t = (btn.innerText || '').toLowerCase();
+          const aria = ((btn.getAttribute('aria-label')) || '').toLowerCase();
+          const combined = `${t} ${aria}`;
+          const isSendResponse =
+            (combined.includes('antwort senden') || combined.includes('send the response')) &&
+            !combined.includes('keine antwort');
+          if (isSendResponse) return 'send';
+        }
+        for (const btn of btns) {
+          const t = (btn.innerText || '').toLowerCase();
+          if (t && (t.includes('antwort senden') || t.includes('send the response'))) return 'send';
+        }
+        return null;
+      });
+
+      if (confirmBtn === 'send') {
+        if (send_response) {
+          // Primär: per Text klicken, Fallback über alle Buttons
+          let clicked = false;
+          const btn = await activePage.$('button:has-text("Antwort senden"), button:has-text("Send the response")');
+          if (btn) { await btn.click(); clicked = true; }
+          if (!clicked) {
+            const buttons = await activePage.$$('button');
+            for (const b of buttons) {
+              const t = ((await b.innerText().catch(() => '')) || '').toLowerCase();
+              if (t.includes('antwort senden') || t.includes('send the response')) { await b.click(); clicked = true; break; }
+            }
+          }
+          await activePage.waitForTimeout(1500);
+        } else {
+          // Ohne Antwortübermittlung: "Keine Antwort senden" / "Do not send a response"
+          const noSend = await activePage.$('button:has-text("Keine Antwort senden"), button:has-text("Do not send a response")').catch(() => null);
+          if (noSend) { await noSend.click(); await activePage.waitForTimeout(1200); }
+        }
+      }
+    }
+
+    await activePage.waitForTimeout(1500);
+
+    // 6. Ergebnis prüfen: Status der Einladung
+    // Nach dem Decline verschwindet die Einladung i.d.R. aus dem Posteingang (Outlook-Flow).
+    // Daher gilt die Absage auch dann als erfolgreich, wenn die convid nicht mehr in der
+    // aktuell sichtbaren Nachrichtenliste erscheint.
+    const statusText = await readingPane.innerText().catch(() => '');
+    const statusDeclined = statusText.toLowerCase().includes('abgesagt') ||
+                           statusText.toLowerCase().includes('declined') ||
+                           statusText.toLowerCase().includes('you declined') ||
+                           statusText.toLowerCase().includes('nicht teil');
+
+    let disappearedFromList = false;
+    if (targetId) {
+      try {
+        const rows = await page.$$('div[data-convid]');
+        let stillPresent = false;
+        for (const r of rows) {
+          const cid = await r.getAttribute('data-convid');
+          if (cid === targetId) { stillPresent = true; break; }
+        }
+        disappearedFromList = !stillPresent;
+      } catch (e) { /* ignore */ }
+    }
+
+    const declined = statusDeclined || disappearedFromList;
+
+    return {
+      success: true,
+      declined: declined,
+      notification: declined ? undefined : 'Decline ausgeführt; Status konnte nicht eindeutig als "abgesagt" verifiziert werden.',
+      message: declined && statusDeclined
+        ? 'Termineinladung erfolgreich abgesagt. Die Gegenseite wurde benachrichtigt, der Termin wird nicht eingetragen.'
+        : declined
+          ? 'Termineinladung erfolgreich abgesagt und aus dem Posteingang entfernt. Die Gegenseite wurde benachrichtigt.'
+          : 'Termineinladung wurde abgesagt. Bitte prüfe den Status in Outlook.'
     };
   }
 

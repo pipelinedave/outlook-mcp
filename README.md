@@ -37,6 +37,7 @@ neue E-Mail-Entwürfe sicher anlegen.
   - `outlook_toggle_flag`: Toggelt bzw. entfernt das Flag (Kennzeichnung) einer E-Mail anhand ihrer Conversation-ID.
    - `outlook_archive_email`: Verschiebt eine E-Mail anhand ihrer Conversation-ID ins Archiv.
    - `outlook_accept_meeting`: Nimmt eine Termineinladung (Meeting Request) in Outlook Web an (RSVP "Annehmen"/Accept). Sendet die Annahme-Rückmeldung an die Gegenseite, trägt den Termin in den Firmenkalender ein und übernimmt den Outlook-typischen Archiv-Flow. Lokalisierung per Conversation-ID oder Suchbegriff.
+   - `outlook_decline_meeting`: Lehnt eine Termineinladung (Meeting Request) in Outlook Web ab (RSVP "Absagen"/Decline). Sendet die Absage-Rückmeldung an die Gegenseite (optional mit Kommentar), trägt den Termin NICHT ein. Lokalisierung per Conversation-ID oder Suchbegriff.
    - `outlook_close`: Beendet die Hintergrund-Browserinstanz.
 - **Firmenkalender-Tools** (für Blocker & Fokuszeiten im Outlook-Firmenkalender):
   - `outlook_create_calendar_event`: Legt einen Kalender-Eintrag (Standard `transparency: busy`) per OWA DeepLink an. Termin-Zeiten werden korrekt als Berlin-Lokalzeit interpretiert (keine UTC-Verschiebung).

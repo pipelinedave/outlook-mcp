@@ -386,6 +386,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: 'outlook_decline_meeting',
+        description: 'Lehnt eine Termineinladung (Meeting Request) in Outlook Web ab (RSVP "Absagen"/Decline). Sendet die Absage-Rückmeldung an die Gegenseite (optional mit Kommentar), trägt den Termin NICHT in den Kalender ein. Lokalisierung per conversation-ID (data-convid) oder Suchbegriff.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'conversation-ID (data-convid) der Einladung' },
+            email_id: { type: 'string', description: 'Alias für id.' },
+            query: { type: 'string', description: 'Optionaler Suchbegriff oder Betreff zum Finden der Einladung (z.B. "Feinkonzept").' },
+            subject: { type: 'string', description: 'Alias für query (Betreff der Einladung).' },
+            folder: { type: 'string', description: 'Optional: Ordner, in dem gesucht werden soll (Standard: inbox).' },
+            comment: { type: 'string', description: 'Optionaler Antworttext an den Organisator (wird über "Antwort bearbeiten" in die Absage eingefügt).' },
+            send_response: { type: 'boolean', description: 'True (Standard): Antwortsendung an die Gegenseite. False: ohne Antwortübermittlung ablehnen.', default: true },
+            realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
+          }
+        }
+      },
+      {
         name: 'outlook_create_calendar_event',
         description: 'Legt einen Eintrag (Fokuszeit-Blocker) im Outlook-FIRMENKALENDER an: Titel, Start/Ende, optionale Beschreibung. Firmenblöcke gehören laut Kalender-Architektur AUSSCHLIESSLICH hierher (nicht Google). Empfohlen vorher outlook_get_freebusy für den Kollisions-Check. Default transparency=busy.',
         inputSchema: {
@@ -698,6 +715,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           query: args?.query || args?.subject,
           subject: args?.subject,
           folder: args?.folder,
+          send_response: args?.send_response ?? true
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+
+      case 'outlook_decline_meeting': {
+        const res = await owaClient.declineMeeting({
+          email_id: args?.email_id || args?.id,
+          id: args?.id,
+          query: args?.query || args?.subject,
+          subject: args?.subject,
+          folder: args?.folder,
+          comment: args?.comment,
           send_response: args?.send_response ?? true
         });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
