@@ -465,6 +465,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des Events, z.B. "MKK Nachbereitung"' },
+            date: { type: 'string', description: 'OPTIONAL, aber EMPFOHLEN: beliebiges ISO-Datum in der Zielwoche des Events (z.B. "2026-11-19"). Ohne date wird nur die AKTUELLE Woche durchsucht — Events in anderen Wochen sind unsichtbar.' },
             realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           },
           required: ['query']
@@ -472,24 +473,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'outlook_delete_calendar_event',
-        description: 'Löscht einen Eintrag aus dem Outlook-FIRMENKALENDER anhand seines Titels/Suchbegriffs (bzw. einer ID). Verwendet die OWA-Kalender-Suche zum Auffinden und entfernt das Event. Nützlich, um versehentlich angelegte Blocker/Test-Einträge zu bereinigen.',
+        description: 'Löscht einen Eintrag aus dem Outlook-FIRMENKALENDER anhand seines Titels/Suchbegriffs (bzw. einer ID). Navigiert verifiziert zur Woche des Events (date-Param) und entfernt es per echtem Klick in der Wochenansicht. Nützlich, um versehentlich angelegte Blocker/Test-Einträge zu bereinigen. OHNE date wird nur die aktuelle Woche durchsucht.',
         inputSchema: {
           type: 'object',
           properties: {
             query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des zu löschenden Kalender-Events' },
             id: { type: 'string', description: 'Alternative: Kalender-Event-ID (falls bekannt)' },
+            date: { type: 'string', description: 'OPTIONAL, aber EMPFOHLEN: beliebiges ISO-Datum in der Zielwoche des Events (z.B. "2026-11-17"). Ohne date wird nur die AKTUELLE Woche durchsucht — Events in anderen Wochen sind unsichtbar.' },
             realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
         }
       },
       {
         name: 'outlook_update_calendar_event',
-        description: 'Aktualisiert einen bestehenden Eintrag im Outlook-FIRMENKALENDER (Titel/Zeit/Beschreibung) anhand seines Titels/Suchbegriffs. Nützlich, um Blocker nachzubearbeiten.',
+        description: 'Aktualisiert einen bestehenden Eintrag im Outlook-FIRMENKALENDER (Titel/Zeit/Beschreibung) anhand seines Titels/Suchbegriffs. Nützlich, um Blocker nachzubearbeiten. OHNE date wird nur die aktuelle Woche durchsucht.',
         inputSchema: {
           type: 'object',
           properties: {
             query: { type: 'string', description: 'Suchbegriff/Titel-Fragment des zu ändernden Kalender-Events' },
             id: { type: 'string', description: 'Alternative: Kalender-Event-ID (falls bekannt)' },
+            date: { type: 'string', description: 'OPTIONAL, aber EMPFOHLEN: beliebiges ISO-Datum in der Zielwoche des Events (z.B. "2026-11-19"). Ohne date wird nur die AKTUELLE Woche durchsucht — Events in anderen Wochen sind unsichtbar.' },
             subject: { type: 'string', description: 'Neuer Titel' },
             start: { type: 'string', description: 'Neuer Start (ISO)' },
             end: { type: 'string', description: 'Neues Ende (ISO)' },
@@ -790,12 +793,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'outlook_get_calendar_event': {
-        const res = await owaClient.getCalendarEvent({ query: args.query });
+        const res = await owaClient.getCalendarEvent({ query: args.query, date: args?.date });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 
       case 'outlook_delete_calendar_event': {
-        const res = await owaClient.deleteCalendarEvent({ query: args?.query, id: args?.id });
+        const res = await owaClient.deleteCalendarEvent({ query: args?.query, id: args?.id, date: args?.date });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 
@@ -803,6 +806,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const res = await owaClient.updateCalendarEvent({
           query: args?.query,
           id: args?.id,
+          date: args?.date,
           subject: args?.subject,
           start: args?.start,
           end: args?.end,

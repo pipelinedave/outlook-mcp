@@ -339,6 +339,19 @@ export function buildCalendarWeekUrl(realm, iso) {
   return `https://outlook.office.com/calendar/view/week?${realmParam}startdate=${iso}`;
 }
 
+// Liefert den Montag (OWA beginnt die Woche montags) der Woche, die das
+// ISO-Datum (z.B. "2026-11-19" oder "2026-11-19T14:00:00") enthält.
+// Rückgabe: ISO-String 'YYYY-MM-DD'. Ungültige Eingaben -> null.
+export function mondayOfIsoDate(input) {
+  const d = String(input || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  const dateObj = new Date(d + 'T00:00:00');
+  if (isNaN(dateObj.getTime())) return null;
+  const weekday = dateObj.getDay(); // 0 = Sonntag
+  const offsetToMonday = weekday === 0 ? -6 : 1 - weekday;
+  return toIsoDate(new Date(dateObj.getTime() + offsetToMonday * 86400000));
+}
+
 // Formatiert ein ISO-Datum (z.B. "2026-09-15T13:00:00" oder "2026-09-15T13:00:00+02:00")
 // zu einem OWA-kompatiblen startdt/enddt-Wert.
 //
@@ -6000,10 +6013,10 @@ export class OwaClient {
     const defaultYear = parseInt(rangeStartDate.slice(0, 4), 10);
 
     // Zielwoche: Montag der Woche, die das Startdatum enthaelt (OWA beginnt montags).
-    const startDateObj = new Date(rangeStartDate + 'T00:00:00');
-    const weekday = startDateObj.getDay(); // 0 = Sonntag
-    const offsetToMonday = weekday === 0 ? -6 : 1 - weekday;
-    const mondayIso = toIsoDate(new Date(startDateObj.getTime() + offsetToMonday * 86400000));
+    const mondayIso = mondayOfIsoDate(rangeStartDate);
+    if (!mondayIso) {
+      throw new Error(`Parameter "start" ist kein gültiges ISO-Datum: "${start}".`);
+    }
 
     const optimizedUrl = buildCalendarWeekUrl(this.realm, mondayIso);
     const provenUrl = this.realm
@@ -6305,27 +6318,148 @@ export class OwaClient {
   // Doppelklick zum Oeffnen des (lesenden) Detail-Panels ausgefuehrt.
   //
   // Rueckgabe: { status, query, titleMatched, detailText } oder wirft.
-  async getCalendarEvent({ query } = {}) {
+  async getCalendarEvent({ query, date = null } = {}) {
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
       throw new Error('Parameter "query" (Suchbegriff/Titel-Fragment) ist erforderlich.');
     }
-    const { page, titleMatched, detailText } = await this.openCalendarEventByQuery(query);
+    const { page, titleMatched, detailText } = await this.openCalendarEventByQuery(query, { date });
     return {
       status: 'ok',
       calendar: 'Firmenkalender (Outlook Web)',
       query,
+      date: date || null,
       titleMatched,
       detailText,
       note: 'READ-ONLY Detail-Ansicht aus dem OWA-Reading-Panel. Es wurde nichts geaendert.'
     };
   }
 
+  // Navigiert die OWA-Wochenansicht verifiziert zur Woche, die das Datum enthält.
+  // Wiederverwendung der verifizierten Navigations-Primitive aus listCalendarEvents:
+  //  1) Optimierter Deep-Link mit startdate-Parameter (wird von OWA NICHT zuverlässig
+  //     befolgt — nur Optimierungsversuch),
+  //  2) Fallback: plain week-URL,
+  //  3) Gerichtete Wochen-Button-Klicks mit Label-Verriegelung (max. 4), bis der
+  //     ANGEZEIGTE Header die Zielwoche bestätigt.
+  // Rückgabe: { mondayIso, rendered } oder wirft, wenn die Zielwoche nicht erreicht wurde.
+  async navigateCalendarToWeekContaining(page, dateIso) {
+    const mondayIso = mondayOfIsoDate(dateIso);
+    if (!mondayIso) {
+      throw new Error(`Parameter "date" muss ein ISO-Datum sein (erhalten: "${dateIso}").`);
+    }
+
+    const optimizedUrl = buildCalendarWeekUrl(this.realm, mondayIso);
+    const provenUrl = this.realm
+      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+      : 'https://outlook.office.com/calendar/view/week';
+
+    const deadline = Date.now() + 40000;
+    const remaining = () => deadline - Date.now();
+
+    const gotoCalendar = async (url) => {
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
+      } catch (e) { /* bewusst ignorieren — Fallback folgt */ }
+      const urlDeadline = Date.now() + 4000;
+      while (Date.now() < urlDeadline) {
+        if ((page.url() || '').includes('/calendar')) return true;
+        await page.waitForTimeout(500);
+      }
+      return (page.url() || '').includes('/calendar');
+    };
+
+    let onCalendar = await gotoCalendar(optimizedUrl);
+    if (!onCalendar) onCalendar = await gotoCalendar(provenUrl);
+    if (!onCalendar) {
+      throw new Error(`Kalender-Tab konnte nicht erreicht werden (URL: ${page.url() || 'unbekannt'}). ` +
+        'Möglicherweise ist die Session abgelaufen — bitte outlook_login erneut ausführen.');
+    }
+    await page.waitForTimeout(4000);
+
+    // Verifizierte gerichtete Navigation (max. 4 Button-Klicks). Gleiche Guard-Primitives
+    // wie listCalendarEvents (Label-Verriegelung gegen Verirren, Header-Verifikation).
+    const MAX_CLICKS = 4;
+    let lastClickDirection = null;
+    let weekConfirmedAfterClick = false;
+    let rendered = await readRenderedCalendarWeek(page);
+    let clicks = 0;
+    for (let step = 0; step < 30; step++) {
+      const view = weekViewState({ rendered, targetStart: mondayIso });
+      if (view.state === WEEK_VIEW_STATES.targetWeek) {
+        return { mondayIso, rendered, clicks };
+      }
+      if (remaining() <= 0 || clicks >= MAX_CLICKS) break;
+      const deltaWeeks = Math.round(
+        (new Date(mondayIso + 'T00:00:00') - new Date((rendered.startDate || '') + 'T00:00:00')) / (7 * 86400000)
+      );
+      if (!rendered.startDate || !isFinite(deltaWeeks) || deltaWeeks === 0) break;
+      const direction = Math.sign(deltaWeeks);
+      if (!canClickSameDirection({ lastClickDirection, direction, weekConfirmedAfterClick })) break;
+      const probe = [];
+      const r = await runWeekButtonClick({
+        direction,
+        prevStart: rendered.startDate,
+        targetStart: mondayIso,
+        page,
+        probe,
+        readWeek: () => readRenderedCalendarWeek(page),
+        // Pflicht-Callback nach echtem Klick: auf gerenderten Wochen-Header warten
+        // (sonst liest der naechste Schleifendurchlauf einen stale Header und der
+        // Klick-Zyklus verheddert sich — Regression 05.11.: "afterClick is not a
+        // function", gbrain #10041). Gleicher Vertrag wie waitRenderAfterClick in
+        // listCalendarEvents: { week, verified } mit evaluateClickVerification.
+        afterClick: async (prev, waitMs) => {
+          const waitDeadline = Date.now() + Math.max(500, Math.min(waitMs || FREEBUSY_CLICK_RENDER_WAIT_MS, Math.max(0, remaining())));
+          let week = { text: null, startDate: null, endDate: null };
+          while (Date.now() < waitDeadline) {
+            week = await readRenderedCalendarWeek(page);
+            if (week.startDate) break;
+            if (Date.now() + 500 > waitDeadline) break;
+            await page.waitForTimeout(500);
+          }
+          return { week, verified: evaluateClickVerification(prev, week) };
+        },
+        clickWaitMs: FREEBUSY_CLICK_RENDER_WAIT_MS,
+        clickCostMs: FREEBUSY_CLICK_RENDER_WAIT_MS,
+        remainingMs: remaining
+      });
+      // Gleiche Post-Klick-Semantik wie listCalendarEvents: Guards re-evaluieren,
+      // ehrlich abbrechen bei overshoot/unverified/wirkungslos. NUR bei einem
+      // verifizierten Fortschritt wird die Richtung als bestätigt gezählt — sonst
+      // blockiert der Same-Direction-Guard den zweiten Klick (Regression 05.11.,
+      // 1-Klick-Abbruch, gbrain #10042).
+      if (r.guard === WEEK_CLICK_GUARD_REASONS.viewNotReady || r.guard === WEEK_CLICK_GUARD_REASONS.labelHeaderConflict) {
+        rendered = r.week || rendered;
+        continue;
+      }
+      if (r.targetReached) { rendered = r.week || rendered; break; }
+      if (r.clicked && r.effect === 'overshoot') { throw new Error(`Wochen-Navigation überschossen die Zielwoche ${mondayIso} (gerendert: ${r.week && r.week.startDate}). Bitte 'date' prüfen oder manuell navigieren.`); }
+      if (r.clicked && r.effect === 'unverified') { break; }
+      if (!r.clicked) { break; }
+      clicks++;
+      rendered = r.week;
+      lastClickDirection = direction;
+      weekConfirmedAfterClick = Boolean(r.week && r.week.startDate);
+    }
+
+    rendered = await readRenderedCalendarWeek(page);
+    if (rendered.startDate === mondayIso) {
+      return { mondayIso, rendered, clicks };
+    }
+    throw new Error(`Zielwoche ${mondayIso} konnte nicht erreicht werden (angezeigt: ` +
+      `${rendered.startDate || 'unbekannt'} nach ${clicks} Klicks). Bitte 'date' prüfen oder manuell navigieren.`);
+  }
+
   // Lokalisiert ein Kalender-Event im OWA-Firmenkalender und öffnet dessen Detail-Panel.
   // Suchbegriff = Titel-Fragment. Geht über die Wochenansicht (für den Zieltext), da die
   // Kalender-Suche in OWA keine zuverlässigen klickbaren Ergebnisse liefert. Der Klick
   // wird als ECHTER Playwright-Klick ausgeführt (React braucht native Events).
+  //
+  // WICHTIG (Tool-Lücke 05.11.2026, gbrain #10040): Ohne 'date' wird nur die AKTUELLE
+  // Woche durchsucht — Events in anderen Wochen sind unsichtbar. Mit 'date' (ISO-Datum,
+  // beliebiges Datum in der Zielwoche) wird verifiziert zur Zielwoche navigiert.
   // Rückgabe: { page, titleMatched, detailText } oder wirft, wenn nichts gefunden.
-  async openCalendarEventByQuery(query, { timeout = 30000 } = {}) {
+  async openCalendarEventByQuery(query, { timeout = 30000, date = null } = {}) {
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
       throw new Error('Parameter "query" (Suchbegriff/Titel-Fragment) ist erforderlich.');
     }
@@ -6333,11 +6467,15 @@ export class OwaClient {
     this.lastPage = page;
     const ql = query.trim().toLowerCase();
 
-    const calUrl = this.realm
-      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
-      : 'https://outlook.office.com/calendar/view/week';
-    await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(6000);
+    if (date) {
+      await this.navigateCalendarToWeekContaining(page, date);
+    } else {
+      const calUrl = this.realm
+        ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+        : 'https://outlook.office.com/calendar/view/week';
+      await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(6000);
+    }
 
     // Event-Elemente über ihr ARIA-Label (Format "<Titel>, HH:MM to HH:MM, ...") finden.
     // Playwright locator mit case-insensitivem Substring auf den Titel.
@@ -6368,7 +6506,9 @@ export class OwaClient {
     }
 
     if (!clicked) {
-      throw new Error(`Kein Kalender-Event für Suchbegriff "${query}" gefunden (Wochenansicht).`);
+      throw new Error(`Kein Kalender-Event für Suchbegriff "${query}" in der ` +
+        (date ? `Woche um ${String(date).slice(0, 10)}` : 'AKTUELLEN Woche — liegt das Event in einer ANDEREN Woche, Parameter "date" (ISO-Datum in der Zielwoche) mitgeben') +
+        ' gefunden (Wochenansicht).');
     }
 
     // OWA öffnet nach Doppelklick ein Editor-/Reading-Panel (Dialog)
@@ -6382,7 +6522,7 @@ export class OwaClient {
     return { page, titleMatched: query, detailText };
   }
 
-  async deleteCalendarEvent({ query, id } = {}) {
+  async deleteCalendarEvent({ query, id, date = null } = {}) {
     const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
     this.lastPage = page;
     const targetQuery = id || query;
@@ -6390,7 +6530,7 @@ export class OwaClient {
       throw new Error('Parameter "query" oder "id" (Suchbegriff/Titel-Fragment) ist erforderlich.');
     }
 
-    await this.openCalendarEventByQuery(targetQuery);
+    await this.openCalendarEventByQuery(targetQuery, { date });
 
     // Nach dem Öffnen des Events das "Löschen"-/Entfernen-Element finden und klicken.
     // Alle DOM-Vorgänge laufen nach dem dblclick im Editor-Dialog ab. Der Löschen-Button
@@ -6469,23 +6609,29 @@ export class OwaClient {
       };
     }
 
-    // VERIFIKATION: Zurück zur Wochenansicht und prüfen, ob das Event wirklich weg ist.
-    // Nie blind success melden (Zero-Tolerance gegen falsche Erfolge).
-    const stillPresent = await this.eventStillInWeekView(targetQuery);
+    // VERIFIKATION: Zurück zur Zielwoche (nicht nur aktuelle Woche!) und prüfen,
+    // ob das Event wirklich weg ist. Nie blind success melden (Zero-Tolerance
+    // gegen falsche Erfolge). Ohne Verifikation -> success: false.
+    const stillPresent = await this.eventStillInWeekView(targetQuery, date);
     return {
       success: !stillPresent,
       query: targetQuery,
+      date: date || null,
       verified: !stillPresent,
       message: stillPresent
-        ? `WARNUNG: Löschen wurde ausgelöst, aber "${targetQuery}" ist STILL im Kalender vorhanden. Bitte manuell prüfen.`
+        ? `WARNUNG: Löschen wurde ausgelöst, aber "${targetQuery}" ist STILL im Kalender vorhanden (oder Zielwoche nicht verifizierbar). Bitte manuell prüfen.`
         : `Kalender-Event "${targetQuery}" wurde gelöscht (per Wochenansicht verifiziert).`
     };
   }
 
   // Prüft (aus der aktuellen OWA-Session heraus), ob ein Event mit Titel-Fragment in der
   // Wochenansicht noch vorhanden ist. Navigiert zur Wochenansicht und matcht ARIA-Labels.
-  // Rückgabe: true = noch vorhanden, false = weg/nicht gefunden.
-  async eventStillInWeekView(query) {
+  // Mit 'date' (ISO-Datum in der Zielwoche) wird verifiziert zur Zielwoche navigiert —
+  // sonst würde die Prüfung nur die AKTUELLE Woche sehen (Tool-Lücke 05.11.2026).
+  // Ehrlichkeits-Garantie: Kann die (Ziel-)Woche nicht erreicht/verifiziert werden,
+  // wird TRUE zurückgegeben ("noch vorhanden") — nie ein blindes "gelöscht" behaupten.
+  // Rückgabe: true = noch vorhanden/nicht verifizierbar, false = nachweislich weg.
+  async eventStillInWeekView(query, date = null) {
     let page = browserManager.getPage(this.realm);
     if (!page || page.isClosed()) {
       // Beim Aufbau eigenen Kontext holen
@@ -6495,25 +6641,44 @@ export class OwaClient {
     }
     const ql = query.trim().toLowerCase();
     const escaped = ql.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const calUrl = this.realm
-      ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
-      : 'https://outlook.office.com/calendar/view/week';
     try {
-      await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(5000);
-      const found = await page.evaluate((q) => {
+      if (date) {
+        await this.navigateCalendarToWeekContaining(page, date);
+      } else {
+        const calUrl = this.realm
+          ? `https://outlook.office.com/calendar/view/week?realm=${encodeURIComponent(this.realm)}`
+          : 'https://outlook.office.com/calendar/view/week';
+        await page.goto(calUrl, { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(5000);
+      }
+      // Re-Poll gegen Render-Lag (Regression 05.11., False-Negative): Direkt
+      // nach dem Löschen kann OWA das Event noch Sekunden in der Wochenansicht
+      // zeigen. Found wird erst als dauerhaft gewertet, wenn es über 2 Re-Polls
+      // stabil bleibt; verschwindet es, ist es nachweislich weg (false).
+      let found = await page.evaluate((q) => {
         const ql2 = q.toLowerCase();
         const els = Array.from(document.querySelectorAll('[role="button"][aria-label]'));
         return els.some(el => (el.getAttribute('aria-label') || '').toLowerCase().split(',')[0].includes(ql2));
       }, ql);
+      for (let i = 0; found && i < 2; i++) {
+        await page.waitForTimeout(2000);
+        found = await page.evaluate((q) => {
+          const ql2 = q.toLowerCase();
+          const els = Array.from(document.querySelectorAll('[role="button"][aria-label]'));
+          return els.some(el => (el.getAttribute('aria-label') || '').toLowerCase().split(',')[0].includes(ql2));
+        }, ql);
+      }
       return found;
     } catch (e) {
-      // Bei Navigations-/Session-Fehlern optimistisch melden, aber klar kennzeichnen
-      return false;
+      // Ehrlichkeits-Garantie (Zero-Tolerance): Kann die Woche nicht erreicht
+      // werden, ist NICHT verifizierbar, dass das Event weg ist -> "noch
+      // vorhanden" (true) melden, damit der Aufrufer keinen falschen
+      // Lösch-Erfolg behauptet.
+      return true;
     }
   }
 
-  async updateCalendarEvent({ query, id, subject, start, end, body, is_all_day, timezone = 'Europe/Berlin', transparency } = {}) {
+  async updateCalendarEvent({ query, id, subject, start, end, body, is_all_day, timezone = 'Europe/Berlin', transparency, date = null } = {}) {
     const page = await browserManager.ensureContext(true, this.realm).then(r => r.page);
     this.lastPage = page;
     const targetQuery = id || query;
@@ -6521,7 +6686,7 @@ export class OwaClient {
       throw new Error('Parameter "query" oder "id" (Suchbegriff/Titel-Fragment) ist erforderlich.');
     }
 
-    await this.openCalendarEventByQuery(targetQuery);
+    await this.openCalendarEventByQuery(targetQuery, { date });
 
     // öffnet ggf. ein Edit-Panel; bei freien Blocker-Events ist der Event-Viewer meist editierbar.
     // 1) Titel aktualisieren. Der Titel-Input in OWA hat KEIN aria-label, sondern
@@ -6561,7 +6726,7 @@ export class OwaClient {
     // VERIFIKATION: Neuer Titel in Wochenansicht prüfen (nur wenn Titel geändert wurde).
     let verified = null;
     if (subject && subject.trim().length > 0) {
-      const found = await this.eventStillInWeekView(subject);
+      const found = await this.eventStillInWeekView(subject, date);
       verified = found;
     }
 
