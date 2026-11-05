@@ -2049,6 +2049,43 @@ export function isHeaderReadVerified(rendered) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Runde 2 (Live-Befund 05.11.2026, Befund 3): Die aktuelle Woche hatte 8
+// Events (inhaltlich PASS), aber dataQuality unverified — die Navigation
+// akzeptierte einen nav-abgeleiteten Wochenstand und re-pollierte nie für
+// einen GELESENEN Header, obwohl der echte Header ("2–8 November, 2026,
+// Jump to a specific date or date range.") im DOM stand (Live-Diagnostik).
+// Der Re-Poll holt den echten Header-Read nach, sobald das Grid gerendert
+// hat — er PRAEVALIERT nichts: bleibt nur die Ableitung, wird ehrlich
+// 'unverified' gemeldet.
+// ---------------------------------------------------------------------------
+
+// Pollt readWeek bis eine Lesung einen GELESENEN angezeigten Header trägt
+// (isHeaderReadVerified) oder das Budget erschöpft ist. Rückgabe: die
+// verifizierte Lesung — oder null, wenn nur Ableitungen verfügbar blieben.
+// Dependency-Injection (readWeek/sleep/now) wie waitForWeekViewReady.
+export async function pollForDisplayedHeaderRead({
+  readWeek = null,
+  budgetMs = 0,
+  pollMs = 500,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  now = () => Date.now()
+} = {}) {
+  if (typeof readWeek !== 'function' || !(budgetMs > 0)) return null;
+  const deadline = now() + budgetMs;
+  let last = null;
+  while (now() < deadline) {
+    // Transiente Read-Fehler ("Execution context was destroyed" etc., Befund
+    // 15.10.) brechen den Re-Poll nicht ab — der naechste Poll liest neu.
+    last = (await readWeek().catch(() => null)) || last;
+    if (isHeaderReadVerified(last)) return last;
+    if (now() + pollMs > deadline) break;
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(pollMs);
+  }
+  return null;
+}
+
 // Sammelt reiche Diagnostik für Fehlerfälle und unverified-Responses (Kernforderung
 // Runde 3): URL, Header-Kandidaten, Tageskopf-Kandidaten, ARIA-Button-Anzahl und ein
 // Sample der ersten ARIA-Labels — so zeigt der nächste Live-Test sofort, was das DOM
@@ -5239,6 +5276,20 @@ export class OwaClient {
     // eine Schaetzung und traegt keine 'weekVerified' — in Lauf 5 stand
     // weekVerified:true bei View auf KW 39, weil der next-Button-Label die
     // Zielwoche nannte.
+    //
+    // Runde 2 (Befund 3, 05.11.2026): Vor dem Nachweis ein kurzer Re-Poll —
+    // die Navigation arbeitet mit Ableitungen, der Nachweis muss gelesen sein.
+    // Der echte Header steht im DOM, sobald das Grid gerendert hat (Live-
+    // Diagnostik 05.11.: Header vorhanden, weekVerified trotzdem false).
+    if (rendered.startDate && !isHeaderReadVerified(rendered) && remaining() > 2000) {
+      const upgraded = await pollForDisplayedHeaderRead({
+        readWeek: () => readRenderedCalendarWeek(page),
+        budgetMs: Math.min(5000, remaining() - 1500),
+        pollMs: 500,
+        sleep: (ms) => page.waitForTimeout(ms)
+      });
+      if (upgraded) rendered = upgraded;
+    }
     const weekVerified = isHeaderReadVerified(rendered);
     if (!weekVerified && rendered.readError) {
       // FIX 1: kein lesbarer angezeigter Header -> der Grund wird als
@@ -6027,6 +6078,23 @@ export class OwaClient {
       rendered = r.week;
       lastClickDirection = direction;
       weekConfirmedAfterClick = Boolean(r.week && r.week.startDate);
+    }
+
+    // Re-Poll auf einen GELESENEN Header (Runde 2, Befund 3): Die Navigation
+    // darf sich auf nav-abgeleitete Wochenstaende verlassen (Richtung/Klicks),
+    // der ABSCHLIESSENDE Nachweis muss aber ein gelesener Header sein. Sobald
+    // das Grid gerendert hat, steht der echte Header im DOM (Live-Befund:
+    // "2–8 November, 2026, Jump to..." war da, weekVerified war trotzdem
+    // false). Kurzer Re-Poll hebt 'unverified' auf 'verified' — ohne dass
+    // eine Ableitung je als Nachweis durchgeht.
+    if (rendered.startDate && !isHeaderReadVerified(rendered) && remaining() > 2000) {
+      const upgraded = await pollForDisplayedHeaderRead({
+        readWeek: () => readRenderedCalendarWeek(page),
+        budgetMs: Math.min(5000, remaining() - 1500),
+        pollMs: 500,
+        sleep: (ms) => page.waitForTimeout(ms)
+      });
+      if (upgraded) rendered = upgraded;
     }
 
     // GUARD 1: falsche Woche -> keine Daten statt falscher Daten.
