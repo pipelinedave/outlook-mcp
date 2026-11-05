@@ -9,6 +9,7 @@ import {
 import { browserManager } from './src/browser.js';
 import { owaClient } from './src/owa.js';
 import { config } from './src/config.js';
+import { withRealmLock } from './src/realm-lock.js';
 
 const server = new Server(
   {
@@ -507,6 +508,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
+  // Realm-Lock (Runde 2, Live-Befund 05.11.2026): Pro Realm läuft EIN Browser
+  // mit EINER Page, die sich alle Agenten/Sessions teilen. Ohne Serialisierung
+  // interleaven parallele Tool-Calls ihre mehrstufigen UI-Flows (Suche -> Klick
+  // -> Read, Navigation -> Header-Read) auf derselben Page — Folge waren
+  // Fremdmails bei get_email und transiente Kalender-Snapshots. Jeder Call ist
+  // jetzt ATOMAR je Realm; verschiedene Realms bleiben parallel.
+  // Der Lock-Key wird VOR dem Setzen gelesen: expliziter args.realm (bereits
+  // sanitär geprüft) oder der aktuelle Singleton-Realm — beides konsistente
+  // Zustände, da der sperrende Call setRealm + Ablauf zusammen umschließt.
+  const explicitRealm = (args && typeof args.realm === 'string' && args.realm.trim() &&
+    /^[a-zA-Z0-9.-]{3,}$/.test(args.realm.trim()))
+    ? args.realm.trim()
+    : null;
+  const realmKey = explicitRealm || owaClient.realm || config.defaultRealm;
+
+  return withRealmLock(realmKey, async () => {
   // Multi-Tenant (Problem 2): Jedes Tool kann optional einen 'realm' übergeben,
   // um gezielt zwischen d-velop.de und adesso.de zu wechseln. Ein globaler
   // owaClient-Singleton trägt den aktuellen Realm; setRealm() lässt den
@@ -815,6 +832,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [{ type: 'text', text }]
     };
   }
+  }); // withRealmLock — Realm-Call atomar (siehe Kommentar oben)
 });
 
 async function run() {
