@@ -101,7 +101,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'outlook_get_email',
-        description: 'Liest eine E-Mail im Lesebereich vollständig aus (Markdown, Teams-Links, Metadaten). Standardmäßig die oberste E-Mail (Index 0).',
+        description: 'Liest eine E-Mail im Lesebereich vollständig aus (Markdown, Teams-Links, Metadaten). Standardmäßig die oberste E-Mail (Index 0). Bei Konversations-IDs wird die NEUESTE Thread-Mail gerendert (die Mail, die die Suche/Liste in der Preview getroffen hat); die vollständige Konversations-Historie liegt als Metadatum "conversation.messages" bei (message_index wählt eine andere Nachricht, 0 = neueste).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -113,6 +113,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             id: {
               type: 'string',
               description: 'Optionale ID oder Conversation-ID der E-Mail'
+            },
+            message_index: {
+              type: 'number',
+              description: 'Optional: 0-basierter Index in der Konversations-Historie, neueste zuerst (0 = neueste Thread-Mail = Standard). Nur bei Konversationen wirksam.'
             },
             realm: { type: 'string', description: 'Optionaler Tenant/Realm (z.B. "adesso.de" oder "d-velop.de").' }
           }
@@ -603,7 +607,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'outlook_get_email': {
         const indexOrId = args?.id || (typeof args?.index === 'number' ? args.index : 0);
-        const email = await owaClient.getEmailDetails(indexOrId);
+        const messageIndex = typeof args?.message_index === 'number' ? args.message_index : null;
+        const email = await owaClient.getEmailDetails(indexOrId, { messageIndex });
         return {
           content: [{ type: 'text', text: JSON.stringify(email, null, 2) }]
         };

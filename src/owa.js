@@ -375,20 +375,22 @@ export function normalizeCalendarDate(input, timezone = 'Europe/Berlin') {
 // ---------------------------------------------------------------------------
 
 // Monatnamen DE/EN (lowercase) -> Monatsindex. Wird für das Parsen von
-// OWA-Kalender-Headern und Event-ARIA-Labels benötigt.
+// OWA-Kalender-Headern und Event-ARIA-Labels benötigt. Abkürzungen (z.B.
+// "Okt.", "Oct") ergänzt für die kompakten Nachrichten-Datums-Header der
+// Konversations-Ansicht ("Mon 19 Oct 2026 11:51", "Di 6. Okt. 2026 15:39").
 const MONTH_NAMES = {
-  januar: 0, january: 0,
-  februar: 1, february: 1,
-  märz: 2, maerz: 2, march: 2,
-  april: 3,
+  januar: 0, january: 0, jan: 0,
+  februar: 1, february: 1, feb: 1,
+  märz: 2, maerz: 2, march: 2, mrz: 2, mar: 2,
+  april: 3, apr: 3,
   mai: 4, may: 4,
-  juni: 5, june: 5,
-  juli: 6, july: 6,
-  august: 7,
-  september: 8,
-  oktober: 9, october: 9,
-  november: 10,
-  dezember: 11, december: 11
+  juni: 5, june: 5, jun: 5,
+  juli: 6, july: 6, jul: 6,
+  august: 7, aug: 7,
+  september: 8, sep: 8, sept: 8,
+  oktober: 9, october: 9, okt: 9, oct: 9,
+  november: 10, nov: 10,
+  dezember: 11, december: 11, dez: 11, dec: 11
 };
 
 // Date -> ISO-Datumsstring 'YYYY-MM-DD' (lokale Kalenderkomponenten).
@@ -3766,6 +3768,85 @@ export function formatUtcIsoInZone(iso, timeZone = 'Europe/Berlin') {
   }).format(new Date(ms));
 }
 
+// Parst einen Nachrichten-Datums-Header der Konversations-Ansicht in ein
+// Datum. Erkannte Formate (Live-Belege 05.11.2026, d-velop-Realm):
+//  - DE voll:  "Gesendet: Dienstag, 6. Oktober 2026 11:22"
+//  - EN voll:  "Sent: Tuesday, October 6, 2026 3:39 PM" / "Tuesday, 6 October 2026 11:22"
+//  - EN kompakt: "Mon 19 Oct 2026 11:51" / "Tue 6 Oct 2026 15:39"
+//  - DE kompakt: "Di 6. Okt. 2026 15:39"
+// Ruegabe: String 'YYYY-MM-DD HH:MM' oder null.
+export function parseConversationDateText(text, now = new Date()) {
+  if (!text) return null;
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  const currentYear = now.getFullYear();
+
+  // EN kompakt / DE kompakt: "(Tue) 6 (Oct|Okt.) 2026 15:39" — matcht auch
+  // die voll-formatierten Header ("Gesendet: Dienstag, 6. Oktober 2026 11:22"),
+  // Ergebnis identisch. Zuerst versuchen, sonst auf die EN-Monat-zuerst-Form
+  // ("October 6, 2026 3:39 PM") ausweichen.
+  const compact = t.match(/(\d{1,2})\.?\s+([A-Za-zäöüÄÖÜß]{3,})\.?\s+(\d{4})?\s+(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+  const fullEn = t.match(/([A-Za-zäöüÄÖÜß]{3,})\.?\s+(\d{1,2}),?\s+(\d{4})?\s+(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+
+  let day = null, month = null, year = null, hh = null, mm = null, pm = null;
+  if (compact && MONTH_NAMES[compact[2].toLowerCase()] !== undefined) {
+    day = parseInt(compact[1], 10); month = MONTH_NAMES[compact[2].toLowerCase()];
+    year = compact[3] ? parseInt(compact[3], 10) : null;
+    hh = parseInt(compact[4], 10); mm = parseInt(compact[5], 10); pm = compact[6] || null;
+  } else if (fullEn && MONTH_NAMES[fullEn[1].toLowerCase()] !== undefined) {
+    month = MONTH_NAMES[fullEn[1].toLowerCase()]; day = parseInt(fullEn[2], 10);
+    year = fullEn[3] ? parseInt(fullEn[3], 10) : null;
+    hh = parseInt(fullEn[4], 10); mm = parseInt(fullEn[5], 10); pm = fullEn[6] || null;
+  } else {
+    return null;
+  }
+  if (day === null || month === undefined || month === null) return null;
+  if (day < 1 || day > 31 || hh > 23 || mm > 59) return null;
+  if (pm && /pm/i.test(pm) && hh < 12) hh += 12;
+  if (pm && /am/i.test(pm) && hh === 12) hh = 0;
+  const y = year !== null ? year : currentYear;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${y}-${pad(month + 1)}-${pad(day)} ${pad(hh)}:${pad(mm)}`;
+}
+
+// Reine Auswahl-Funktion: welcher Karten-Index ist die Ziel-Nachricht?
+// Standard (Defekt A): die NEUESTE SENDENDE Nachricht (Drafts ausgeschlossen —
+// "[Draft] This message hasn't been sent" trug im Live-Befund spaete
+// Zeitstempel und haette sonst Vorrang bekommen). Ohne parsebares Datum:
+// die letzte Karte in DOM-Reihenfolge (der Karten-Stapel ist aufsteigend).
+export function selectConversationTargetIndex(cards) {
+  const list = Array.isArray(cards) ? cards : [];
+  if (list.length === 0) return -1;
+  let best = -1;
+  let bestTs = -Infinity;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].isDraft) continue;
+    const iso = list[i].dateIso || (list[i].dateText ? parseConversationDateText(list[i].dateText) : null);
+    const ts = iso ? new Date(iso.replace(' ', 'T')).getTime() : NaN;
+    if (!Number.isNaN(ts) && ts >= bestTs) { bestTs = ts; best = i; }
+  }
+  if (best === -1) {
+    // Kein sendendes Datum parsebar: letzte Karte (Stapel aufsteigend)
+    for (let i = list.length - 1; i >= 0; i--) { if (!list[i].isDraft) return i; }
+    return list.length - 1;
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// Konversations-Lesebereich (Defekt A, 05.11.2026): Der Lesebereich rendert
+// eine geoeffnete Konversation als Karten-Stapel — pro Thread-Mail EINE Karte
+// mit eigenem Datums-Header, aufsteigend (aelteste zuerst). Die Funktionen
+// hier finden den Karten-Stapel und liefern je Karte Metadaten (+ optional
+// HTML), damit der Renderer die NEUESTE (= gesuchte) Nachricht ausgeben kann.
+// Bewusst ohne obfuszierte Klassennamen: der Stapel wird ueber die Struktur
+// erkannt (Container mit >= 2 Kindern, die je einen Datums-Header tragen).
+// Top-level Funktion ohne Closures — wird von Playwright serialisiert
+// (page.evaluate) und ist damit identisch im Browser verfuegbar.
+// ---------------------------------------------------------------------------
+// Der Karten-Stapel-Finder selbst laeuft als INLINE-Callback in
+// OwaClient._renderReadingPane (page.evaluate duerfen laut Scope-Audit keine
+// Modul-Referenzen ueber die Serialisierungsgrenze nehmen). Die Auswahl-Logik
+// (welche Karte?) bleibt hier oben als reine, getestete Funktion.
 export class OwaClient {
   constructor(realm = config.defaultRealm) {
     this.realm = realm;
@@ -6316,14 +6397,200 @@ export class OwaClient {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // Konversations-Renderer (Defekt A, 05.11.2026): outlook_get_email hat bei
+  // Konversations-IDs die AELTESTE statt die getroffene (neueste) Thread-Mail
+  // gerendert. Root Cause: Der Klick auf die Konversationszeile oeffnet im
+  // Lesebereich die GESAMTE Konversation als Karten-Stapel (aelteste zuerst);
+  // der Code nahm die ganze Pane — Titel und Body stammten damit aus der
+  // ersten (aeltesten) Karte, die in der Suche getroffene neueste Mail fehlte
+  // effektiv (53 KB-History-Dump, neueste Karte weit hinten).
+  // ---------------------------------------------------------------------------
+
   // Oeffentlicher Read-Pfad mit Restart-Retry (P6): "Target page closed"/
   // "navigation destroyed" traten v.a. beim Lesebereichs-Read auf; der
   // Live-Workaround (close -> search -> get_email(index)) ist hier verallgemeinert.
-  async getEmailDetails(indexOrId = 0) {
-    return this._withReadRetry('outlook_get_email', () => this._getEmailDetailsInner(indexOrId));
+  async getEmailDetails(indexOrId = 0, { messageIndex = null } = {}) {
+    return this._withReadRetry('outlook_get_email', () => this._getEmailDetailsInner(indexOrId, { messageIndex }));
   }
 
-  async _getEmailDetailsInner(indexOrId = 0) {
+  // Rendert den Lesebereich NACH dem Klick auf die Zielzeile (Defekt A, 05.11.2026):
+  // Bei Konversationen liefert der Lesebereich einen Karten-Stapel (aelteste
+  // zuerst). Standardmaessig wird die NEUESTE sendende Karte gerendert (= die
+  // Mail, die die Suche/Liste in der Preview getroffen hat); messageIndex
+  // (0-basiert, neueste zuerst) wählt eine andere Karte aus der History.
+  // Einzelmails ohne Karten-Stapel fallen auf das alte Ganz-Pane-Rendering
+  // zurueck. Rueckgabe ist abwaertskompatibel (title/teamsMeetings/
+  // contentMarkdown) plus optionale Konversations-Metadaten.
+  async _renderReadingPane(page, { messageIndex = null } = {}) {
+    const paneSel = 'div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView';
+    const readingPane = await page.waitForSelector(paneSel, { timeout: 10000 });
+    if (!readingPane) {
+      throw new Error("Lesebereich nach Klick auf E-Mail nicht geladen.");
+    }
+
+    const title = await readingPane.$eval('h1, h2, [role="heading"]', el => el.innerText).catch(() => '');
+    const teamsLinks = await readingPane.$$eval('a[href*="teams.microsoft.com"]', links => Array.from(new Set(links.map(a => a.href)))).catch(() => []);
+
+    // Karten-Stapel-Erkennung mit kurzem Retry: direkt nach dem Klick kann der
+    // Lesebereich die Karten-Historie noch nachschieben (Klick-Wait ist 2s).
+    // INLINE-Callbacks (Scope-Audit): kein Modul-Scope-Identifier darf ueber
+    // die Serialisierungsgrenze referenziert werden.
+    let meta = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      meta = await page.evaluate(() => {
+        const pane = document.querySelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView');
+        if (!pane) return { found: false, reason: 'no-reading-pane' };
+        // Datums-Header-Signatur (nur Erkennung, exaktes Parsen Node-seitig):
+        // "Gesendet: ..." | "Sent: ..." | "Mon 19 Oct 2026 11:51" | "Di 6. Okt. 2026 15:39"
+        const dateish = (s) => /(?:Gesendet:|Sent:)|(?:\b(?:Mon|Mo|Di|Tue|Tues|Mi|Wed|Do|Thu|Thurs|Fr|Fri|Sa|Sat|So|Sun)\b[^\n]{0,40}\d{1,2}:\d{2})|(?:\d{1,2}\.\s*[A-Za-zäöüß]{3,}\.?\s+\d{0,4}\s*\d{1,2}:\d{2})/i.test(s || '');
+        // Karten-Stapel finden. QUORUM-Regel (Härtung nach Fehltreffer
+        // 05.11.2026): der Stapel-Container hat >= 2 Kinder und der GROSSTEIL
+        // davon (> 40%) traegt einen Datums-Header — ein Body-/Paragraph-
+        // Wrapper mit hunderten Kinder-DIVs, in deren QUOTED-Text vereinzelt
+        // "Gesendet:"-Zeilen stecken, wird abgelehnt (5/200 = 2.5% vs. Stapel
+        // 12/13 = 92%). Gleichstand -> tieferer Container (querySelectorAll
+        // liefert Dokumentordnung: Vorfahr vor Nachfahre, Nachziehen).
+        let best = null;
+        for (const c of pane.querySelectorAll('div')) {
+          const kids = c.children;
+          if (!kids || kids.length < 2) continue;
+          let withDate = 0;
+          for (const k of kids) { if (dateish(k.textContent)) withDate++; }
+          if (withDate >= 2 && withDate / kids.length >= 0.4 &&
+            (!best || withDate > best.withDate || (withDate === best.withDate && best.el.contains(c)))) {
+            best = { el: c, withDate };
+          }
+        }
+        if (!best) return { found: false, reason: 'no-conversation-stack' };
+        // Container-Pfad (Kind-Indizes von pane abwaerts) fuer den zweiten
+        // Read — der braucht dann NICHT neu zu detektieren.
+        const containerPath = [];
+        let n = best.el;
+        while (n && n !== pane) {
+          const p = n.parentElement;
+          if (!p) return { found: false, reason: 'no-path' };
+          containerPath.unshift(Array.prototype.indexOf.call(p.children, n));
+          n = p;
+        }
+        if (n !== pane || containerPath.length === 0) return { found: false, reason: 'no-path' };
+        const cards = [];
+        const kids = Array.from(best.el.children);
+        for (let i = 0; i < kids.length; i++) {
+          const k = kids[i];
+          const rawText = k.innerText || '';
+          const text = rawText.replace(/\s+/g, ' ').trim();
+          if (!text) continue;
+          let dateText = null;
+          let isDraft = false;
+          let from = null;
+          const rawLines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
+          for (const l of rawLines) {
+            if (!dateText && (/^(Gesendet|Sent):/i.test(l) || (/^(Mon|Mo|Di|Tue|Tues|Mi|Wed|Do|Thu|Thurs|Fr|Fri|Sa|Sat|So|Sun)\b/.test(l) && /\d{1,2}:\d{2}/.test(l) && /\d{4}|\d{1,2}\.\s*[A-Za-zäöüß]{3,}/.test(l)) || (/^\d{1,2}\.\s*[A-Za-zäöüß]{3,}\.?\s+\d{4}\s+\d{1,2}:\d{2}/.test(l)) || /^Saved:/i.test(l))) {
+              dateText = l.slice(0, 80);
+            }
+            if (!isDraft && l.length < 120 && /(\[Draft\])|(hasn.{0,1}t been sent)|(wurde nicht gesendet)|(nicht gesendet)/i.test(l)) isDraft = true;
+            if (!from && /^(Von|From):/i.test(l)) from = l.slice(0, 140);
+          }
+          cards.push({
+            domIndex: i,
+            dateText,
+            isDraft,
+            from,
+            preview: text.slice(0, 220),
+            textLength: text.length
+          });
+        }
+        return { found: true, cardCount: cards.length, containerPath, cards };
+      }).catch(() => null);
+      if (meta && meta.found) break;
+      if (attempt < 2) await page.waitForTimeout(1200);
+    }
+
+    // Karten-Stapel mit >= 2 Karten -> Konversation: Zielkarte auswaehlen.
+    if (meta && meta.found && meta.cards && meta.cards.length >= 2) {
+      const cards = meta.cards.map((c) => ({
+        ...c,
+        dateIso: c.dateText ? parseConversationDateText(c.dateText) : null
+      }));
+      // Reihenfolge neueste-zuerst (ohne Datum hinten, DOM-Reihenfolge stabil).
+      const order = cards
+        .map((c, i) => ({ c, i }))
+        .sort((a, b) => {
+          const ta = a.c.dateIso ? new Date(a.c.dateIso.replace(' ', 'T')).getTime() : -Infinity;
+          const tb = b.c.dateIso ? new Date(b.c.dateIso.replace(' ', 'T')).getTime() : -Infinity;
+          return tb - ta || a.i - b.i;
+        });
+      const wanted = (typeof messageIndex === 'number' && messageIndex >= 0 && messageIndex < order.length)
+        ? order[messageIndex]
+        : null;
+      const targetEntry = wanted || (() => {
+        // Defekt A: Standard = neueste SENDENDE Nachricht (kein Draft).
+        const idx = selectConversationTargetIndex(cards);
+        return idx >= 0 ? { c: cards[idx], i: idx } : order[0];
+      })();
+      const domIndex = targetEntry.c.domIndex;
+
+      // Zweiter Read: Zielkarten-HTML ueber den gespeicherten Container-Pfad
+      // holen (kein erneutes Detektieren, minimaler Inline-Callback).
+      const sel = await page.evaluate(({ containerPath, domIndex }) => {
+        const pane = document.querySelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView');
+        if (!pane) return { found: false, reason: 'no-reading-pane' };
+        let n = pane;
+        for (const idx of containerPath) {
+          n = n.children[idx];
+          if (!n) return { found: false, reason: 'path-lost' };
+        }
+        const k = n.children[domIndex];
+        if (!k) return { found: false, reason: 'card-lost' };
+        return {
+          found: true,
+          signature: ((k.innerText || '') || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+          html: k.innerHTML || ''
+        };
+      }, { containerPath: meta.containerPath, domIndex }).catch(() => null);
+      if (sel && sel.found && sel.html) {
+        // Konsistenz-Guard: der zweite Read muss dieselbe Karte treffen (DOM
+        // kann sich zwischen den Reads re-rendern). Bei Abweichung ehrlich auf
+        // den Ganz-Pane-Fallback fallen.
+        const expected = (targetEntry.c.preview || '').slice(0, 60);
+        if (expected && sel.signature === expected) {
+          return {
+            title,
+            teamsMeetings: teamsLinks,
+            contentMarkdown: turndown.turndown(sel.html),
+            messageDate: targetEntry.c.dateIso,
+            renderStrategy: typeof messageIndex === 'number' ? 'conversation-index' : 'conversation-newest',
+            conversation: {
+              count: cards.length,
+              selectedDomIndex: domIndex,
+              selectedMessageIndex: typeof messageIndex === 'number' ? messageIndex : null,
+              messages: order.map((o, k) => ({
+                messageIndex: k,
+                domIndex: o.c.domIndex,
+                dateIso: o.c.dateIso,
+                dateText: o.c.dateText,
+                from: o.c.from,
+                isDraft: o.c.isDraft,
+                preview: o.c.preview
+              }))
+            }
+          };
+        }
+      }
+    }
+
+    // Fallback: Ganz-Pane-Rendering (Einzelmails, Drafts-Ansicht, Struktur-Nichterkennung)
+    const rawHtml = await readingPane.innerHTML();
+    return {
+      title,
+      teamsMeetings: teamsLinks,
+      contentMarkdown: turndown.turndown(rawHtml),
+      renderStrategy: 'full-pane'
+    };
+  }
+
+  async _getEmailDetailsInner(indexOrId = 0, { messageIndex = null } = {}) {
     const page = await this.getPage(true);
 
     await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 15000 });
@@ -6350,22 +6617,7 @@ export class OwaClient {
     await targetRow.click();
     await page.waitForTimeout(2000);
 
-    const readingPane = await page.waitForSelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView', { timeout: 10000 });
-    if (!readingPane) {
-      throw new Error("Lesebereich nach Klick auf E-Mail nicht geladen.");
-    }
-
-    const rawHtml = await readingPane.innerHTML();
-    const markdown = turndown.turndown(rawHtml);
-    const title = await readingPane.$eval('h1, h2, [role="heading"]', el => el.innerText).catch(() => '');
-
-    const teamsLinks = await readingPane.$$eval('a[href*="teams.microsoft.com"]', links => Array.from(new Set(links.map(a => a.href)))).catch(() => []);
-
-    return {
-      title: title,
-      teamsMeetings: teamsLinks,
-      contentMarkdown: markdown
-    };
+    return this._renderReadingPane(page, { messageIndex });
   }
 
   async listRecent(limit = 10) {
@@ -6488,11 +6740,10 @@ export class OwaClient {
     const deadline = Date.now() + timeoutMs;
 
     const readPane = async () => {
-      const readingPane = await page.waitForSelector('div[role="main"], div[aria-label="Reading Pane"], div[aria-label="Lesebereich"], div.ItemPartView', { timeout: 12000 });
-      const rawHtml = await readingPane.innerHTML();
-      const markdown = turndown.turndown(rawHtml);
-      const title = await readingPane.$eval('h1, h2, [role="heading"]', el => el.innerText).catch(() => '');
-      return { title, contentMarkdown: markdown };
+      // Defekt A (05.11.2026): auch dieser Pfad renderte bei Konversationen die
+      // gesamte Karten-Historie (aelteste zuerst). Derselbe Renderer wie
+      // outlook_get_email: Standard = neueste sendende Karte der Konversation.
+      return this._renderReadingPane(page);
     };
 
     // Playwright-Locator auf die conversation-ID: deutlich weniger CDP-Round-Trips als
