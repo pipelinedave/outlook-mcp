@@ -252,6 +252,21 @@ npm run check       # Überprüft JS-Syntax aller Dateien
 npm test            # Führt Unit-Tests via node:test aus
 ```
 
+### Determinismus-Garantien (Runde 2, Live-Befunde 05.11.2026)
+
+- **`outlook_get_email` mit ID/Conversation-ID rendert NIE eine andere Mail:** Ist die ID
+  in der aktuell gerenderten Liste nicht enthalten, läuft eine begrenzte Scroll-Enumeration;
+  danach ein ehrlicher Fehler mit Recovery-Hinweis (`outlook_search`) — niemals ein
+  `rows[0]`-Fallback (Live-Befund: 3 identische Calls, 3 verschiedene Fremdmails).
+- **Realm-Lock:** Pro Tenant-Realm läuft ein Tool-Call atomar (Promise-Kette in
+  `src/realm-lock.js`); parallele Agenten/Sessions auf dem geteilten Daemon-Browser
+  interleaven nicht mehr in fremde UI-Flows. Verschiedene Realms bleiben parallel.
+- **Kalender-Verifikation:** Monats-/Datum-Picker-Labels (`"November 2026, select to
+  change the month"` → Phantom-Woche aus „November 20(26)") sind nie eine Wochen-/Datums-
+  Quelle; vor dem Wochen-Nachweis re-pollt der Flow auf einen GELESENEN Header — eine
+  korrekt gerenderte Woche liefert daher `verified` bzw. `verified-empty`, nie
+  `unverified` bei korrekter Navigation.
+
 ---
 
 ## Lizenz
