@@ -6748,30 +6748,76 @@ export class OwaClient {
     const page = await this.getPage(true);
 
     await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 15000 });
+
+    // ID-Pfad (Runde 2, Live-Befund 05.11.2026): Auf 3 IDENTISCHE get_email-Calls
+    // mit derselben Conversation-ID wurde jedes Mal eine ANDERE, fremde Mail
+    // gerendert. Root Cause: War die ID in der gerade offenen Liste nicht
+    // enthalten (geteilter Daemon-Browser in fremdem Zustand — alte Suchliste,
+    // Inbox, Kalender-Tab), klickte der Code stillschweigend rows[0]. Ein
+    // identischer Call darf NIE ein anderes Ergebnis liefern — deshalb jetzt:
+    //   1) gerenderte Zeilen scannen, 2) begrenzte Scroll-Enumeration,
+    //   3) ehrlicher Fehler. NIEMALS eine andere Zeile klicken.
+    if (typeof indexOrId === 'string' && indexOrId.length > 0) {
+      const clicked = await this._findAndClickRowById(page, indexOrId, { timeoutMs: 20000 });
+      if (!clicked) {
+        throw new Error(
+          `Conversation-ID "${indexOrId}" ist in der aktuell gerenderten Liste nicht vorhanden ` +
+          `(auch nicht nach Scroll-Enumeration). Es wurde bewusst KEINE andere E-Mail gerendert ` +
+          `(kein rows[0]-Fallback). Bitte zuerst outlook_search mit passendem Suchbegriff ausfuehren ` +
+          `und die ID aus dem Suchergebnis uebernehmen.`
+        );
+      }
+      await page.waitForTimeout(2000);
+      return this._renderReadingPane(page, { messageIndex });
+    }
+
     const rows = await page.$$('div[data-convid], div[role="option"]');
 
     if (rows.length === 0) {
       throw new Error("Keine E-Mails in der Liste gefunden.");
     }
 
-    let targetRow = rows[0];
-    if (typeof indexOrId === 'number' && indexOrId < rows.length) {
-      targetRow = rows[indexOrId];
-    } else if (typeof indexOrId === 'string' && indexOrId.length > 0) {
-      for (const r of rows) {
-        const convid = await r.getAttribute('data-convid');
-        const id = await r.getAttribute('id');
-        if (convid === indexOrId || id === indexOrId) {
-          targetRow = r;
-          break;
-        }
-      }
+    // Index-Pfad: Out-of-Range ist ein ehrlicher Fehler, kein stiller rows[0].
+    if (typeof indexOrId === 'number' && (indexOrId < 0 || indexOrId >= rows.length)) {
+      throw new Error(`Index ${indexOrId} liegt ausserhalb der aktuellen Liste (${rows.length} Zeilen). Es wurde bewusst keine E-Mail gerendert.`);
     }
 
-    await targetRow.click();
+    await rows[indexOrId].click();
     await page.waitForTimeout(2000);
 
     return this._renderReadingPane(page, { messageIndex });
+  }
+
+  // Findet eine Listen-Zeile per Conversation-ID (data-convid) ODER Element-ID
+  // und klickt NUR die exakt treffende Zeile. Bei Nichttreffer in den aktuell
+  // gerenderten Zeilen: begrenzte Scroll-Enumeration (virtualisierte Liste).
+  // Rueckgabe: true wenn geklickt wurde, false wenn die ID nicht gefunden wurde.
+  async _findAndClickRowById(page, id, { timeoutMs = 20000 } = {}) {
+    const esc = String(id).replace(/["\\]/g, '\\$&');
+    // Denselbe Attributvertrag wie der fruehere Zeilen-Scan: data-convid ODER id.
+    const rowLocator = page.locator(`div[data-convid="${esc}"], div[data-convid][id="${esc}"]`).first();
+    const deadline = Date.now() + timeoutMs;
+    for (let i = 0; i < 500; i++) {
+      if (Date.now() > deadline) return false;
+      const count = await rowLocator.count().catch(() => 0);
+      if (count > 0) {
+        await rowLocator.click();
+        return true;
+      }
+      // Virtualisierte Liste: einen Viewport weiterscrollen und neu pruefen.
+      await page.evaluate(() => {
+        const lists = document.querySelectorAll('[aria-label="Message list"] [role="listbox"], [aria-label="Message list"]');
+        let el = null;
+        for (const list of lists) { el = list; break; }
+        for (let k = 0; k < 8 && el; k++) {
+          const s = getComputedStyle(el);
+          if ((s.overflowY === 'scroll' || s.overflowY === 'auto') && el.scrollHeight > el.clientHeight) { el.scrollTop += 4000; return; }
+          el = el.parentElement;
+        }
+      }).catch(() => {});
+      await page.waitForTimeout(400);
+    }
+    return false;
   }
 
   async listRecent(limit = 10) {
