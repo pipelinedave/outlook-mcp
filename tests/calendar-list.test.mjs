@@ -104,9 +104,20 @@ const weekLabel = (mondayIso) => {
   return `${a.getDate()} ${MONTH_EN[a.getMonth()]} – ${b.getDate()} ${MONTH_EN[b.getMonth()]}, ${a.getFullYear()}`;
 };
 
-const buildCalendar = ({ displayedMonday, events = [], eventsByWeek = null }) => {
-  const state = { monday: displayedMonday, clicks: [] };
-  const labelsFor = () => (typeof eventsByWeek === 'function' ? eventsByWeek(state.monday) : events);
+const buildCalendar = ({ displayedMonday, events = [], eventsByWeek = null, hydrateTo = null }) => {
+  // hydrateTo (Runde 3): { afterMs, labels } — bis afterMs werden `events`
+  // geliefert, danach `labels`. Simuliert OWA-Lazy-Hydration: Header sofort
+  // da, Event-Grid faellt gestaffelt ein. Die Uhr ist VIRTUELL: das Fake-
+  // page.waitForTimeout dreht state.fakeMs weiter (reale Wanduhr bleibt in
+  // Tests bei ~0 — daher nicht Date.now()).
+  const state = { monday: displayedMonday, clicks: [], fakeMs: 0, startFakeMs: null };
+  const labelsFor = () => {
+    if (hydrateTo && Array.isArray(hydrateTo.labels)) {
+      if (state.startFakeMs === null) state.startFakeMs = state.fakeMs;
+      return (state.fakeMs - state.startFakeMs) >= hydrateTo.afterMs ? hydrateTo.labels : events;
+    }
+    return typeof eventsByWeek === 'function' ? eventsByWeek(state.monday) : events;
+  };
   const nodes = () => {
     const banner = mkNode({ tag: 'DIV', attrs: { role: 'banner' } });
     const list = [banner];
@@ -132,7 +143,7 @@ const buildCalendar = ({ displayedMonday, events = [], eventsByWeek = null }) =>
     url: () => currentUrl,
     async goto(url) { currentUrl = url; return true; },
     async reload() { return true; },
-    async waitForTimeout() {},
+    async waitForTimeout(ms) { state.fakeMs += Number(ms) || 0; },
     async evaluate(fn, arg) { globalThis.document = doc(); return fn(arg); },
     locator(selector) {
       return {
@@ -156,6 +167,7 @@ const buildCalendar = ({ displayedMonday, events = [], eventsByWeek = null }) =>
   };
   return { page, state, doc };
 };
+export { buildCalendar };
 
 const realEnsure = browserManager.ensureContext.bind(browserManager);
 let activeCalendar = null;

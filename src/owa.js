@@ -2186,6 +2186,22 @@ export const FREEBUSY_EVENT_WAIT_POLL_MS = 500;
 // die stale Vorabmeldung verdeckt hat.
 export const FREEBUSY_EVENT_WAIT_SETTLE_MS = 1000;
 
+// Runde 3 (05.11.2026, Live-Befund KW47 "4 von 7 Events, Header verified"):
+// Nach bestätigter Wochen-Verifikation rendert OWA das Event-Grid LAZY weiter
+// (Header sofort, Event-Knoten gestaffelt). waitForWeekViewReady hat sein
+// Ruhe-Fenster nur im notReady-Pfad — bei direkter URL-Navigation auf die
+// Zielwoche kehrt es sofort mit targetWeek zurueck, OHNE dass das Event-Set
+// vollstaendig hydratisiert ist. Der finale Collect kann dadurch ein
+// TEIL-Event-Set lesen (Befund: 4 von 7). Der Settlement-Wartepunkt verlangt,
+// dass die Event-Signatur ueber STABLE_ROUNDS aufeinanderfolgende Polls
+// identisch bleibt, bevor gelesen wird.
+// Poll-Intervall der Event-Settlement-Phase.
+export const EVENT_SET_STABLE_POLL_MS = 500;
+// Anzahl aufeinanderfolgender identischer Signaturen bis "stabil".
+export const EVENT_SET_STABLE_ROUNDS = 2;
+// Obergrenze der Settlement-Phase (PHASE des Gesamtbudgets, kein Extra).
+export const EVENT_SET_STABLE_BUDGET_MS = 6000;
+
 // BUG 5 (Live-Befund 26.09.2026, Lauf 4): Budget fuer das WARTEN auf einen
 // datierbaren Wochen-Header (Zustand 1). Live war die Verweigerung des
 // Wochen-Klicks korrekt, kam aber nach 13ms — es wurde auf eine Ansicht
@@ -2948,6 +2964,79 @@ export async function waitForWeekViewReady({
     await doSleep(pollMs);
   }
   return { state: WEEK_VIEW_STATES.notReady, rendered: last, polls, loadingPolls, waitedMs: waited(), exhausted: true };
+}
+
+// ---------------------------------------------------------------------------
+// Event-Settlement (Runde 3, 05.11.2026 — Live-Befund KW47)
+// ---------------------------------------------------------------------------
+// Wartet darauf, dass das EVENT-SET stabil ist, bevor der finale Read läuft.
+// Anders als waitForWeekViewReady (Header/Ladezustand) prüft diese Funktion
+// die SIGNATUR des Event-Sets: Sortierte Label-Liste + Knotenzahl. Sie gilt
+// erst als stabil, wenn sie ueber `stableRounds` aufeinanderfolgende Polls
+// identisch bleibt. Ein Lade-Indikator (Spinner) setzt das Fenster zurueck —
+// "lädt noch" ist kein Leer-Beweis (gleiche Disziplin wie oben).
+//
+// Diese Funktion ist der Produktionspfad von listCalendarEvents; sie ist
+// exportiert und per Dependency-Injection testbar, weil der Defekt
+// ("Header verified, Event-Set partiell") nur durch einen Test auf genau
+// diesem Pfad belegt werden kann — nicht durch einen nachgebauten.
+//
+// Rueckgabe: { stable, polls, stableRounds, waitedMs, exhausted, skipped,
+//              signature, labelsCount, eventElementsFound }
+//   stable === false && exhausted === true -> Budget aufgebraucht, Aufrufer
+//   liest trotzdem (graceful) und kennzeichnet das Ergebnis als unsicher.
+export async function waitForEventSetStable({
+  readEvents = null,
+  budgetMs = 0,
+  pollMs = EVENT_SET_STABLE_POLL_MS,
+  stableRounds = EVENT_SET_STABLE_ROUNDS,
+  sleep = null,
+  now = () => Date.now()
+} = {}) {
+  const doSleep = typeof sleep === 'function' ? sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  const startedAt = now();
+  const waited = () => now() - startedAt;
+  if (typeof readEvents !== 'function' || !(budgetMs > 0)) {
+    return { stable: false, skipped: true, polls: 0, stableRounds: 0, waitedMs: 0, exhausted: true, signature: null, labelsCount: 0, eventElementsFound: 0 };
+  }
+  let polls = 0;
+  let stableCount = 0;
+  let lastSignature = null;
+  let lastLabels = [];
+  let lastFound = 0;
+  while (waited() < budgetMs) {
+    polls++;
+    // eslint-disable-next-line no-await-in-loop
+    const res = (await readEvents()) || {};
+    const labels = Array.isArray(res.labels) ? res.labels : [];
+    const found = Number(res.eventElementsFound) || 0;
+    // Signatur ist ordnungsunempfindlich (OWA darf DOM-Knoten umhaengen),
+    // aber empfindlich gegen Menge und Inhalt.
+    const signature = `${labels.length}|${found}|${labels.slice().sort().join('\u0001')}`;
+    if (res.loading === true) {
+      // Spinner: "noch nicht fertig" — Ruhe-Fenster ungueltig machen.
+      stableCount = 0;
+      lastSignature = null;
+    } else if (signature === lastSignature) {
+      stableCount++;
+      // Stabil: Signatur identisch ueber stableRounds aufeinanderfolgende Polls.
+      if (stableCount >= Math.max(1, stableRounds)) {
+        return { stable: true, skipped: false, polls, stableRounds: stableCount, waitedMs: waited(), exhausted: false, signature, labelsCount: labels.length, eventElementsFound: found };
+      }
+    } else {
+      stableCount = 1;
+      lastSignature = signature;
+    }
+    lastLabels = labels;
+    lastFound = found;
+    if (waited() + pollMs >= budgetMs) break;
+    // eslint-disable-next-line no-await-in-loop
+    await doSleep(pollMs);
+  }
+  return {
+    stable: false, skipped: false, polls, stableRounds: stableCount, waitedMs: waited(), exhausted: true,
+    signature: lastSignature, labelsCount: lastLabels.length, eventElementsFound: lastFound
+  };
 }
 
 // Bis 0d47105 lag dieser Code als Closure in getFreeBusy. Der Test
@@ -6117,6 +6206,21 @@ export class OwaClient {
     }
     const weekVerified = isHeaderReadVerified(rendered);
 
+    // Runde 3: Event-Settlement VOR dem finalen Read. Bei direkter URL-Navi-
+    // gation auf die Zielwoche kehrt waitForWeekViewReady sofort mit targetWeek
+    // zurueck (settle only im notReady-Pfad) — das Grid kann dann noch lazy
+    // hydratisieren (Live-Befund: Header verified, 4 von 7 Events). Hier wird
+    // gewartet, bis die Event-Signatur ueber 2 aufeinanderfolgende Polls
+    // identisch ist; bei Budget-Erschoepfung wird trotzdem gelesen (graceful),
+    // aber ehrlich als unsicher gekennzeichnet.
+    const eventSettlement = await waitForEventSetStable({
+      readEvents: () => collectCalendarEventLabels(page, { weekStartIso: mondayIso, fast: true }),
+      budgetMs: phase(EVENT_SET_STABLE_BUDGET_MS),
+      pollMs: EVENT_SET_STABLE_POLL_MS,
+      stableRounds: EVENT_SET_STABLE_ROUNDS,
+      sleep: (ms) => page.waitForTimeout(ms)
+    });
+
     // Event-Knoten sammeln und alle parsen (nicht nur Busy — fuer Briefings).
     const eventCollection = await collectCalendarEventLabels(page, { weekStartIso: rendered.startDate || mondayIso });
     const eventElementsFound = eventCollection.eventElementsFound;
@@ -6163,6 +6267,13 @@ export class OwaClient {
       },
       weekVerified,
       dataQuality,
+      eventSettlement: {
+        stable: eventSettlement.stable,
+        polls: eventSettlement.polls,
+        waitedMs: Math.round(eventSettlement.waitedMs || 0),
+        labelsCount: eventSettlement.labelsCount,
+        eventElementsFound: eventSettlement.eventElementsFound
+      },
       events,
       count: events.length,
       note: `READ-ONLY Liste aller Termine (busy/free/tentative/Ganztag) aus der OWA-Wochenansicht ` +
@@ -6171,6 +6282,12 @@ export class OwaClient {
     };
     if (dataQuality !== 'verified') {
       result.note += ' WARNUNG: Woche/Event-Grid nicht vollständig verifizierbar — Liste ggf. unvollständig.';
+    }
+    if (eventSettlement.skipped) {
+      result.note += ' HINWEIS: Event-Settlement übersprungen (Restbudget zu knapp) — Liste ggf. unvollständig.';
+    } else if (!eventSettlement.stable) {
+      result.note += ` WARNUNG: Event-Set nach ${eventSettlement.polls} Polls nicht stabil (Budget erschöpft) — ` +
+        `Liste kann ein unvollständiges Event-Grid widerspiegeln.`;
     }
     if (abortReason !== 'none') {
       result.note += ` HINWEIS: Navigation vorzeitig beendet (${abortReason}).`;
