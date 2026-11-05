@@ -653,6 +653,44 @@ export function filterCalendarHeaderCandidates(texts = []) {
 }
 
 // ---------------------------------------------------------------------------
+// Runde 2 (Live-Befund 05.11.2026, KW47): Picker-/Flyout-Steuerelemente des
+// Kalenders wurden als Wochen-/Datums-Quellen missbraucht. Live-Belege:
+//   "November 2026, select to change the month"
+//     -> Monats-Picker-BUTTON. enDateRe las "November 20(26)" als Tag 20 ->
+//        Phantom-Woche 16.–22.11. (KW47 enthaelt zufaellig den 20.11. — die
+//        "korrekte renderedWeek" war reiner Zufall; gerendert war KW45).
+//   "November 2026, Selected date November 5, 2026, Today's date November 5, 2026"
+//     -> Datum-Picker-Label; leitet fuer JEDE November-Anfrage die Woche des
+//        5.11. her (aktuelle Woche) statt der gerenderten.
+//   "Go to today November 5, 2026" -> Sprung-zu-heute-BUTTON, kein Header.
+// Der ECHTE Wochen-Header enthaelt "Jump to a specific date or date range."
+// und bleibt von diesem Filter UNBERUEHRT — "Jump to" ist ein Zusatz AM
+// Header, nicht ein Picker-Steuerlabel.
+// ---------------------------------------------------------------------------
+export const CALENDAR_PICKER_LABEL_PATTERNS = [
+  String.raw`\bselect\s+to\s+change\s+the\s+(?:month|week|year)\b`,
+  String.raw`\bselected\s+date\b[^\n]*\btoday(?:'s|s)\s+date\b`,
+  String.raw`\bgo\s+to\s+today\b`
+];
+
+let compiledPickerPatterns = null;
+function pickerPatterns() {
+  if (!compiledPickerPatterns) {
+    compiledPickerPatterns = CALENDAR_PICKER_LABEL_PATTERNS.map((p) => new RegExp(p, 'i'));
+  }
+  return compiledPickerPatterns;
+}
+
+// Ist der Text ein Picker-/Flyout-Steuerelement (Monats-/Datum-Wahl) statt
+// eines angezeigten Kalender-Headers? Reine Funktion (unit-testbar).
+export function isPickerControlLabel(text) {
+  if (!text) return false;
+  const t = String(text);
+  for (const re of pickerPatterns()) { if (re.test(t)) return true; }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // FIX 1 (Live-Befund Lauf 5, 26.09.2026): der angezeigte Wochen-Header wurde
 // aus dem ARIA-Label des "Go to next week"-Buttons gelesen.
 // ---------------------------------------------------------------------------
@@ -1907,8 +1945,11 @@ export function resolveRenderedWeekFromCandidates({ headerTexts = [], dayHeaderT
 
   // Event-Labels strikt ausschließen (Runde-4-Root-Cause): Ein All-Day-Event
   // ("Urlaub … September 23") darf NIE als Wochen-Header durchkommen.
-  const headers = filterCalendarHeaderCandidates(headerTexts);
-  const dayHeaders = filterCalendarHeaderCandidates(dayHeaderTexts);
+  // Picker-Steuerelemente ebenfalls (Runde 2, 05.11.2026): Monats-/Datum-Picker
+  // leiten Phantom-Wochen her (Live-Beleg: "November 2026, select to change
+  // the month" -> Woche 16.–22.11. obwohl KW45 gerendert war).
+  const headers = filterCalendarHeaderCandidates(headerTexts).filter((t) => !isPickerControlLabel(t));
+  const dayHeaders = filterCalendarHeaderCandidates(dayHeaderTexts).filter((t) => !isPickerControlLabel(t));
 
   // FIX 1 (Live-Lauf 5): Navigations-Labels sind NIE der angezeigte Header.
   // Ihr Datumsbereich ist das Klickziel, nicht die Ansicht — in Lauf 5 hat
@@ -3355,10 +3396,17 @@ export function parseEventLabel(label, defaultYear) {
 
   // Datum extrahieren: DE ("28. September 2026") vor EN ("September 28, 2026") versuchen.
   // matchAll + Monats-Check: falsche Kandidaten (z.B. "Besetzt 9") werden übersprungen.
+  //
+  // Runde 2 (Live-Befund 05.11.2026): Der Monats-Picker-Button
+  // "November 2026, select to change the month" wurde von enDateRe als
+  // "November 20" gelesen (das "26" von 2026 als Rest des Tages) — daraus
+  // leitete resolveRenderedWeekFromCandidates die Woche 16.–22.11. ab, OBWOHL
+  // die Woche gar nicht gerendert war. Die Tageserkennung darf deshalb nie
+  // mitten in einer mehrstelligen Zahl ansetzen: (?<!\d)/(?!\d)-Grenzen.
   let day = null;
   let month = null;
   let year = null;
-  const deDateRe = /(\d{1,2})\.\s*([A-Za-zäöüÄÖÜß]{3,})\.?(?:\s+(\d{4}))?/g;
+  const deDateRe = /(?<!\d)(\d{1,2})(?!\d)\.\s*([A-Za-zäöüÄÖÜß]{3,})\.?(?:\s+(\d{4}))?/g;
   for (const m of label.matchAll(deDateRe)) {
     const mo = MONTH_NAMES[m[2].toLowerCase()];
     if (mo !== undefined) {
@@ -3369,7 +3417,7 @@ export function parseEventLabel(label, defaultYear) {
     }
   }
   if (day === null) {
-    const enDateRe = /([A-Za-zäöüÄÖÜß]{3,})\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?/g;
+    const enDateRe = /([A-Za-zäöüÄÖÜß]{3,})\.?\s+(?<!\d)(\d{1,2})(?!\d)(?:,?\s*(\d{4}))?/g;
     for (const m of label.matchAll(enDateRe)) {
       const mo = MONTH_NAMES[m[1].toLowerCase()];
       if (mo !== undefined) {
@@ -3377,6 +3425,21 @@ export function parseEventLabel(label, defaultYear) {
         day = parseInt(m[2], 10);
         year = m[3] ? parseInt(m[3], 10) : null;
         break;
+      }
+    }
+    // EN Tag-zuerst ("3 November 2026"): Vor dem Runde-2-Fix las dieser Fall
+    // das JAHR als Tagesrest ("November 20(26)" -> Tag 20). Mit Grenzen liest
+    // der Monat-zuerst-Durchlauf hier nichts mehr, deshalb der eigene Pass.
+    if (day === null) {
+      const enDayFirstRe = /(?<!\d)(\d{1,2})(?!\d)\s+([A-Za-zäöüÄÖÜß]{3,})\.?(?:,?\s*(\d{4}))?/g;
+      for (const m of label.matchAll(enDayFirstRe)) {
+        const mo = MONTH_NAMES[m[2].toLowerCase()];
+        if (mo !== undefined) {
+          day = parseInt(m[1], 10);
+          month = mo;
+          year = m[3] ? parseInt(m[3], 10) : null;
+          break;
+        }
       }
     }
   }
