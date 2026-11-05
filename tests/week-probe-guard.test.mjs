@@ -208,10 +208,11 @@ describe('Bug 2 — Zielwochen-Guard vor dem Klick', () => {
   test('alle Kandidaten werden weiterhin in der Reihenfolge probiert, die vorher nicht passten', async () => {
     const r = await runGuard({ readWeek: WRONG_WEEK, prevStart: '2026-09-21' });
     const kinds = r.probe.map((e) => e.kind).filter(Boolean);
-    assert.equal(kinds[0], 'aria-label-de', 'erst DE, dann EN — Reihenfolge unveraendert');
-    assert.equal(kinds[1], 'aria-label-en');
+    assert.equal(kinds[0], 'aria-label-de', 'erst DE, dann DE-Dativ, dann EN — Reihenfolge dokumentiert');
+    assert.equal(kinds[1], 'aria-label-de-dat');
+    assert.equal(kinds[2], 'aria-label-en');
     assert.equal(r.probe[0].found, false, 'DE-Button existiert nicht');
-    assert.equal(r.probe[1].clicked, true, 'EN-Button wird geklickt');
+    assert.equal(r.probe[2].clicked, true, 'EN-Button wird geklickt');
   });
 
   test('der Guard-Read ist memoisiert und wird nach einem Klick verworfen', async () => {
@@ -489,14 +490,16 @@ describe('Bug 2 — Zielwochen-Guard vor dem Klick', () => {
     assert.equal(classifyButtonFailure({ foundAny: true, clickedAny: false }), 'button-ineffective');
   });
 
-  test('Kandidaten-Reihenfolge unveraendert: aria-label-de steht vor aria-label-en', () => {
+  test('Kandidaten-Reihenfolge: aria-label-de (+ Dativ) steht vor aria-label-en', () => {
     const c = weekButtonCandidates(1);
     assert.equal(c[0].kind, 'aria-label-de');
-    assert.equal(c[1].kind, 'aria-label-en');
+    assert.equal(c[1].kind, 'aria-label-de-dat');
+    assert.equal(c[2].kind, 'aria-label-en');
     assert.equal(c[0].selector, '[aria-label*="Nächste Woche" i]');
-    assert.equal(c[1].selector, '[aria-label*="Next week" i]');
+    assert.equal(c[1].selector, '[aria-label*="nächsten Woche" i]');
+    assert.equal(c[2].selector, '[aria-label*="Next week" i]');
     assert.equal(weekButtonCandidates(-1)[0].kind, 'aria-label-de');
-    assert.equal(weekButtonCandidates(-1)[1].kind, 'aria-label-en');
+    assert.equal(weekButtonCandidates(-1)[2].kind, 'aria-label-en');
   });
 
   test('Klick-Verifikation unveraendert (unverified bleibt unverified)', () => {

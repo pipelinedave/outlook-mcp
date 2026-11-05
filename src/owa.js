@@ -461,6 +461,21 @@ export function parseWeekHeaderText(text, now = new Date()) {
     }
   }
 
+  // DE-Kompakt (Defekt-B-Ergänzung 05.11.2026): "9.–15. November 2026" — die
+  // deutsche Wochen-Navigation beschriftet Buttons/GuT mit Bindestrich-Zange
+  // ("9.–15. November"); weder DE-Voll noch Tag-zuerst greifen hier.
+  const deCompact = t.match(/(\d{1,2})\.\s*[–—-]\s*(\d{1,2})\.\s*([A-Za-zäöüÄÖÜß]{3,})\.?(?:,?\s*(\d{4}))?/);
+  if (deCompact) {
+    const month = MONTH_NAMES[deCompact[3].toLowerCase()];
+    if (month !== undefined) {
+      const year = deCompact[4] ? parseInt(deCompact[4], 10) : currentYear;
+      const s = new Date(year, month, parseInt(deCompact[1], 10));
+      let e = new Date(year, month, parseInt(deCompact[2], 10));
+      if (e < s) e = new Date(year + 1, month, parseInt(deCompact[2], 10));
+      return { startDate: toIsoDate(s), endDate: toIsoDate(e) };
+    }
+  }
+
   // Ein-Tag-zuerst / EIN Monat: "21–27 September, 2026" (OWA-Form des
   // angezeigten Headers, Live-Beleg 26.09.2026: "21–27 September, 2026,
   // Jump to a specific date or date range." bzw. "… (Week 39)"). Weder das
@@ -2686,7 +2701,12 @@ export function renderedWeekContains(rendered, dateIso) {
 export const WEEK_CLICK_GUARD_REASONS = {
   targetReached: 'target-week-reached',
   viewNotReady: 'view-not-ready',
-  click: 'click'
+  click: 'click',
+  // Defekt B (05.11.2026): Header-Read und Button-Label widersprechen sich
+  // (Boot-Flash: der Store restauriert kurz eine alte Woche, dann settled OWA
+  // auf die heutige Woche). Die Label-abgeleitete Woche gewinnt; der Aufrufer
+  // re-evaluiert die Richtung, statt falsch zu klicken oder abzubrechen.
+  labelHeaderConflict: 'label-header-conflict'
 };
 
 // ---------------------------------------------------------------------------
@@ -2949,6 +2969,44 @@ export async function runWeekButtonClick({
       continue;
     }
     foundAny = true;
+    // Defekt B — LABEL-VERRIEGELUNG vor dem Klick: Der Button nennt in seinem
+    // ARIA-Label die Woche, zu der er navigiert. Wird diese Woche NICHT der
+    // Zielwoche noch der adjazenten Folge/ Vorgaengerwoche gerecht, wird der
+    // Klick VERWEIGERT (Verirren-Schutz) und der naechste Kandidat probiert.
+    // Nicht parsebare Labels (Chevron-Buttons) fallen ins alte Verhalten
+    // (Klick + Header-Verifikation) zurueck.
+    let labelText = null;
+    try { labelText = await loc.getAttribute('aria-label'); } catch (e) { labelText = null; }
+    if (!labelText) { try { labelText = await loc.getAttribute('title'); } catch (e) { labelText = null; } }
+    const labelDecision = weekNavLabelDecision({ labelText, direction, renderedStart: prevStart, targetStart });
+    if (labelDecision.parseable && labelDecision.click === false) {
+      probe.push({
+        selector: cand.selector, kind: cand.kind, found: true, clicked: false,
+        note: `Label-Zielwoche ${labelDecision.labelWeek} abgelehnt (${labelDecision.reason})`,
+        label: String(labelText || '').slice(0, 120)
+      });
+      // Defekt B — Header/Label-Konflikt: Das Label impliziert eine andere
+      // aktuelle Woche als der Header-Read. Der Header war im Live-Befund ein
+      // Boot-Flash (Store restaurierte kurz KW47, OWA settled auf KW45). Der
+      // Aufrufer re-evaluiert mit der Label-abgeleiteten Woche, statt in die
+      // falsche Richtung zu klicken oder ehrlich abzubrechen.
+      if (labelDecision.impliedCurrent && labelDecision.impliedCurrent !== prevStart) {
+        const impliedEnd = toIsoDate(new Date(new Date(labelDecision.impliedCurrent + 'T00:00:00').getTime() + 6 * 86400000));
+        return {
+          clicked: false,
+          week: {
+            startDate: labelDecision.impliedCurrent,
+            endDate: impliedEnd,
+            text: String(labelText || '').slice(0, 120),
+            source: 'nav-label-derivation'
+          },
+          verified: 'guard-blocked', foundAny: true, clickedAny: false,
+          targetReached: false, effect: CLICK_EFFECTS.unverified,
+          guard: WEEK_CLICK_GUARD_REASONS.labelHeaderConflict
+        };
+      }
+      continue;
+    }
     try {
       await loc.click({ timeout: Math.min(2000, Math.max(100, remainingMs())) });
     } catch (e) {
@@ -2961,13 +3019,39 @@ export async function runWeekButtonClick({
     targetWeekChecked = false;
     targetWeekNow = null;
     // eslint-disable-next-line no-await-in-loop
-    const r = await afterClick(prevStart, clickWaitMs);
+    const r0 = await afterClick(prevStart, clickWaitMs);
+    // Defekt B — READ-RACE-Gnadenfrist: Das Label verspricht eine konkrete
+    // Zielwoche. Zeigt der Header unmittelbar nach dem Klick noch die ALTE
+    // Woche, ist das sehr wahrscheinlich ein Render-Race (OWA aktualisiert
+    // Header/Label erst nach der Transition) — KEIN Grund fuer einen
+    // Zweitklick (genau der hat im Live-Befund KW46 auf KW47 verschoben:
+    // Folgekandidat traf denselben Button mit dem STALEN Label). Kurze
+    // Gnadenfrist mit Re-Poll, bevor 'unchanged' konstatiert wird.
+    let r = r0;
+    if (labelDecision.parseable && labelDecision.labelWeek && r && r.week && r.week.startDate === prevStart) {
+      const graceDeadline = Date.now() + 4000;
+      while (r.week.startDate === prevStart && Date.now() < graceDeadline && remainingMs() > 1000) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((res) => setTimeout(res, 500));
+        // eslint-disable-next-line no-await-in-loop
+        r = await afterClick(prevStart, 1500);
+      }
+    }
     // FIX 3: die Annahme des Klicks wird am ANGEZEIGTEN Header bewertet
     // (classifyClickEffect), nicht daran festgemacht, dass sich ueberhaupt
     // etwas bewegt hat ('changed'). Der Aufrufer entscheidet danach ueber
     // advanced/overshoot/unverified — er KANN nicht mehr blind weiterklicken.
+    // Bei parsebarem Label gilt zusaetzlich: landet der Klick NICHT auf der
+    // versprochenen Woche, entscheidet die Klassifikation ehrlich (overshoot/
+    // advanced) — der Aufrufer re-evaluiert die gerenderte Woche und
+    // korrigiert selbst, es wird KEIN weiterer Kandidat geblind-klickt.
     const effect = classifyClickEffect({ prevStart, newWeek: r && r.week, targetStart, direction });
-    probe.push({ selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified, effect });
+    probe.push({
+      selector: cand.selector, kind: cand.kind, found: true, clicked: true, verified: r.verified, effect,
+      label: String(labelText || '').slice(0, 120),
+      labelWeek: labelDecision.labelWeek,
+      labelReason: labelDecision.reason
+    });
     if (shouldTryNextCandidate(r.verified)) continue; // wirkungslos -> naechster Kandidat
     return {
       clicked: true, week: r.week, verified: r.verified, effect, foundAny, clickedAny,
@@ -3070,12 +3154,17 @@ export function affordableClicks(remainingMs, clickCostMs, maxClicks) {
 // symbolbasierte Chevron-Kandidaten. Reihenfolge = Versuchreihenfolge; jeder
 // Versuch wird ins Klick-Protokoll (weekButtonProbe) geschrieben, auch
 // "kein Button gefunden".
+// Defekt B (05.11.2026): die Buttons sind BUTTON.fui-Button OHNE role-Attribut
+// und tragen ARIA-Labels wie "Go to next week \n9–15 November, 2026 (Week 46)".
+// Die Label-Verriegelung (weekNavLabelDecision) entscheidet VOR dem Klick.
 export function weekButtonCandidates(direction) {
   if (direction > 0) {
     return [
       { selector: '[aria-label*="Nächste Woche" i]', kind: 'aria-label-de' },
+      { selector: '[aria-label*="nächsten Woche" i]', kind: 'aria-label-de-dat' },
       { selector: '[aria-label*="Next week" i]', kind: 'aria-label-en' },
       { selector: '[title*="Nächste Woche" i]', kind: 'title-de' },
+      { selector: '[title*="nächsten Woche" i]', kind: 'title-de-dat' },
       { selector: '[title*="Next week" i]', kind: 'title-en' },
       { selector: '[role="button"][aria-label*="Nächste" i]', kind: 'aria-label-de-broad' },
       { selector: '[role="button"][aria-label*="Next" i]', kind: 'aria-label-en-broad' },
@@ -3085,14 +3174,55 @@ export function weekButtonCandidates(direction) {
   }
   return [
     { selector: '[aria-label*="Vorherige Woche" i]', kind: 'aria-label-de' },
+    { selector: '[aria-label*="vorherigen Woche" i]', kind: 'aria-label-de-dat' },
     { selector: '[aria-label*="Previous week" i]', kind: 'aria-label-en' },
     { selector: '[title*="Vorherige Woche" i]', kind: 'title-de' },
+    { selector: '[title*="vorherigen Woche" i]', kind: 'title-de-dat' },
     { selector: '[title*="Previous week" i]', kind: 'title-en' },
     { selector: '[role="button"][aria-label*="Vorherige" i]', kind: 'aria-label-de-broad' },
     { selector: '[role="button"][aria-label*="Previous" i]', kind: 'aria-label-en-broad' },
     { selector: '[role="button"]:has([data-icon-name*="ChevronLeft" i])', kind: 'symbol-chevron-left' },
     { selector: '[role="button"][aria-label*="chevron-left" i], [role="button"][aria-label*="chevron left" i]', kind: 'symbol-aria-chevron' }
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Defekt B (05.11.2026): Die Wochen-Navigation verirrte sich — startdate wird
+// von OWA komplett ignoriert (Live-Probe: startdate=2026-11-09/16 und URL ohne
+// startdate rendern alle die aktuelle Woche), und die Arrow-Buttons wurden
+// blind nach Substring-Match geklickt. Die Buttons tragen aber ARIA-Labels,
+// die die ZIELWOCHE nennen ("Go to next week 9–15 November, 2026 (Week 46)").
+// Diese Funktion entscheidet VOR dem Klick anhand des Labels:
+//   - Label-Woche == Zielwoche            -> klicken (landet exakt)
+//   - Label-Woche == gerenderte Woche +/- 1 in Klickrichtung -> klicken (adjazent)
+//   - Label-Woche fremd                   -> NICHT klicken (Verirren-Schutz)
+//   - Label nicht parsebar (Chevron ohne Label) -> Entscheidung dem Aufrufer
+//     ueberlassen (altes Verhalten: Klick + Header-Verifikation).
+// Reine Funktion, direkt testbar.
+export function weekNavLabelDecision({ labelText = null, direction = 0, renderedStart = null, targetStart = null } = {}) {
+  const week = labelText ? parseWeekHeaderText(String(labelText)) : null;
+  if (!week || !week.startDate) return { parseable: false, click: null, reason: 'label-nicht-parsebar', labelWeek: null };
+  const labelWeek = week.startDate;
+
+  if (targetStart && labelWeek === targetStart) {
+    return { parseable: true, click: true, reason: 'label-ist-zielwoche', labelWeek };
+  }
+  if (renderedStart && direction) {
+    const step = Math.sign(direction) * 7;
+    const expected = toIsoDate(new Date(new Date(renderedStart + 'T00:00:00').getTime() + step * 86400000));
+    if (labelWeek === expected) {
+      return { parseable: true, click: true, reason: 'label-ist-adjazent', labelWeek };
+    }
+    // Fremde Label-Woche: Das Label impliziert eine ANDERE aktuelle Woche
+    // (labelWeek - Klickschritt). Weicht die vom Header-Read ab, war der
+    // Header-Read stale/Boot-Flash — der Aufrufer re-evaluiert mit der
+    // Label-abgeleiteten Woche (Guard label-header-conflict).
+    const impliedCurrent = toIsoDate(new Date(new Date(labelWeek + 'T00:00:00').getTime() - step * 86400000));
+    return { parseable: true, click: false, reason: 'label-woche-fremd', labelWeek, impliedCurrent };
+  }
+  // Renderstand/Richtung unbekannt: nur klicken, wenn das Label die Zielwoche
+  // verspricht — sonst ist der Klick unbelegbar.
+  return { parseable: true, click: Boolean(targetStart) ? labelWeek === targetStart : true, reason: 'label-nur-ziel-check', labelWeek };
 }
 
 // Klick-Verifikation (Runde-4-Forderung C): Nach dem Klick MUSS sich der
@@ -4935,6 +5065,13 @@ export class OwaClient {
         rendered = r.week || rendered;
         continue;
       }
+      // Defekt B: Header/Label-Konflikt — der Label-abgeleitete Wochenstand
+      // (r.week) ersetzt den stale Header-Read (Boot-Flash); die Schleife
+      // re-evaluiert die Richtung. Kein Klick ist gefahren.
+      if (r.guard === WEEK_CLICK_GUARD_REASONS.labelHeaderConflict) {
+        rendered = r.week || rendered;
+        continue;
+      }
       // FIX 3: Die Zielwoche gilt nur als erreicht, wenn der ANGEZEIGTE Header
       // sie jetzt traegt (classifyClickEffect -> 'reached'), nicht weil sich
       // 'irgendetwas bewegt' hat.
@@ -5812,6 +5949,13 @@ export class OwaClient {
         rendered = r.week || rendered;
         continue;
       }
+      // Defekt B: Header/Label-Konflikt — der Label-abgeleitete Wochenstand
+      // (r.week) ersetzt den stale Header-Read; die Schleife re-evaluiert die
+      // Richtung. Kein Klick ist gefahren, das Klick-Budget bleibt intakt.
+      if (r.guard === WEEK_CLICK_GUARD_REASONS.labelHeaderConflict) {
+        rendered = r.week || rendered;
+        continue;
+      }
       if (r.targetReached) { rendered = r.week; break; }
       if (r.clicked && r.effect === CLICK_EFFECTS.overshoot) { abortReason = 'week-overshoot'; break; }
       if (r.clicked && r.effect === CLICK_EFFECTS.unverified) { abortReason = 'click-unverified'; break; }
@@ -5824,11 +5968,21 @@ export class OwaClient {
 
     // GUARD 1: falsche Woche -> keine Daten statt falscher Daten.
     if (rendered.startDate && !renderedWeekContains(rendered, rangeStartDate)) {
-      throw new Error(
+      // Diagnostik im Fehler (Defekt B, 05.11.2026): Klick-Protokoll mit
+      // Label-Verriegelung + Navigationsrekonstruktion mitliefern, damit der
+      // Aufrufer (und der Live-Test) sehen kann, welche Klicks gefahren sind.
+      throw Object.assign(new Error(
         `Kalender-Wochenansicht zeigt nicht die angefragte Woche: angefragt ab ${rangeStartDate}, ` +
         `gerendert ${rendered.startDate} – ${rendered.endDate || '?'}. Es werden bewusst keine Daten ` +
         `der falschen Woche zurueckgegeben.`
-      );
+      ), {
+        diagnostics: {
+          abortReason,
+          buttonClicks,
+          renderedWeek: rendered,
+          weekButtonProbe: weekButtonProbe.slice(0, 20)
+        }
+      });
     }
     const weekVerified = isHeaderReadVerified(rendered);
 

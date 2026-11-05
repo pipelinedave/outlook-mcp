@@ -8,6 +8,7 @@ import {
   runWeekButtonClick,
   weekProbeGuardEntry,
   weekClickDecision,
+  weekNavLabelDecision,
   FREEBUSY_MAX_BUTTON_CLICKS
 } from '../src/owa.js';
 
@@ -218,8 +219,8 @@ describe('FIX 3 — Verdrahtung: gerichtet, begrenzt, ehrlich', () => {
     const fn = src.slice(i, src.indexOf('// Darf in dieselbe Richtung erneut geklickt werden?', i));
     assert.ok(/const effect = classifyClickEffect\(\{ prevStart, newWeek: r && r\.week, targetStart, direction \}\);/.test(fn),
       'die Wirkungsklassifikation sitzt im Produktionspfad');
-    assert.ok(/probe\.push\(\{ selector: cand\.selector, kind: cand\.kind, found: true, clicked: true, verified: r\.verified, effect \}\)/.test(fn),
-      'und sie steht im Klick-Protokoll');
+    assert.ok(/probe\.push\(\{[\s\S]{0,400}?kind: cand\.kind, found: true, clicked: true, verified: r\.verified, effect,/.test(fn),
+      'und sie steht im Klick-Protokoll (inkl. Label-Verriegelungs-Feldern, Defekt B)');
   });
 
   test('"max-clicks" entsteht nur noch als ehrlicher Abbruch (kein Blindklicken)', () => {
@@ -259,5 +260,118 @@ describe('FIX 3 — Verdrahtung: gerichtet, begrenzt, ehrlich', () => {
     const e = weekProbeGuardEntry(weekClickDecision({ rendered: KW40, targetStart: TARGET }));
     assert.equal(e.skipped, 'target-week-verified');
     assert.equal('effect' in e, false, 'der Guard-Eintrag traegt keinen Klick-Effekt');
+  });
+});
+
+// ===========================================================================
+// Defekt B (05.11.2026): startdate wird von OWA komplett ignoriert (Live-Probe:
+// startdate=2026-11-09/16 und URL ohne startdate rendern alle die aktuelle
+// Woche), die Arrow-Klicks verirrten sich. Die Nav-Buttons tragen ARIA-Labels
+// mit der Zielwoche ("Go to next week 9–15 November, 2026 (Week 46)") — die
+// Label-Verriegelung (weekNavLabelDecision) entscheidet VOR dem Klick.
+// ===========================================================================
+describe('Defekt B — Label-Verriegelung der Wochen-Navigation', () => {
+  const TARGET_KW46 = '2026-11-09';
+
+  test('Label nennt die Zielwoche -> klicken (landet exakt)', () => {
+    const d = weekNavLabelDecision({
+      labelText: 'Go to next week \n9–15 November, 2026 (Week 46)',
+      direction: 1,
+      renderedStart: '2026-11-02',
+      targetStart: TARGET_KW46
+    });
+    assert.equal(d.parseable, true);
+    assert.equal(d.click, true);
+    assert.equal(d.reason, 'label-ist-zielwoche');
+    assert.equal(d.labelWeek, '2026-11-09');
+  });
+
+  test('Label nennt die adjazente Folgezeit in Klickrichtung -> klicken', () => {
+    // von KW45 aus Richtung KW47: erster Klick auf KW46 (noch nicht Ziel)
+    const d = weekNavLabelDecision({
+      labelText: 'Go to next week \n9–15 November, 2026 (Week 46)',
+      direction: 1,
+      renderedStart: '2026-11-02',
+      targetStart: '2026-11-16'
+    });
+    assert.equal(d.parseable, true);
+    assert.equal(d.click, true);
+    assert.equal(d.reason, 'label-ist-adjazent');
+  });
+
+  test('Label nennt eine FREMDE Woche -> NICHT klicken (Verirren-Schutz)', () => {
+    // prev-Button-Label beim Ziel KW46: 26 Oct – 1 Nov — bewegt sich falsch
+    const d = weekNavLabelDecision({
+      labelText: 'Go to previous week \n26 October – 1 November, 2026 (Week 44)',
+      direction: 1,
+      renderedStart: '2026-11-02',
+      targetStart: TARGET_KW46
+    });
+    assert.equal(d.parseable, true);
+    assert.equal(d.click, false);
+    assert.equal(d.reason, 'label-woche-fremd');
+  });
+
+  test('DE-Label (Dativ): "Zur nächsten Woche 9.–15. November 2026"', () => {
+    const d = weekNavLabelDecision({
+      labelText: 'Zur nächsten Woche 9.–15. November 2026 (Woche 46) navigieren',
+      direction: 1,
+      renderedStart: '2026-11-02',
+      targetStart: TARGET_KW46
+    });
+    assert.equal(d.parseable, true);
+    assert.equal(d.click, true);
+    assert.equal(d.labelWeek, TARGET_KW46);
+  });
+
+  test('Nicht parsebares Label (Chevron ohne Datum) -> Entscheidung beim Aufrufer', () => {
+    const d = weekNavLabelDecision({ labelText: 'Weiter', direction: 1, renderedStart: '2026-11-02', targetStart: TARGET_KW46 });
+    assert.equal(d.parseable, false);
+    assert.equal(d.click, null);
+  });
+
+  test('Ohne Label gar keine Entscheidung (null -> nicht parsebar)', () => {
+    const d = weekNavLabelDecision({ labelText: null, direction: 1, renderedStart: '2026-11-02', targetStart: TARGET_KW46 });
+    assert.equal(d.parseable, false);
+  });
+
+  test('Renderstand unbekannt: nur klicken, wenn das Label die Zielwoche verspricht', () => {
+    const ok = weekNavLabelDecision({
+      labelText: 'Go to next week \n9–15 November, 2026 (Week 46)',
+      direction: 1, renderedStart: null, targetStart: TARGET_KW46
+    });
+    assert.equal(ok.click, true);
+    const no = weekNavLabelDecision({
+      labelText: 'Go to next week \n2–8 November, 2026 (Week 45)',
+      direction: 1, renderedStart: null, targetStart: TARGET_KW46
+    });
+    assert.equal(no.click, false);
+  });
+
+  test('Header/Label-Konflikt (Boot-Flash, Live-Befund 05.11.): impliedCurrent aus Label hergeleitet', () => {
+    // Live-Befund: Header flashte KW47 (2026-11-16), View war KW45. Der
+    // prev-Button versprach Week 44 (26.10.) — dazu passt als aktuelle Woche
+    // nur KW45 (02.11.), NICHT der Header-Read.
+    const d = weekNavLabelDecision({
+      labelText: 'Go to previous week \n26 October – 1 November, 2026 (Week 44)',
+      direction: -1,
+      renderedStart: '2026-11-16',
+      targetStart: TARGET_KW46
+    });
+    assert.equal(d.parseable, true);
+    assert.equal(d.click, false, 'Fremde Label-Woche wird nicht geklickt');
+    assert.equal(d.reason, 'label-woche-fremd');
+    assert.equal(d.impliedCurrent, '2026-11-02', 'Label impliziert KW45 als aktuelle Woche');
+  });
+
+  test('Kein impliedCurrent, wenn Label zur gerenderten Woche adjazent ist', () => {
+    const d = weekNavLabelDecision({
+      labelText: 'Go to next week \n9–15 November, 2026 (Week 46)',
+      direction: 1,
+      renderedStart: '2026-11-02',
+      targetStart: '2026-11-23'
+    });
+    assert.equal(d.click, true);
+    assert.equal(d.impliedCurrent, undefined);
   });
 });
