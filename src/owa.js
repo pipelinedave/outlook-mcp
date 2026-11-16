@@ -4,6 +4,14 @@ import path from 'path';
 import os from 'os';
 import { browserManager } from './browser.js';
 import { config } from './config.js';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DEFAULT_SIGNATURE_PATH = path.join(__dirname, 'default_signature.html');
+export const DEFAULT_SIGNATURE_HTML = fs.existsSync(DEFAULT_SIGNATURE_PATH)
+  ? fs.readFileSync(DEFAULT_SIGNATURE_PATH, 'utf-8')
+  : '';
 
 const turndown = new TurndownService({
   headingStyle: 'atx',
@@ -273,11 +281,18 @@ export function recipientListContains(list, expected) {
     .filter(Boolean);
   if (parts.length === 0) return hay.includes(String(expected).toLowerCase().trim());
   // Jede erwartete Adresse muss nachweisbar sein; Alternative: Match auf den
-  // reinen Adressteil (Chip-Label "Name <mail@x.de>" enthält die Adresse).
+  // reinen Adressteil (Chip-Label "Name <mail@x.de>" enthält die Adresse) oder
+  // Klarnamen-Bestandteile bei internen M365-Kontakten (z.B. "Placke, Gabriel").
   return parts.every((p) => {
     if (hay.includes(p)) return true;
     const addr = p.match(/<([^>]+)>/);
-    return addr ? hay.includes(addr[1].trim()) : false;
+    if (addr && hay.includes(addr[1].trim())) return true;
+    const emailPrefix = (addr ? addr[1] : p).split('@')[0];
+    const nameParts = emailPrefix.split(/[._-]+/).filter((part) => part.length >= 3);
+    if (nameParts.length > 0 && nameParts.every((part) => hay.includes(part))) {
+      return true;
+    }
+    return false;
   });
 }
 
@@ -4432,7 +4447,13 @@ export class OwaClient {
     if (context) {
       const pagesAfter = context.pages();
       if (pagesAfter.length > pagesBefore) {
-        activePage = pagesAfter[pagesAfter.length - 1];
+        // FILTER: nur echte Outlook-Mail-Pages, keine Popup/Auth-Seiten wie login.microsoftonline.com
+        const mailPages = pagesAfter.filter((p) => {
+          const u = p.url();
+          return (u.includes('outlook.office.com/mail') || u.includes('outlook.cloud.microsoft/mail')) &&
+                 !u.includes('login.microsoftonline.com') && !u.includes('oauthRedirect');
+        });
+        activePage = mailPages.length > 0 ? mailPages[mailPages.length - 1] : pagesAfter[pagesAfter.length - 1];
         this.lastPage = activePage;
       }
     }
@@ -4486,9 +4507,40 @@ export class OwaClient {
       );
     }
 
+    // P4: CC direkt im offenen Compose-Fenster befüllen (da deeplink &cc= von OWA ignoriert wird)
+    if (ccStr) {
+      await this._populateComposeCc(activePage, ccStr);
+    }
+
     // Bestand vor dem Tippen merken (Unversehrtheits-Beweis fuer die
     // OWA-Account-Signatur, die OWA beim Oeffnen automatisch einsetzt).
-    const preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
+    let preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
+
+    // FALLBACK-SIGNATUR (Befund 16.11.2026): Hat OWA keine Signatur vorab geladen,
+    // injecten wir DEFAULT_SIGNATURE_HTML, damit der Entwurf nicht nackt bleibt.
+    const hasSig = await editor.evaluate((el) => {
+      const html = el.innerHTML || '';
+      const text = el.innerText || '';
+      return html.includes('id="Signature"') || html.includes('id="divtagdefaultwrapper"') ||
+             text.includes('David Hallmann') || text.includes('adesso SE') ||
+             text.includes('Mit freundlichen Grüßen') || text.includes('Best regards');
+    });
+
+    if (!hasSig && DEFAULT_SIGNATURE_HTML) {
+      await editor.evaluate((el, sig) => {
+        const p = document.createElement('p');
+        p.innerHTML = '<br>';
+        const p2 = document.createElement('p');
+        p2.innerHTML = '<br>';
+        el.appendChild(p);
+        el.appendChild(p2);
+        const div = document.createElement('div');
+        div.innerHTML = sig;
+        el.appendChild(div);
+      }, DEFAULT_SIGNATURE_HTML);
+      await activePage.waitForTimeout(300);
+      preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
+    }
 
     // TEXTUEBERNAHME PER TASTATUR — derselbe Serialisierungs-Weg wie bei
     // replyDraft. Die fruehere reine DOM-Insertion (insertBefore + dispatchEvent)
@@ -9074,15 +9126,18 @@ export class OwaClient {
           let cur = el;
           for (let i = 0; i < 8 && cur; i++) {
             const al = (cur.getAttribute && cur.getAttribute('aria-label')) || '';
-            if (/^(an|to)\b/i.test(al.trim())) return 'to';
-            if (/^(cc|ccempf|kopie|carbon)/i.test(al.trim())) return 'cc';
+            const id = (cur.getAttribute && cur.getAttribute('id')) || '';
+            if (/^(an|to)\b/i.test(al.trim()) || id === 'recipient-well-label-to') return 'to';
+            if (/^(cc|ccempf|kopie|carbon)/i.test(al.trim()) || id === 'recipient-well-label-cc') return 'cc';
+            if (cur.classList && cur.classList.contains('qcY7b')) return 'cc';
             cur = cur.parentElement;
           }
           return null;
         };
-        // Chips: title/aria-label enthält eine E-Mail-Adresse
-        for (const chip of document.querySelectorAll('[title*="@"], [aria-label*="@"]')) {
-          const label = (chip.getAttribute('title') || chip.getAttribute('aria-label') || '').trim();
+        // Chips: title/aria-label enthält eine E-Mail-Adresse ODER Name aus M365 Directory
+        for (const chip of document.querySelectorAll('[title*="@"], [aria-label*="@"], [class*="_EType_RECIPIENT_ENTITY"], [class*="validPill"]')) {
+          let label = (chip.getAttribute('title') || chip.getAttribute('aria-label') || chip.innerText || '').trim();
+          label = label.replace(/^(offline|abwesend|beschäftigt|away|available|busy)\s*/i, '');
           push(wellOf(chip), label);
         }
         // Frisch getippte, noch nicht als Chip gerenderte Werte in Eingabefeldern
@@ -9130,36 +9185,62 @@ export class OwaClient {
     }
   }
 
+  // P4: CC-Empfänger im offenen Compose-Fenster eintippen & auflösen
+  async _populateComposeCc(page, ccStr) {
+    try {
+      const ccContainer = await page.waitForSelector(
+        'button#recipient-well-label-cc, button[aria-label*="Cc" i], input[aria-label^="Cc" i], div.qcY7b',
+        { timeout: 6000 }
+      ).catch(() => null);
+
+      if (ccContainer) {
+        const ccInput = await page.$('input[aria-label^="Cc" i], div.qcY7b .zjzhQ, div[role="combobox"][aria-label*="Cc" i]');
+        if (ccInput) {
+          await ccInput.click({ force: true }).catch(() => null);
+        } else {
+          await ccContainer.click({ force: true }).catch(() => null);
+        }
+      }
+      await page.waitForTimeout(400);
+
+      const parts = String(ccStr).split(/[;,]+/).map((s) => s.trim()).filter(Boolean);
+      for (const p of parts) {
+        const inputElem = await page.$('div.qcY7b input, input[aria-label^="Cc" i], div[aria-label^="Cc" i] input');
+        if (inputElem) {
+          await inputElem.click({ force: true }).catch(() => null);
+          await page.waitForTimeout(200);
+        }
+        await page.keyboard.type(p, { delay: 25 });
+        await page.waitForTimeout(800);
+        const suggestion = await page.$('#FloatingSuggestionsItemId0, [role="option"][id*="Suggestion" i], [role="listbox"] [role="option"]');
+        if (suggestion) {
+          await suggestion.click().catch(() => null);
+        } else {
+          await page.keyboard.press('Enter');
+        }
+        await page.waitForTimeout(400);
+        await page.keyboard.press('Escape').catch(() => null);
+        await page.waitForTimeout(300);
+      }
+    } catch (e) {
+      // Best-effort in compose
+    }
+  }
+
   // P4: Fehlende CC-Adresse im offenen Draft nachziehen (UI-Chips) und speichern.
-  // Läuft auf der Seite, die verifyPersistedDraftBody mit dem geöffneten Entwurf
-  // hinterlassen hat. Rückgabe: { repaired: boolean, reason?: string }.
   async _repairDraftCc(ccStr) {
     try {
       const page = await this.getPage(true);
-      // Cc-Zeile ggf. erst einblenden (OWA: "Cc verwenden"-Button im eingeklappten Zustand)
-      const ccReveal = await page.$(
-        'button[aria-label*="Cc verwenden" i], button[aria-label*="Show Cc" i], ' +
-        'button[aria-label*="Cc" i][aria-expanded="false"], button[title*="Cc" i]'
+      // Falls OWA den Entwurf im Lesemodus geöffnet hat: "Entwurf bearbeiten" klicken
+      const editBtn = await page.$(
+        'button[aria-label*="Entwurf bearbeiten" i], button[aria-label*="Edit draft" i], ' +
+        'button[title*="Entwurf bearbeiten" i], button[title*="Edit draft" i]'
       );
-      if (ccReveal) {
-        await ccReveal.click().catch(() => null);
-        await page.waitForTimeout(700);
+      if (editBtn) {
+        await editBtn.click().catch(() => null);
+        await page.waitForTimeout(1500);
       }
-      const ccInput = await page.waitForSelector(
-        'input[aria-label^="Cc" i], div[aria-label^="Cc" i] input, input[id*="cc" i]',
-        { timeout: 5000 }
-      ).catch(() => null);
-      if (!ccInput) {
-        return { repaired: false, reason: 'Cc-Eingabefeld im geöffneten Entwurf nicht gefunden' };
-      }
-      await ccInput.click();
-      await page.waitForTimeout(300);
-      await page.keyboard.type(ccStr, { delay: 20 });
-      await page.waitForTimeout(900); // Kontaktvorschläge laden lassen
-      await page.keyboard.press('Enter'); // Chip bestätigen
-      await page.waitForTimeout(600);
-      await page.keyboard.press('Escape').catch(() => null); // Vorschlags-Popup schließen
-      await page.waitForTimeout(300);
+      await this._populateComposeCc(page, ccStr);
       await page.keyboard.press('Control+s');
       await page.waitForTimeout(3000);
       return { repaired: true };

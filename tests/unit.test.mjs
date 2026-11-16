@@ -2472,6 +2472,12 @@ describe('recipientListContains - CC-Persistenz-Beweis (P4, Befund 15.10.2026)',
     assert.equal(recipientListContains(['a@x.de'], 'a@x.de; b@x.de'), false);
   });
 
+  test('M365 interner Kontakt ohne @ in Chip (Name match)', () => {
+    assert.equal(recipientListContains(['Placke, Gabriel'], 'Gabriel.Placke@d-velop.de'), true);
+    assert.equal(recipientListContains(['offlinePlacke, Gabriel'], 'Gabriel.Placke@d-velop.de'), true);
+    assert.equal(recipientListContains(['Lábas, Robert'], 'r.labas@filmuniversitaet.de'), false);
+  });
+
   test('leerer erwarteter Wert -> trivially true', () => {
     assert.equal(recipientListContains([], ''), true);
     assert.equal(recipientListContains([], null), true);
