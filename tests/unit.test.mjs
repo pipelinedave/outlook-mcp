@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion, recipientListContains, extractEmailLike } from '../src/owa.js';
+import { resolveFolder, buildComposeUrl, buildCalendarComposeUrl, buildCalendarWeekUrl, normalizeCalendarDate, FOLDER_MAP, parseWeekHeaderText, parseEventLabel, classifyEventStatus, parseMailRowTimestamp, parseNumericDayHeaderText, resolveRenderedWeekFromCandidates, isWorkLocationPseudoSlot, dedupeBusySlots, partitionSlotsByRange, formatCalendarDiagnostics, FREEBUSY_TOTAL_BUDGET_MS, FREEBUSY_MAX_BUTTON_CLICKS, FREEBUSY_CLICK_RENDER_WAIT_MS, FREEBUSY_MIN_REMAINING_FOR_ESCALATION_MS, phaseBudgetMs, affordableClicks, weekButtonCandidates, evaluateClickVerification, shouldTryNextCandidate, classifyButtonFailure, assembleFreeBusyDiagnostics, slotExtractionWarning, collectCalendarEventLabels, isCalendarEventLabel, filterCalendarHeaderCandidates, isVisibleCalendarElement, parseWeekNumberFromNav, parseNavWeekRange, isoWeekMonday, resolveWeekFromNavButtons, MAILBOX_VERIFICATION_SOURCES, resolveMailboxVerification, isEventGridLabel, EVENT_LABEL_PATTERNS, eventWaitBudgetMs, pollUntilEventGrid, FREEBUSY_EVENT_WAIT_MAX_MS, FREEBUSY_EVENT_WAIT_RESERVE_MS, FREEBUSY_EVENT_WAIT_POLL_MS, EVENT_WAIT_OUTCOMES, canClickSameDirection, weekProbeSkipEntry, eventWaitWarning, CALENDAR_EVENT_SOURCES, eventSourcePlan, normalizeClockTime, mapXToDayColumn, mapYToClockTime, estimateHourPx, buildGeometryEventLabel, deriveEventLabelFromNode, resolveDataQuality, DATA_QUALITY_VALUES, resolveEventWaitOutcome, verifyBodyInserted, isWritableEditor, resolveBodyInserted, isHistoryPreserved, isRealComposeEditor, classifyBodyMatch, buildBodySollIstDiff, normalizeBodyForCompare, evidenceMatchesExpected, parseFlexibleDateInput, resolveReplyTargetAssertion, recipientListContains, extractEmailLike, selectNewestReplyRowCandidate } from '../src/owa.js';
 import { config } from '../src/config.js';
 import { owaClient } from '../src/owa.js';
 
@@ -2531,5 +2531,61 @@ describe('_withReadRetry - Playwright-Stabilitaet (P6, Befund 15.10.2026)', () =
       /outlook_get_email \(nach 2 Restart-Retries\)/
     );
     assert.equal(attempts, 3);
+  });
+});
+
+// ============================================================================
+// A3 PAGE-FILTER replyDraft (17.11.2026) — Suchzeilen deterministisch wählen
+// Defekt: Selector mischte Mail-Zeilen (data-convid) mit Search-Suggest-Options
+// (role=option); ohne parsebaren Timestamp griff der stille rows[0]-Fallback
+// und replyDraft beantwortete die FALSCHE Mail (Fehlerklasse get_email 326b9d4).
+// ============================================================================
+describe('selectNewestReplyRowCandidate - A3 Page-Filter (Mail-Zeilen vs Suggest-Options)', () => {
+  test('INCIDENT: Suggest-Optionen ohne Datum dürfen den Index nicht verfälschen — Mail-Zeile gewinnt', () => {
+    // Suggest-Liste zuerst gerendert, Ergebnisliste dahinter (Reihenfolge = Handle-Reihenfolge)
+    const rows = [
+      { index: 0, id: 'opt1', text: 'Suchen nach "UHK Abgabe"', convid: false },
+      { index: 1, id: 'opt2', text: 'Alle Ordner durchsuchen', convid: false },
+      { index: 2, id: 'conv-a', text: 'Isenberg, Petra\nUHK Abgabe\nHeute 09:12', convid: true },
+      { index: 3, id: 'conv-b', text: 'Mlynarek, Tom\nUHK Nachfrage\nGestern', convid: true }
+    ];
+    const sel = selectNewestReplyRowCandidate(rows);
+    assert.equal(sel.ok, true);
+    assert.equal(sel.index, 2); // "Heute" > "Gestern", Options ignoriert
+  });
+
+  test('KEIN rows[0]-Fallback: keine parsebaren Daten -> ok:false mit Previews', () => {
+    const rows = [
+      { index: 0, id: 'x1', text: 'Irgendein Text ohne Datum', convid: true },
+      { index: 1, id: 'x2', text: 'Noch ein Text', convid: true }
+    ];
+    const sel = selectNewestReplyRowCandidate(rows);
+    assert.equal(sel.ok, false);
+    assert.equal(sel.reason, 'no-parsable-timestamp');
+    assert.ok(Array.isArray(sel.previews) && sel.previews.length === 2);
+  });
+
+  test('ohne Mail-Zeilen werden Options als Kandidaten zugelassen (Legacy-Suchseite)', () => {
+    const rows = [
+      { index: 0, id: '', text: 'Ergebnis A\n24.09. 10:00', convid: false },
+      { index: 1, id: '', text: 'Ergebnis B\n25.09. 08:00', convid: false }
+    ];
+    const sel = selectNewestReplyRowCandidate(rows);
+    assert.equal(sel.ok, true);
+    assert.equal(sel.index, 1); // 25.09. > 24.09.
+  });
+
+  test('leere/fehlende Liste -> ok:false, kein Index', () => {
+    assert.equal(selectNewestReplyRowCandidate([]).ok, false);
+    assert.equal(selectNewestReplyRowCandidate(null).ok, false);
+    assert.equal(selectNewestReplyRowCandidate(null).index, undefined);
+  });
+
+  test('neuester Timestamp gewinnt auch bei vermischten Formaten', () => {
+    const rows = [
+      { index: 0, id: 'a', text: 'Alt\n14.10.2026', convid: true },
+      { index: 1, id: 'b', text: 'Neu\nHeute 08:00', convid: true }
+    ];
+    assert.equal(selectNewestReplyRowCandidate(rows).index, 1);
   });
 });

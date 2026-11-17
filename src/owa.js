@@ -303,6 +303,44 @@ export function extractEmailLike(s) {
   return m ? m[0] : null;
 }
 
+// A3 PAGE-FILTER (17.11.2026, Sofortmaßnahme replyDraft): Deterministische
+// Zeilenwahl in den OWA-Suchergebnissen. Der bisherige Selector mischte echte
+// Mail-Zeilen (div[data-convid]) mit Search-Suggest-Optionen (div[role="option"])
+// in EIN Array — waitForSelector kann bereits die Suggest-Liste treffen, BEVOR
+// die Ergebnisliste gerendert ist; die Index-Shifts plus stiller rows[0]-Fallback
+// ließen replyDraft die FALSCHE Mail beantworten. Fehlerklasse identisch zum
+// get_email-rows[0]-Fallback (Fix 326b9d4).
+//
+// Regeln: (1) Mail-Zeilen (convid) werden bevorzugt — Options zählen nur, wenn
+// es keine convid-Zeilen gibt. (2) Nur Zeilen mit parsebarem Datum kommen in
+// Frage (neuester Timestamp gewinnt). (3) KEIN rows[0]-Fallback: ohne parsebares
+// Datum -> ok:false mit Zeilen-Previews statt blindem Klick.
+//
+// rows: [{ index, id, text, convid }] (Reihenfolge = Handle-Reihenfolge).
+export function selectNewestReplyRowCandidate(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { ok: false, reason: 'empty', previews: [] };
+  }
+  const mailRows = rows.filter((r) => r.convid);
+  const candidates = mailRows.length ? mailRows : rows;
+  let best = null;
+  for (const r of candidates) {
+    const ts = parseMailRowTimestamp(r.text || '');
+    if (ts !== null && (!best || ts > best.ts)) {
+      best = { index: r.index, ts };
+    }
+  }
+  if (!best) {
+    return {
+      ok: false,
+      reason: 'no-parsable-timestamp',
+      previews: candidates.slice(0, 5).map((r) => String(r.text || '')
+        .split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 2).join(' | ').slice(0, 120))
+    };
+  }
+  return { ok: true, index: best.index };
+}
+
 export function buildComposeUrl(realm, { to, subject, body, cc } = {}) {
   const toStr = Array.isArray(to) ? to.join('; ') : (to || '');
   const ccStr = Array.isArray(cc) ? cc.join('; ') : (cc || '');
@@ -8608,34 +8646,36 @@ export class OwaClient {
 
       await page.waitForSelector('div[data-convid], div[role="option"]', { timeout: 15000 });
 
-      // NEUESTE Nachricht des Threads wählen (nicht die älteste): Die OWA-Suche sortiert
-      // nach Relevanz — der erste Treffer kann eine tagelange alte Thread-Mail sein
-      // (Fehlerbild 24.09.2026: Doppel-Entwurf auf die Mail vom 21.09. statt 24.09.).
-      // Daher Datum aus den Zeilentexten parsen und die Zeile mit dem jüngsten Datum klicken.
+      // A3 PAGE-FILTER (17.11.2026): Mail-Zeilen von Suggest-Options getrennt
+      // bewerten und NEUESTE mit parsebarem Datum wählen — KEIN rows[0]-Fallback
+      // mehr (siehe selectNewestReplyRowCandidate). Reihenfolge der Handles muss
+      // der Reihenfolge im evaluate entsprechen (gleichzeitiger Selector).
       const rowInfos = await page.evaluate(() => {
-        const rows = Array.from(document.querySelectorAll('div[data-convid], div[role="option"]'));
-        return rows.map((r, i) => ({
+        return Array.from(document.querySelectorAll('div[data-convid], div[role="option"]')).map((r, i) => ({
           index: i,
           id: r.getAttribute('data-convid') || r.getAttribute('id') || '',
-          text: (r.innerText || '').slice(0, 300)
+          text: (r.innerText || '').slice(0, 300),
+          convid: Boolean(r.getAttribute('data-convid'))
         })).filter(r => r.id || r.text);
       });
-
-      let bestIndex = 0;
-      let bestTs = -Infinity;
-      for (const info of rowInfos) {
-        const ts = parseMailRowTimestamp(info.text);
-        if (ts !== null && ts > bestTs) {
-          bestTs = ts;
-          bestIndex = info.index;
-        }
-      }
-
       const rows = await page.$$('div[data-convid], div[role="option"]');
+
       if (rows.length === 0) {
         throw new Error(`Keine E-Mail für Suchbegriff "${searchQuery}" gefunden.`);
       }
-      const selectedRow = rows[bestIndex] || rows[0];
+
+      const selection = selectNewestReplyRowCandidate(rowInfos);
+      if (!selection.ok) {
+        throw new Error(
+          `Suchergebnisse für "${searchQuery}" enthielten keine nutzbare Zeile ` +
+          `(${selection.reason}) — es wird bewusst KEINE Zeile blind beantwortet ` +
+          `(kein rows[0]-Fallback). Kandidaten: ${selection.previews.join(', ') || '(keine)'}. ` +
+          `Bitte Zielpost per email_id eindeutig adressieren oder Suchbegriff präzisieren. ` +
+          `Es wurde KEIN Entwurf erstellt.`
+        );
+      }
+
+      const selectedRow = rows[selection.index];
       selectedRowText = ((await selectedRow.innerText().catch(() => '')) || '').slice(0, 800);
       selectedMailPreview = selectedRowText
         .split('\n').map(l => l.trim()).filter(Boolean).slice(0, 3).join(' | ').slice(0, 200);
