@@ -270,16 +270,25 @@ export function resolveReplyTargetAssertion({ evidence = '', senderEvidence = ''
 // (Befund 15.10.2026: CC via &cc=DeepLink wurde von OWA teils nicht persistiert,
 // der Tool-Return sagte trotzdem cc ok). Tolerant gegenüber Chip-Labels der Form
 // "Name <mail@x.de>" und Mehrfach-Eingaben (Semikolon/Komma-getrennt).
+//
+// A1 (17.11.2026): NFD/NFC-Folding — OWA-Chips kommen teils in NFD-Normalform
+// ("La\u0301bas" = a + kombinierender Akut) zurück, während der Auftrag NFC
+// ("á" = U+00E1) enthält. toLowerCase() foldet das NICHT — der includes-Match
+// scheiterte an identisch aussehenden Strings. Beide Seiten werden deshalb nach
+// NFC normalisiert (Test: gedrehter Lábas-Fall NFC-vs-NFD in beiden Richtungen).
+function foldNfc(s) {
+  return String(s || '').normalize('NFC').toLowerCase();
+}
 export function recipientListContains(list, expected) {
   if (!expected || !String(expected).trim()) return true;
   const hay = (Array.isArray(list) ? list : [list])
-    .map((x) => String(x || '').toLowerCase())
+    .map((x) => foldNfc(x))
     .join(' ; ');
   if (!hay.trim()) return false;
-  const parts = String(expected).toLowerCase().split(/[;,]+/)
+  const parts = foldNfc(expected).split(/[;,]+/)
     .map((s) => s.trim())
     .filter(Boolean);
-  if (parts.length === 0) return hay.includes(String(expected).toLowerCase().trim());
+  if (parts.length === 0) return hay.includes(foldNfc(expected).trim());
   // Jede erwartete Adresse muss nachweisbar sein; Alternative: Match auf den
   // reinen Adressteil (Chip-Label "Name <mail@x.de>" enthält die Adresse) oder
   // Klarnamen-Bestandteile bei internen M365-Kontakten (z.B. "Placke, Gabriel").
@@ -8598,7 +8607,7 @@ export class OwaClient {
     };
   }
 
-  async replyDraft({ email_id, id, query, subject, body, reply_all = false, replyAll, folder, expected_from, expectedTo, expected_to, expectedSubject, expected_subject, expectedDate, expected_date } = {}) {
+  async replyDraft({ email_id, id, query, subject, body, cc, reply_all = false, replyAll, folder, expected_from, expectedTo, expected_to, expectedSubject, expected_subject, expectedDate, expected_date } = {}) {
     if (!body || typeof body !== 'string' || body.trim().length === 0) {
       throw new Error('Parameter "body" ist erforderlich und darf nicht leer sein.');
     }
@@ -9013,6 +9022,25 @@ export class OwaClient {
 
     await activePage.waitForTimeout(500);
 
+    // A1 CC-MERGE (17.11.2026): Explizit angeforderte CC-Empfänger werden NACH dem
+    // Body-Insert (9a69e33: CC zu früh =>
+    // Editor-Detachment) und VOR dem Speichern in den CC-Well des Reply-Composes
+    // eingetragen und mit Enter/Escape als Chips aufgelöst. Die Reply-All-CCs von
+    // OWA bleiben unberührt — wir MERGEN zusätzlich, wir ersetzen nichts.
+    let ccMergeResult = null;
+    const ccRequested = String(cc || '').trim();
+    if (ccRequested) {
+      await this._populateComposeCc(activePage, ccRequested);
+      await activePage.waitForTimeout(500);
+      // Merge-Nachweis am flüchtigen Compose (der verbindliche Nachweis folgt
+      // unten am PERSISTIERTEN Draft).
+      const composeRecips = await this._extractRecipientsFromCompose(activePage);
+      ccMergeResult = {
+        mergedIntoCompose: recipientListContains(composeRecips.cc, ccRequested) || recipientListContains(composeRecips.to, ccRequested),
+        composeRecipients: composeRecips
+      };
+    }
+
     // 7. Save draft
     await activePage.keyboard.press('Control+s');
     await activePage.waitForTimeout(3500);
@@ -9021,16 +9049,68 @@ export class OwaClient {
     const bodyInsertSource = injection.method;
 
     // 8. PERSISTIERTER NACHWEIS — gemeinsame Methode (s. verifyPersistedDraftBody).
-    // Nur der Zustand NACH dem Speichern gilt als Beleg; der Entwurf bleibt bei
-    // Fehlschlag zur Sichtung liegen und wird NICHT automatisch geloescht.
-    const persisted = await this.verifyPersistedDraftBody(body);
+    // A1 (17.11.2026): mit withRecipients:true werden die PERSISTIERTEN Empfänger
+    // des gespeicherten Drafts mitgelesen — der Draft ist exakt das, was David
+    // später sendet, also gilt nur sein Zustand als Beleg (Drafts-Only-Protokoll).
+    const persisted = await this.verifyPersistedDraftBody(body, { withRecipients: true });
     const persistedBodyVerified = persisted.verified;
     const persistedDetail = persisted.detail;
+    const persistedRecipients = persisted.recipients || null;
 
     // fuzzy = Abweichungen (z.B. Reste von Autokorrektur) — im Return als diff melden
     const bodyMatchMeta = persisted.match === 'fuzzy'
       ? { bodyMatch: 'fuzzy', bodySollIst: persisted.diff }
       : {};
+
+    // A1 CC-SOLL-IST-VERGLEICH am PERSISTIERTEN Draft (gleicher Beweisstandard wie
+    // createDraft): Angeforderte CC müssen nachweisbar sein (in CC — oder ehrlich
+    // gemeldet in TO). Fehlen sie, Reparatur über _repairDraftCc + Re-Read;
+    // bleibt der Nachweis aus, wird der Return EHRlich success:false — der
+    // unvollständige Draft bleibt zur Sichtung liegen (Drafts-Only-Protokoll).
+    let ccState = null;
+    if (ccRequested) {
+      const recips = persistedRecipients || { to: [], cc: [] };
+      const inCc = recipientListContains(recips.cc, ccRequested);
+      const inTo = recipientListContains(recips.to, ccRequested);
+      if (inCc) {
+        ccState = { ccPersisted: true, ccLocation: 'cc', recipients: recips };
+      } else if (inTo) {
+        ccState = {
+          ccPersisted: false, ccLocation: 'to', recipients: recips,
+          ccNote: 'Angeforderte CC-Empfänger sind im Draft unter "An" statt "Cc" — Zustellung gesichert, Verteilung weicht vom Auftrag ab.'
+        };
+      } else {
+        const repair = await this._repairDraftCc(ccRequested);
+        let ok = false;
+        let recips2 = recips;
+        let where = null;
+        if (repair.repaired) {
+          const recheck = await this._readPersistedDraftRecipients();
+          if (recheck.found) {
+            recips2 = recheck.recipients;
+            if (recipientListContains(recips2.cc, ccRequested)) { ok = true; where = 'cc'; }
+            else if (recipientListContains(recips2.to, ccRequested)) { ok = true; where = 'to'; }
+          }
+        }
+        ccState = {
+          ccPersisted: ok,
+          ...(where ? { ccLocation: where } : {}),
+          ccRepaired: Boolean(repair.repaired),
+          ...(repair.reason ? { ccRepairReason: repair.reason } : {}),
+          recipients: recips2
+        };
+      }
+    }
+
+    const ccMeta = ccState ? {
+      ccRequested: ccRequested,
+      ccPersisted: ccState.ccPersisted,
+      ...(ccState.ccLocation ? { ccLocation: ccState.ccLocation } : {}),
+      ...(ccState.ccNote ? { ccNote: ccState.ccNote } : {}),
+      ...(ccState.ccRepaired !== undefined ? { ccRepaired: ccState.ccRepaired } : {}),
+      ...(ccState.ccRepairReason ? { ccRepairReason: ccState.ccRepairReason } : {}),
+      recipients: ccState.recipients
+    } : (persistedRecipients ? { recipients: persistedRecipients } : {});
 
     if (persistedBodyVerified !== true) {
       return {
@@ -9042,6 +9122,8 @@ export class OwaClient {
         preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
         bodyInsertSource,
         persistedBodyVerified: persistedBodyVerified === null ? 'unverified' : false,
+        ...(persistedRecipients ? { recipients: persistedRecipients } : {}),
+        ...(ccRequested ? { ccRequested, ccPersisted: false } : {}),
         folder: 'Entwürfe (Drafts)',
         message:
           `WARNUNG: Der Antwort-Entwurf wurde gespeichert, sein Text ist im gespeicherten ` +
@@ -9050,6 +9132,31 @@ export class OwaClient {
           `ggf. neu anlegen. Grund: ${persistedDetail} | Soll/Ist: ` +
           `${JSON.stringify(persisted.diff || buildBodySollIstDiff(body, ''))}`,
         diagnostics: { insertionVerification, persistedDetail }
+      };
+    }
+
+    // A1 (Drafts-Only-Protokoll): CC angefordert, aber NICHT als CC persistiert ->
+    // success:false (ehrlich), der Draft bleibt in "Entwürfe" für David liegen.
+    if (ccState && ccState.ccPersisted === false) {
+      return {
+        success: false,
+        action: isReplyAll ? 'reply_all' : 'reply',
+        subject: emailSubject || undefined,
+        targetMailPreview: selectedMailPreview || undefined,
+        replyTargetAssertion: replyTargetAssertion || undefined,
+        preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
+        bodyInsertSource,
+        ...bodyMatchMeta,
+        persistedBodyVerified: true,
+        ...(ccMergeResult ? { ccMergedIntoCompose: ccMergeResult.mergedIntoCompose } : {}),
+        ...ccMeta,
+        folder: 'Entwürfe (Drafts)',
+        message:
+          `WARNUNG: Antwort-Entwurf wurde erstellt und gespeichert (Body verifiziert), ` +
+          `aber die angeforderten CC-Empfänger sind im PERSISTIERTEN Draft NICHT als "Cc" ` +
+          `nachweisbar${ccState.ccNote ? ' — ' + ccState.ccNote : ''}. ` +
+          `Der Draft bleibt in "Entwürfe" liegen — bitte CC manuell prüfen/ergänzen, ` +
+          `bevor du ihn sendest.`
       };
     }
 
@@ -9062,13 +9169,15 @@ export class OwaClient {
       preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
       bodyInsertSource,
       ...bodyMatchMeta,
+      ...(ccMergeResult ? { ccMergedIntoCompose: ccMergeResult.mergedIntoCompose } : {}),
+      ...ccMeta,
       persistedBodyVerified: true,
       folder: 'Entwürfe (Drafts)',
       message:
         `Antwort-Entwurf (${isReplyAll ? 'Allen antworten' : 'Antworten'}) erstellt, in ` +
         `"Entwürfe" gespeichert und im gespeicherten Zustand verifiziert ` +
         `(Textübernahme: ${bodyInsertSource}${persisted.match === 'fuzzy' ? ', mit Abweichungen — siehe bodySollIst' : ''}). ` +
-        `Verlauf und Signatur blieben erhalten.`
+        `Verlauf und Signatur blieben erhalten.${ccRequested ? ' Angeforderte CC-Empfänger sind im gespeicherten Draft nachweisbar.' : ''}`
     };
   }
 

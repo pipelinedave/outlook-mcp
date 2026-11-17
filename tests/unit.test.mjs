@@ -2478,6 +2478,32 @@ describe('recipientListContains - CC-Persistenz-Beweis (P4, Befund 15.10.2026)',
     assert.equal(recipientListContains(['Lábas, Robert'], 'r.labas@filmuniversitaet.de'), false);
   });
 
+  // A1 (17.11.2026): NFD/NFC-Folding — OWA-Chips kommen teils in NFD-Normalform
+  // zurück (á = a + kombinierender Akut U+0301), der Auftrag enthält NFC (á = U+00E1).
+  // toLowerCase() foldet das NICHT — identisch aussehende Strings scheiterten am Match.
+  test('A1 NFD-Folding: NFD-Chip matcht NFC-Erwartung (Lábas NFC -> NFD)', () => {
+    const nfc = 'Lábas, Robert';           // á = U+00E1
+    const nfd = 'La\u0301bas, Robert';      // a + kombinierender Akut
+    assert.notEqual(nfc, nfd);              // Bytes unterschiedlich, sieht gleich aus
+    assert.equal(recipientListContains([nfd], nfc), true);
+  });
+
+  test('A1 NFD-Folding gedreht: NFC-Chip matcht NFD-Erwartung', () => {
+    const nfc = 'Lábas, Robert';
+    const nfd = 'La\u0301bas, Robert';
+    assert.equal(recipientListContains([nfc], nfd), true);
+  });
+
+  test('A1 NFD-Folding in E-Mail-Adressen (IDN-Lokalteil) und Gemenge', () => {
+    const nfdMail = 'la\u0301bas@x.de';
+    assert.equal(recipientListContains([`L. <${nfdMail}>`], 'lábas@x.de'), true);
+    assert.equal(recipientListContains(['Müller-NFD: Mu\u0308ller'], 'Müller'), true);
+  });
+
+  test('A1 Folding verändert das Negativ-Ergebnis nicht', () => {
+    assert.equal(recipientListContains(['La\u0301bas, Robert'], 'Léna Meier'), false);
+  });
+
   test('leerer erwarteter Wert -> trivially true', () => {
     assert.equal(recipientListContains([], ''), true);
     assert.equal(recipientListContains([], null), true);

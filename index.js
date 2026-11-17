@@ -251,6 +251,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: 'True für "Allen antworten" (Reply All), False für einfaches "Antworten" (Reply). Standard: false.',
               default: false
             },
+            cc: {
+              type: 'string',
+              description: 'Optionale zusätzliche CC-Empfänger (Semikolon/Komma-getrennt), die ZUSÄTZLICH zu den von Reply-All geerbten CCs in den Entwurf gemerged werden. Nach dem Speichern wird am PERSISTIERTEN Draft verifiziert, dass sie als "Cc" nachweisbar sind — sonst success:false mit ehrlichem ccPersisted:false.'
+            },
             folder: {
               type: 'string',
               description: 'Optional: Ordner, in dem gesucht werden soll (Standard: inbox).'
@@ -600,6 +604,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           email_id: args?.email_id || args?.id,
           query: args?.query || args?.subject,
           body: args?.body,
+          cc: args?.cc,
           reply_all: args?.reply_all ?? args?.replyAll ?? false,
           folder: args?.folder,
           expected_from: args?.expected_from,
