@@ -2615,3 +2615,64 @@ describe('selectNewestReplyRowCandidate - A3 Page-Filter (Mail-Zeilen vs Suggest
     assert.equal(selectNewestReplyRowCandidate(rows).index, 1);
   });
 });
+
+// ============================================================================
+// A2 Realm-Signatur-Templates (17.11.2026) — Mapping, Marker, Draft-Assertion
+// Zwei echte Signaturen (adesso + d-velop). Marker: NUR eindeutige (volle
+// Mailbox-Adresse + Host-Domains) — der geteilte Local-Part "david.hallmann"
+// dürfte nie matchen (Cross-Realm-False-Positive).
+// ============================================================================
+describe('signatureTemplates - Realm-Mapping + Fingerprint (A2)', () => {
+  test('Beide extrahierten Realms laden und sind verschieden', async () => {
+    const m = await import('../src/signatureTemplates.js');
+    const t1 = m.loadSignatureTemplate('d-velop.de');
+    const t2 = m.loadSignatureTemplate('adesso.de');
+    assert.ok(t1 && t1.html && t1.html.length > 100, 'd-velop-Template vorhanden');
+    assert.ok(t2 && t2.html && t2.html.length > 100, 'adesso-Template vorhanden');
+    assert.notEqual(t1.html, t2.html, 'Signaturen sind verschieden');
+  });
+
+  test('case-insensitive Realm-Suche, unbekannter Realm -> null', async () => {
+    const m = await import('../src/signatureTemplates.js');
+    assert.ok(m.loadSignatureTemplate('D-Velop.de'));
+    assert.equal(m.loadSignatureTemplate('unbekannt.de'), null);
+    assert.equal(m.loadSignatureTemplate(null), null);
+  });
+
+  test('Marker enthalten KEINEN geteilten Local-Part (Cross-Realm-Schutz)', async () => {
+    const m = await import('../src/signatureTemplates.js');
+    const t1 = m.loadSignatureTemplate('d-velop.de');
+    const t2 = m.loadSignatureTemplate('adesso.de');
+    for (const t of [t1, t2]) {
+      const markers = m.signatureFingerprintMarkers(t);
+      assert.equal(markers.includes('david.hallmann'), false, 'Local-Part allein darf kein Marker sein');
+      assert.ok(markers.some(mm => mm.includes('@')), 'volle Mailbox-Adresse als Marker');
+    }
+  });
+
+  test('Draft mit eigener Realm-Signatur -> true; mit FREMDER -> false', async () => {
+    const m = await import('../src/signatureTemplates.js');
+    const t1 = m.loadSignatureTemplate('d-velop.de');
+    const t2 = m.loadSignatureTemplate('adesso.de');
+    const dvelopBody = 'Hallo ... \nMit freundlichen Grüßen / Best regards\nDavid.Hallmann@d-velop.de\nsignatur.d-velop.de';
+    const adessoBody = '-- \nDavid Hallmann\nadesso SE\nE david.hallmann@adesso.de www.adesso.de';
+    assert.equal(m.bodyHasSignature(dvelopBody, t1), true);
+    assert.equal(m.bodyHasSignature(adessoBody, t2), true);
+    assert.equal(m.bodyHasSignature(dvelopBody, t2), false, 'd-velop-Signatur erfüllt adesso-Template NICHT');
+    assert.equal(m.bodyHasSignature(adessoBody, t1), false, 'adesso-Signatur erfüllt d-velop-Template NICHT');
+  });
+
+  test('leerer Body -> false; fehlendes Template -> null (unverified)', async () => {
+    const m = await import('../src/signatureTemplates.js');
+    const t1 = m.loadSignatureTemplate('d-velop.de');
+    assert.equal(m.bodyHasSignature('', t1), false);
+    assert.equal(m.bodyHasSignature('irgendwas', null), null);
+  });
+
+  test('NFD-gefoldeter Draft-Text matcht NFC-Marker (A1-Konsistenz)', async () => {
+    const m = await import('../src/signatureTemplates.js');
+    const t1 = m.loadSignatureTemplate('d-velop.de');
+    const nfdBody = 'Gru\u0308ße\nDavid.Hallmann@d-velop.de'; // ü = u+U+0308
+    assert.equal(m.bodyHasSignature(nfdBody, t1), true);
+  });
+});

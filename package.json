@@ -16,7 +16,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check src/config.js && node --check src/browser.js && node --check src/owa.js",
+    "check": "node --check index.js && node --check src/config.js && node --check src/browser.js && node --check src/owa.js && node --check src/signatureTemplates.js && node --check extract-signatures.mjs",
     "test": "node --test tests/unit.test.mjs tests/evaluate-scope.test.mjs tests/week-probe-guard.test.mjs tests/event-wait-loop.test.mjs tests/tdz-guard.test.mjs tests/week-header-source.test.mjs tests/wait-range-qualification.test.mjs tests/week-navigation.test.mjs tests/getfreebusy-result.test.mjs tests/calendar-list.test.mjs tests/attendee-availability.test.mjs tests/conversation-render.test.mjs tests/get-email-determinism.test.mjs tests/realm-lock.test.mjs tests/calendar-picker-filter.test.mjs tests/header-repoll.test.mjs tests/event-set-stable.test.mjs"
   },
   "keywords": [

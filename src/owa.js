@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import { browserManager } from './browser.js';
 import { config } from './config.js';
+import { loadSignatureTemplate, bodyHasSignature } from './signatureTemplates.js';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -4561,7 +4562,10 @@ export class OwaClient {
     let preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
 
     // FALLBACK-SIGNATUR (Befund 16.11.2026): Hat OWA keine Signatur vorab geladen,
-    // injecten wir DEFAULT_SIGNATURE_HTML, damit der Entwurf nicht nackt bleibt.
+    // injecten wir die SIGNATUR DES REALMS (A2: Template aus signature-templates.json,
+    // read-only aus dem Postfach extrahiert) — erst ohne Realm-Template greift das
+    // alte hardcoded DEFAULT_SIGNATURE_HTML (d-velop-HTML). Vorher lief im falschen
+    // Realm die FREMDE Signatur in den Entwurf.
     const hasSig = await editor.evaluate((el) => {
       const html = el.innerHTML || '';
       const text = el.innerText || '';
@@ -4570,20 +4574,24 @@ export class OwaClient {
              text.includes('Mit freundlichen Grüßen') || text.includes('Best regards');
     });
 
-    if (!hasSig && DEFAULT_SIGNATURE_HTML) {
-      await editor.evaluate((el, sig) => {
-        const p = document.createElement('p');
-        p.innerHTML = '<br>';
-        const p2 = document.createElement('p');
-        p2.innerHTML = '<br>';
-        el.appendChild(p);
-        el.appendChild(p2);
-        const div = document.createElement('div');
-        div.innerHTML = sig;
-        el.appendChild(div);
-      }, DEFAULT_SIGNATURE_HTML);
-      await activePage.waitForTimeout(300);
-      preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
+    if (!hasSig) {
+      const realmTemplate = loadSignatureTemplate(this.realm);
+      const fallbackHtml = realmTemplate && realmTemplate.html ? realmTemplate.html : DEFAULT_SIGNATURE_HTML;
+      if (fallbackHtml) {
+        await editor.evaluate((el, sig) => {
+          const p = document.createElement('p');
+          p.innerHTML = '<br>';
+          const p2 = document.createElement('p');
+          p2.innerHTML = '<br>';
+          el.appendChild(p);
+          el.appendChild(p2);
+          const div = document.createElement('div');
+          div.innerHTML = sig;
+          el.appendChild(div);
+        }, fallbackHtml);
+        await activePage.waitForTimeout(300);
+        preInsertText = await editor.evaluate((el) => (el.innerText || el.textContent || '').trim());
+      }
     }
 
     // TEXTUEBERNAHME PER TASTATUR — derselbe Serialisierungs-Weg wie bei
@@ -9057,6 +9065,24 @@ export class OwaClient {
     const persistedDetail = persisted.detail;
     const persistedRecipients = persisted.recipients || null;
 
+    // A2 SIGNATUR-ASSERTION (Drafts-Only): Der persistierte Draft muss die
+    // Signatur seines Realms tragen — der Draft ist exakt das, was David sendet.
+    // Basis ist das Realm-Template (signature-templates.json, read-only aus dem
+    // Postfach extrahiert). Re-Poll: OWA kann die Signatur verzögert rendern —
+    // bei erstem Fehlschlag wird der Draft EINMAL nach ~2s erneut gelesen.
+    const sigTemplate = loadSignatureTemplate(this.realm);
+    let signaturePresent = bodyHasSignature(persisted.text, sigTemplate);
+    let signatureRepoll = false;
+    if (signaturePresent === false) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const repoll = await this.verifyPersistedDraftBody(body);
+      if (bodyHasSignature(repoll && repoll.text, sigTemplate) === true) {
+        signaturePresent = true;
+        signatureRepoll = true;
+      }
+    }
+    // Ohne Template: 'unverified' statt falsch melden (ehrlich, aber nicht blockierend)
+
     // fuzzy = Abweichungen (z.B. Reste von Autokorrektur) — im Return als diff melden
     const bodyMatchMeta = persisted.match === 'fuzzy'
       ? { bodyMatch: 'fuzzy', bodySollIst: persisted.diff }
@@ -9122,6 +9148,7 @@ export class OwaClient {
         preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
         bodyInsertSource,
         persistedBodyVerified: persistedBodyVerified === null ? 'unverified' : false,
+        signaturePresent: signaturePresent === null ? 'unverified' : signaturePresent,
         ...(persistedRecipients ? { recipients: persistedRecipients } : {}),
         ...(ccRequested ? { ccRequested, ccPersisted: false } : {}),
         folder: 'Entwürfe (Drafts)',
@@ -9135,6 +9162,40 @@ export class OwaClient {
       };
     }
 
+    // A2 (Drafts-Only-Protokoll): Realm-Signatur erwartet, aber im PERSISTIERTEN
+    // Draft nach Re-Poll NICHT nachweisbar -> success:false (ehrlich). Der Draft
+    // bleibt in "Entwürfe" liegen — David prüft/sendet ihn ohnehin selbst.
+    if (signaturePresent === false) {
+      return {
+        success: false,
+        action: isReplyAll ? 'reply_all' : 'reply',
+        subject: emailSubject || undefined,
+        targetMailPreview: selectedMailPreview || undefined,
+        replyTargetAssertion: replyTargetAssertion || undefined,
+        preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
+        bodyInsertSource,
+        ...bodyMatchMeta,
+        persistedBodyVerified: true,
+        signaturePresent: false,
+        signatureRepoll,
+        signatureRealm: this.realm || undefined,
+        ...(ccState ? { ccRequested, ccPersisted: ccState.ccPersisted } : {}),
+        ...(persistedRecipients ? { recipients: persistedRecipients } : {}),
+        folder: 'Entwürfe (Drafts)',
+        message:
+          `WARNUNG: Antwort-Entwurf wurde erstellt und gespeichert (Body verifiziert), ` +
+          `aber die Signatur des Realm '${this.realm || 'default'}' ist im PERSISTIERTEN ` +
+          `Draft auch nach Re-Poll NICHT nachweisbar. Der Draft bleibt in "Entwürfe" ` +
+          `liegen — bitte Signatur vor dem Senden manuell prüfen.`
+      };
+    }
+
+    const signatureMeta = {
+      signaturePresent: signaturePresent === null ? 'unverified' : signaturePresent,
+      ...(signatureRepoll ? { signatureRepoll } : {}),
+      signatureRealm: this.realm || undefined
+    };
+
     // A1 (Drafts-Only-Protokoll): CC angefordert, aber NICHT als CC persistiert ->
     // success:false (ehrlich), der Draft bleibt in "Entwürfe" für David liegen.
     if (ccState && ccState.ccPersisted === false) {
@@ -9147,6 +9208,7 @@ export class OwaClient {
         preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
         bodyInsertSource,
         ...bodyMatchMeta,
+        ...signatureMeta,
         persistedBodyVerified: true,
         ...(ccMergeResult ? { ccMergedIntoCompose: ccMergeResult.mergedIntoCompose } : {}),
         ...ccMeta,
@@ -9169,6 +9231,7 @@ export class OwaClient {
       preview: body.length > 200 ? body.substring(0, 200) + '...' : body,
       bodyInsertSource,
       ...bodyMatchMeta,
+      ...signatureMeta,
       ...(ccMergeResult ? { ccMergedIntoCompose: ccMergeResult.mergedIntoCompose } : {}),
       ...ccMeta,
       persistedBodyVerified: true,
@@ -9248,6 +9311,8 @@ export class OwaClient {
         match: cls,
         diff: buildBodySollIstDiff(expectedBody, persisted.text),
         detail: `Persistierter Entwurfstext: ${persisted.text.length} Zeichen, Editor gefunden: ${persisted.found}, Match: ${cls}`,
+        // A2: Rohtext für Folgeweisen (Signatur-Re-Poll) mitliefern
+        text: persisted.text,
         ...(recipients ? { recipients } : {})
       };
     } catch (e) {
