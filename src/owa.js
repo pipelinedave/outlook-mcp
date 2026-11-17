@@ -4507,10 +4507,7 @@ export class OwaClient {
       );
     }
 
-    // P4: CC direkt im offenen Compose-Fenster befüllen (da deeplink &cc= von OWA ignoriert wird)
-    if (ccStr) {
-      await this._populateComposeCc(activePage, ccStr);
-    }
+
 
     // Bestand vor dem Tippen merken (Unversehrtheits-Beweis fuer die
     // OWA-Account-Signatur, die OWA beim Oeffnen automatisch einsetzt).
@@ -4551,6 +4548,7 @@ export class OwaClient {
     // SICHERHEIT: Caret per DOM-Range an den Inhaltsanfang, KEIN Control+A —
     // das wuerde eine vorhandene Signatur markieren und beim Tippen
     // ueberschreiben.
+    editor = (await activePage.waitForSelector(EDITOR_SEL, { timeout: 10000 }).catch(() => null)) || editor;
     await editor.click();
     await activePage.waitForTimeout(300);
 
@@ -8468,7 +8466,8 @@ export class OwaClient {
       if (!editor) {
         throw new Error('Compose-Editor für den Ablehnungs-Kommentar konnte nicht gefunden werden.');
       }
-      await editor.click();
+      editor = (await activePage.waitForSelector(EDITOR_SEL, { timeout: 10000 }).catch(() => null)) || editor;
+    await editor.click();
       await activePage.waitForTimeout(300);
       await this._injectBodyText(activePage, editor, comment.trim());
 
