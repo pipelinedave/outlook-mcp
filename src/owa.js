@@ -4654,6 +4654,25 @@ export class OwaClient {
     // Bei CC-Auftrag zusätzlich die persistierten Empfänger mitlesen.
     const persisted = await this.verifyPersistedDraftBody(bodyStr, { withRecipients: Boolean(ccStr) });
 
+    // A2 SIGNATUR-ASSERTION (Drafts-Only, wie replyDraft): Der persistierte Draft
+    // muss die Signatur seines Realms tragen. Re-Poll bei verzögerter OWA-Renderung.
+    const sigTemplate = loadSignatureTemplate(this.realm);
+    let signaturePresent = bodyHasSignature(persisted.text, sigTemplate);
+    let signatureRepoll = false;
+    if (signaturePresent === false) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const repoll = await this.verifyPersistedDraftBody(bodyStr);
+      if (bodyHasSignature(repoll && repoll.text, sigTemplate) === true) {
+        signaturePresent = true;
+        signatureRepoll = true;
+      }
+    }
+    const signatureMeta = {
+      signaturePresent: signaturePresent === null ? 'unverified' : signaturePresent,
+      ...(signatureRepoll ? { signatureRepoll } : {}),
+      signatureRealm: this.realm || undefined
+    };
+
     // P4 (Befund 15.10.2026): CC via &cc=DeepLink wird von OWA teils NICHT
     // persistiert — der frühere Tool-Return sagte cc ok, der gespeicherte Draft
     // hatte keine CC-Chips. Deshalb: Empfänger des PERSISTIERTEN Drafts gegen
@@ -4719,6 +4738,7 @@ export class OwaClient {
         preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
         ...bodyMeta,
         persistedBodyVerified: persisted.verified === null ? 'unverified' : false,
+        ...signatureMeta,
         folder: 'Entwürfe (Drafts)',
         message:
           `WARNUNG: Der Entwurf wurde gespeichert, sein Text ist im gespeicherten Entwurf ` +
@@ -4736,6 +4756,7 @@ export class OwaClient {
       preview: bodyStr.length > 200 ? bodyStr.substring(0, 200) + '...' : bodyStr,
       ...bodyMeta,
       ...ccMeta,
+      ...signatureMeta,
       persistedBodyVerified: true,
       folder: 'Entwürfe (Drafts)',
       message:
